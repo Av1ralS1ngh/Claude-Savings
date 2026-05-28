@@ -1,15 +1,24 @@
 from __future__ import annotations
 
-import hashlib
+import asyncio
 import json
 import re
 from dataclasses import dataclass, asdict
+from functools import partial
 from typing import Any
-
-import httpx
 
 from .config import Settings
 from .db import Store
+
+# Try to import the YSCompress Rust-backed library.
+# This is the real compression engine — SmartCrusher, CodeCompressor, Kompress-base.
+# Falls back to a dumb local summarizer only if the library is not installed.
+try:
+    from headroom import compress as _yscompress_compress
+    _YSCOMPRESS_AVAILABLE = True
+except ImportError:
+    _yscompress_compress = None
+    _YSCOMPRESS_AVAILABLE = False
 
 
 LOG_PATTERNS = [
@@ -37,7 +46,6 @@ class CompressionResult:
 
 def estimate_tokens(value: Any) -> int:
     text = stringify(value)
-    # Conservative-ish approximate tokenizer: 1 token ~= 4 chars for English/code mixed text.
     return max(1, int(len(text) / 4)) if text else 0
 
 
@@ -58,12 +66,8 @@ def looks_compressible(text: str) -> bool:
     return any(p.search(text) for p in LOG_PATTERNS)
 
 
-def summarize_text(text: str, max_chars: int = 1800) -> str:
-    """Safe fallback compressor for local development.
-
-    It keeps the head, tail, and detected error lines. Headroom should replace this when
-    YSCOMPRESS_BASE_URL is configured.
-    """
+def _summarize_text_fallback(text: str, max_chars: int = 1800) -> str:
+    """Last-resort local compressor — only used when yscompress library is not installed."""
     if len(text) <= max_chars:
         return text
     lines = text.splitlines()
@@ -76,6 +80,7 @@ def summarize_text(text: str, max_chars: int = 1800) -> str:
     head = text[: max_chars // 3]
     tail = text[-max_chars // 3 :]
     important_block = "\n".join(important)
+    import hashlib
     digest = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()[:16]
     return (
         f"[decompute:compressed_context sha256={digest} original_chars={len(text)}]\n"
@@ -99,39 +104,50 @@ class YSCompressClient:
         preserve_latest_user: bool = True,
     ) -> CompressionResult:
         mode = mode or self.settings.yscompress_default_mode
-        ccr_enabled = self.settings.yscompress_ccr_enabled if ccr is None else ccr
         tokens_before = estimate_tokens(messages)
 
-        # Prefer real Headroom if configured. The fallback keeps development self-contained.
-        if self.settings.yscompress_base_url:
-            try:
-                async with httpx.AsyncClient(timeout=self.settings.yscompress_timeout_s) as client:
-                    resp = await client.post(
-                        self.settings.yscompress_base_url.rstrip("/") + "/v1/compress",
-                        json={"messages": messages, "mode": mode, "ccr": ccr_enabled},
-                    )
-                if resp.status_code < 400:
-                    payload = resp.json()
-                    compressed = payload.get("messages") or payload.get("compressed_messages") or messages
-                    tokens_after = payload.get("tokens_after") or estimate_tokens(compressed)
-                    tokens_before_remote = payload.get("tokens_before") or tokens_before
-                    saved = max(0, int(tokens_before_remote) - int(tokens_after))
-                    return CompressionResult(
-                        messages=compressed,
-                        tokens_before=int(tokens_before_remote),
-                        tokens_after=int(tokens_after),
-                        tokens_saved=saved,
-                        compression_ratio=round(int(tokens_after) / max(int(tokens_before_remote), 1), 4),
-                        mode=mode,
-                        engine="yscompress_proxy",
-                        transforms_applied=payload.get("transforms_applied") or payload.get("transforms") or ["yscompress"],
-                        ccr_keys=payload.get("ccr_hashes") or payload.get("ccr_keys") or [],
-                    )
-            except Exception:
-                # Fall through to local compressor.
-                pass
+        if mode == "off":
+            return CompressionResult(
+                messages=messages,
+                tokens_before=tokens_before,
+                tokens_after=tokens_before,
+                tokens_saved=0,
+                compression_ratio=1.0,
+                mode=mode,
+                engine="off",
+                transforms_applied=[],
+                ccr_keys=[],
+            )
 
-        compressed, transforms, ccr_keys = self._fallback_compress(messages, mode, ccr_enabled, preserve_latest_user)
+        # ── Path 1: YSCompress Rust library (preferred) ────────────────────────
+        if _YSCOMPRESS_AVAILABLE:
+            try:
+                loop = asyncio.get_running_loop()
+                # compress() is sync + CPU-bound — run it in a thread to not block the event loop
+                result = await loop.run_in_executor(
+                    None,
+                    partial(_yscompress_compress, messages, model="claude-sonnet-4-5")
+                )
+                tokens_after = result.tokens_after
+                tokens_saved = max(0, tokens_before - tokens_after)
+                return CompressionResult(
+                    messages=result.messages,
+                    tokens_before=tokens_before,
+                    tokens_after=tokens_after,
+                    tokens_saved=tokens_saved,
+                    compression_ratio=round(tokens_after / max(tokens_before, 1), 4),
+                    mode=mode,
+                    engine="yscompress_rust",
+                    transforms_applied=result.transforms_applied or ["yscompress"],
+                    ccr_keys=[],
+                )
+            except Exception:
+                pass  # fall through to local
+
+        # ── Path 2: dumb local fallback (yscompress not installed) ─────────────
+        compressed, transforms, ccr_keys = self._local_compress(
+            messages, mode, preserve_latest_user
+        )
         tokens_after = estimate_tokens(compressed)
         return CompressionResult(
             messages=compressed,
@@ -145,16 +161,12 @@ class YSCompressClient:
             ccr_keys=ccr_keys,
         )
 
-    def _fallback_compress(
+    def _local_compress(
         self,
         messages: list[dict[str, Any]],
         mode: str,
-        ccr_enabled: bool,
         preserve_latest_user: bool,
     ) -> tuple[list[dict[str, Any]], list[str], list[str]]:
-        if mode == "off":
-            return messages, [], []
-
         out: list[dict[str, Any]] = []
         transforms: set[str] = set()
         ccr_keys: list[str] = []
@@ -168,13 +180,11 @@ class YSCompressClient:
         for idx, msg in enumerate(messages):
             new_msg = dict(msg)
             role = new_msg.get("role", "user")
-            # Preserve the latest plain user instruction. Compress tool outputs and older huge context.
             should_preserve = idx == latest_user_idx and role == "user"
             new_msg["content"] = self._compress_content(
                 new_msg.get("content"),
                 should_preserve=should_preserve,
                 mode=mode,
-                ccr_enabled=ccr_enabled,
                 transforms=transforms,
                 ccr_keys=ccr_keys,
                 role=role,
@@ -188,22 +198,20 @@ class YSCompressClient:
         *,
         should_preserve: bool,
         mode: str,
-        ccr_enabled: bool,
         transforms: set[str],
         ccr_keys: list[str],
         role: str,
     ) -> Any:
+        max_chars = 1000 if mode == "aggressive" else 1800
+
         if isinstance(content, str):
             if should_preserve and not looks_compressible(content):
                 return content
             if role in {"tool", "function"} or looks_compressible(content):
-                if ccr_enabled and len(content) > 1500:
-                    ccr_keys.append(self.store.put_ccr(content, {"role": role, "mode": mode}))
                 transforms.add("fallback_smart_context")
-                return summarize_text(content, max_chars=1000 if mode == "aggressive" else 1800)
+                return _summarize_text_fallback(content, max_chars=max_chars)
             return content
 
-        # Anthropic content blocks: [{type:text/tool_result, ...}]
         if isinstance(content, list):
             new_blocks = []
             for block in content:
@@ -214,25 +222,19 @@ class YSCompressClient:
                 btype = b.get("type")
                 if btype == "tool_result":
                     raw = stringify(b.get("content"))
-                    if ccr_enabled and len(raw) > 1500:
-                        ccr_keys.append(self.store.put_ccr(raw, {"block_type": btype, "mode": mode}))
                     transforms.add("fallback_tool_result")
-                    b["content"] = summarize_text(raw, max_chars=1000 if mode == "aggressive" else 1800)
+                    b["content"] = _summarize_text_fallback(raw, max_chars=max_chars)
                 elif btype == "text" and isinstance(b.get("text"), str):
                     text = b["text"]
                     if not should_preserve and looks_compressible(text):
-                        if ccr_enabled and len(text) > 1500:
-                            ccr_keys.append(self.store.put_ccr(text, {"block_type": btype, "mode": mode}))
                         transforms.add("fallback_text_context")
-                        b["text"] = summarize_text(text, max_chars=1000 if mode == "aggressive" else 1800)
+                        b["text"] = _summarize_text_fallback(text, max_chars=max_chars)
                 new_blocks.append(b)
             return new_blocks
 
         if isinstance(content, dict):
             raw = stringify(content)
             if looks_compressible(raw):
-                if ccr_enabled:
-                    ccr_keys.append(self.store.put_ccr(raw, {"role": role, "mode": mode}))
                 transforms.add("fallback_json_context")
-                return summarize_text(raw, max_chars=1000 if mode == "aggressive" else 1800)
+                return _summarize_text_fallback(raw, max_chars=max_chars)
         return content
