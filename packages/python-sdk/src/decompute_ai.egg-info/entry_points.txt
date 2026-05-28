@@ -1,0 +1,2 @@
+[console_scripts]
+decompute = decompute_ai.cli:app

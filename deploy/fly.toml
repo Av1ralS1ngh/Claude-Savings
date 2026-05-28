@@ -1,0 +1,26 @@
+app = "decompute-gateway"
+primary_region = "sjc"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  DECOMPUTE_ENV = "production"
+  DECOMPUTE_HOST = "0.0.0.0"
+  DECOMPUTE_PORT = "8080"
+  DECOMPUTE_REQUIRE_AUTH = "true"
+  DECOMPUTE_MOCK_ANTHROPIC = "false"
+  DECOMPUTE_PROMPT_CACHE = "auto"
+  DECOMPUTE_DATA_DIR = "/data"
+  DECOMPUTE_SQLITE_PATH = "/data/decompute.db"
+
+[[mounts]]
+  source = "decompute_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0

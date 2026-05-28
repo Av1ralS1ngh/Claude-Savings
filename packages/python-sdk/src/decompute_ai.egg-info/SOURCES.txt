@@ -1,0 +1,11 @@
+README.md
+pyproject.toml
+src/decompute_ai/__init__.py
+src/decompute_ai/cli.py
+src/decompute_ai/client.py
+src/decompute_ai.egg-info/PKG-INFO
+src/decompute_ai.egg-info/SOURCES.txt
+src/decompute_ai.egg-info/dependency_links.txt
+src/decompute_ai.egg-info/entry_points.txt
+src/decompute_ai.egg-info/requires.txt
+src/decompute_ai.egg-info/top_level.txt

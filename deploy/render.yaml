@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: decompute-gateway
+    env: docker
+    plan: starter
+    autoDeploy: true
+    envVars:
+      - key: DECOMPUTE_ENV
+        value: production
+      - key: DECOMPUTE_REQUIRE_AUTH
+        value: "true"
+      - key: DECOMPUTE_MOCK_ANTHROPIC
+        value: "false"
+      - key: DECOMPUTE_PROMPT_CACHE
+        value: auto
+      - key: DECOMPUTE_DATA_DIR
+        value: /data
+      - key: DECOMPUTE_SQLITE_PATH
+        value: /data/decompute.db
