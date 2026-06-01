@@ -5,9 +5,10 @@ from typing import Any
 
 import httpx
 
+from .config import load_config
+from .errors import DecomputeError, error_for_status
 
-class DecomputeError(RuntimeError):
-    pass
+__all__ = ["Decompute", "DecomputeError"]
 
 
 class _Resource:
@@ -69,11 +70,49 @@ class ApiKeys(_Resource):
         return self._client.get("/v1/api_keys")
 
 
+class Models(_Resource):
+    def list(self) -> dict[str, Any]:
+        return self._client.get("/v1/models")
+
+
+class Usage(_Resource):
+    def summary(self) -> dict[str, Any]:
+        return self._client.get("/v1/usage")
+
+    def export(self, *, format: str = "json", start: str | None = None, end: str | None = None) -> Any:
+        params: dict[str, str] = {"format": format}
+        if start:
+            params["start"] = start
+        if end:
+            params["end"] = end
+        return self._client.get("/v1/usage/export", params=params, raw=(format == "csv"))
+
+
 class Decompute:
-    def __init__(self, api_key: str | None = None, base_url: str | None = None, timeout: float = 120.0):
-        self.api_key = api_key or os.getenv("DECOMPUTE_API_KEY", "dc_dev_local")
-        self.base_url = (base_url or os.getenv("DECOMPUTE_BASE_URL", "http://127.0.0.1:8080")).rstrip("/")
+    """Thin client for the Decompute Gateway.
+
+    Resolution order for credentials: explicit argument > environment variable
+    (DECOMPUTE_BASE_URL / DECOMPUTE_API_KEY) > saved config (~/.decompute/config.json,
+    written by `decompute login`) > built-in local default.
+
+    A custom httpx `transport` may be injected for in-process testing.
+    """
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        timeout: float = 120.0,
+        *,
+        max_retries: int = 2,
+        transport: httpx.BaseTransport | None = None,
+    ):
+        cfg = load_config()
+        self.api_key = api_key or os.getenv("DECOMPUTE_API_KEY") or cfg.get("api_key") or "dc_dev_local"
+        self.base_url = (base_url or os.getenv("DECOMPUTE_BASE_URL") or cfg.get("base_url") or "http://127.0.0.1:8080").rstrip("/")
         self.timeout = timeout
+        self.max_retries = max(0, max_retries)
+        self._transport = transport
         self.devices = Devices(self)
         self.compression = Compression(self)
         self.routes = Routes(self)
@@ -81,23 +120,48 @@ class Decompute:
         self.messages = Messages(self)
         self.chat = Chat(self)
         self.api_keys = ApiKeys(self)
+        self.models = Models(self)
+        self.usage = Usage(self)
 
     def headers(self) -> dict[str, str]:
-        return {"x-decompute-key": self.api_key, "content-type": "application/json"}
+        return {"x-decompute-api-key": self.api_key, "content-type": "application/json"}
 
-    def get(self, path: str) -> Any:
-        with httpx.Client(timeout=self.timeout) as client:
-            resp = client.get(self.base_url + path, headers=self.headers())
-        return self._handle(resp)
+    def _new_client(self) -> httpx.Client:
+        return httpx.Client(base_url=self.base_url, timeout=self.timeout, transport=self._transport)
+
+    def _request(self, method: str, path: str, *, json: dict[str, Any] | None = None, params: dict[str, str] | None = None, raw: bool = False) -> Any:
+        last_exc: Exception | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                with self._new_client() as client:
+                    resp = client.request(method, path, headers=self.headers(), json=json, params=params)
+                # Retry only safe, transient upstream failures.
+                if resp.status_code in (502, 503, 504, 529) and attempt < self.max_retries:
+                    continue
+                return self._handle(resp, raw=raw)
+            except httpx.TransportError as exc:  # connect/read timeouts — retry
+                last_exc = exc
+                if attempt >= self.max_retries:
+                    raise DecomputeError(f"connection to {self.base_url} failed: {exc}") from exc
+        raise DecomputeError(str(last_exc) if last_exc else "request failed")
+
+    def get(self, path: str, params: dict[str, str] | None = None, raw: bool = False) -> Any:
+        return self._request("GET", path, params=params, raw=raw)
 
     def post(self, path: str, json: dict[str, Any] | None = None) -> Any:
-        with httpx.Client(timeout=self.timeout) as client:
-            resp = client.post(self.base_url + path, headers=self.headers(), json=json or {})
-        return self._handle(resp)
+        return self._request("POST", path, json=json or {})
 
-    def _handle(self, resp: httpx.Response) -> Any:
+    def _handle(self, resp: httpx.Response, *, raw: bool = False) -> Any:
         if resp.status_code >= 400:
-            raise DecomputeError(f"HTTP {resp.status_code}: {resp.text}")
+            try:
+                body = resp.json()
+                message = (body.get("error", {}) or {}).get("message") if isinstance(body, dict) else None
+                message = message or (body.get("detail") if isinstance(body, dict) else None) or resp.text
+            except Exception:
+                body, message = None, resp.text
+            raise error_for_status(resp.status_code, f"HTTP {resp.status_code}: {message}", body)
+        if raw:
+            return resp.text
         if not resp.content:
             return None
         return resp.json()

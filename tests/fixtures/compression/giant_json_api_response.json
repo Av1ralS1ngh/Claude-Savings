@@ -1,0 +1,40 @@
+{
+  "status": "ERROR",
+  "code": 429,
+  "message": "rate_limit_exceeded",
+  "request_id": "req_9f2c1ab7e4",
+  "retry_after_seconds": 42,
+  "meta": {
+    "page": 1,
+    "per_page": 50,
+    "total": 1284,
+    "generated_at": "2026-05-30T00:14:02Z"
+  },
+  "data": [
+    {"id": "usr_0001", "name": "Ada Lovelace", "plan": "pro", "tokens_used": 184221, "status": "active"},
+    {"id": "usr_0002", "name": "Alan Turing", "plan": "team", "tokens_used": 901233, "status": "active"},
+    {"id": "usr_0003", "name": "Grace Hopper", "plan": "pro", "tokens_used": 55012, "status": "suspended"},
+    {"id": "usr_0004", "name": "Edsger Dijkstra", "plan": "free", "tokens_used": 1201, "status": "active"},
+    {"id": "usr_0005", "name": "Barbara Liskov", "plan": "team", "tokens_used": 442870, "status": "active"},
+    {"id": "usr_0006", "name": "Donald Knuth", "plan": "pro", "tokens_used": 77310, "status": "active"},
+    {"id": "usr_0007", "name": "Margaret Hamilton", "plan": "team", "tokens_used": 661002, "status": "active"},
+    {"id": "usr_0008", "name": "John McCarthy", "plan": "free", "tokens_used": 88, "status": "churned"},
+    {"id": "usr_0009", "name": "Dennis Ritchie", "plan": "pro", "tokens_used": 320145, "status": "active"},
+    {"id": "usr_0010", "name": "Ken Thompson", "plan": "team", "tokens_used": 510998, "status": "active"},
+    {"id": "usr_0011", "name": "Tim Berners-Lee", "plan": "pro", "tokens_used": 14002, "status": "active"},
+    {"id": "usr_0012", "name": "Linus Torvalds", "plan": "team", "tokens_used": 1200541, "status": "active"},
+    {"id": "usr_0013", "name": "Guido van Rossum", "plan": "pro", "tokens_used": 205311, "status": "active"},
+    {"id": "usr_0014", "name": "Bjarne Stroustrup", "plan": "free", "tokens_used": 4410, "status": "active"},
+    {"id": "usr_0015", "name": "James Gosling", "plan": "team", "tokens_used": 380221, "status": "active"},
+    {"id": "usr_0016", "name": "Anders Hejlsberg", "plan": "pro", "tokens_used": 99120, "status": "active"},
+    {"id": "usr_0017", "name": "Yukihiro Matsumoto", "plan": "pro", "tokens_used": 61234, "status": "active"},
+    {"id": "usr_0018", "name": "Rasmus Lerdorf", "plan": "free", "tokens_used": 233, "status": "churned"},
+    {"id": "usr_0019", "name": "Brendan Eich", "plan": "team", "tokens_used": 720113, "status": "active"},
+    {"id": "usr_0020", "name": "Rob Pike", "plan": "pro", "tokens_used": 150900, "status": "active"}
+  ],
+  "errors": [
+    {"field": "rate", "detail": "project exceeded 200000 input tokens per minute"},
+    {"field": "quota", "detail": "monthly spend cap of 250 usd will be reached in 3 hours"}
+  ],
+  "links": {"next": "/v1/users?page=2", "prev": null, "self": "/v1/users?page=1"}
+}

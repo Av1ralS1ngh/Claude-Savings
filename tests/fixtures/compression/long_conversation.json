@@ -1,0 +1,11 @@
+[
+  {"role": "user", "content": "Help me debug why my gateway returns 413 on large prompts."},
+  {"role": "assistant", "content": "A 413 means the request exceeded a size or context limit. The gateway enforces max_request_bytes (default 10MB) and max_context_tokens (default 200000). Which one are you hitting?"},
+  {"role": "user", "content": "Probably context tokens. I'm pasting a 300k token log file."},
+  {"role": "assistant", "content": "That is above the 200000 max_context_tokens ceiling, so preflight rejects it before Anthropic. You have three options: enable compression (safe mode), trim the log with retrieval, or raise the per-project limit via an admin override."},
+  {"role": "user", "content": "Walk me through compression."},
+  {"role": "assistant", "content": "Compression runs the messages through YSCompress (Rust core) which deduplicates logs and summarizes tool output while preserving your latest instruction verbatim. Tool and log content is compressed aggressively; source code and the current user instruction are preserved carefully."},
+  {"role": "user", "content": "Does compression ever lose my error message?"},
+  {"role": "assistant", "content": "No — the summarizer keeps ERROR/WARN/Exception/Traceback lines in an important_lines block, plus head and tail. The compression-safety evaluator gates this so no fixture loses a critical fact in safe mode."},
+  {"role": "user", "content": "Good. One last thing, and this is the actual instruction I want you to follow: do not modify auth.py, and only summarize the build failure in the kubernetes logs I pasted earlier. Keep the answer under 5 lines."}
+]

@@ -1,8 +1,31 @@
 from __future__ import annotations
 
-from fastapi import Header, HTTPException, Request
+from dataclasses import dataclass
+import secrets
+from typing import Iterable
+
+from fastapi import HTTPException, Request
+
 from .config import Settings
 from .db import Store
+
+
+@dataclass(frozen=True)
+class AuthPrincipal:
+    project_id: str
+    org_id: str | None
+    key_id: str | None
+    key_prefix: str | None
+    scopes: list[str]
+    auth_mode: str
+
+    def has_scope(self, scope: str) -> bool:
+        return "admin" in self.scopes or scope in self.scopes
+
+    def require(self, *scopes: str) -> None:
+        missing = [s for s in scopes if not self.has_scope(s)]
+        if missing:
+            raise HTTPException(status_code=403, detail={"error": "missing_scope", "required": missing})
 
 
 def extract_bearer(authorization: str | None) -> str | None:
@@ -11,33 +34,64 @@ def extract_bearer(authorization: str | None) -> str | None:
     parts = authorization.split(None, 1)
     if len(parts) == 2 and parts[0].lower() == "bearer":
         return parts[1]
-    return authorization
+    return None
 
 
 def platform_api_key_from_request(request: Request) -> str | None:
-    # Prefer dedicated Decompute header. Fall back to Bearer only for non-Claude platform endpoints.
-    return (
-        request.headers.get("x-decompute-key")
-        or request.headers.get("x-decompute-api-key")
-        or request.headers.get("x-api-key")
-        or extract_bearer(request.headers.get("authorization"))
-    )
+    # Decompute platform auth intentionally does NOT use Anthropic x-api-key.
+    dedicated = request.headers.get("x-decompute-api-key") or request.headers.get("x-decompute-key")
+    if dedicated:
+        return dedicated
+    bearer = extract_bearer(request.headers.get("authorization"))
+    if bearer and bearer.startswith("dc_"):
+        return bearer
+    return None
 
 
-def auth_context(request: Request, store: Store, settings: Settings) -> dict:
+def auth_context(request: Request, store: Store, settings: Settings, *, required_scope: str | None = None) -> AuthPrincipal:
     raw = platform_api_key_from_request(request)
 
-    if raw == settings.dev_api_key:
-        return {"project_id": "proj_default", "key_prefix": raw[:10], "auth_mode": "dev"}
+    if raw and raw == settings.dev_api_key and not settings.is_production:
+        # Explicit dev convenience key — allowed only in non-production.
+        principal = AuthPrincipal(
+            project_id="proj_default",
+            org_id="org_default",
+            key_id=None,
+            key_prefix=raw[:12],
+            scopes=["admin"],
+            auth_mode="dev",
+        )
+    elif raw:
+        # A key was supplied — it must verify. Never fall through to local_noauth
+        # when a key is present; a revoked or unknown key is always 401.
+        found = store.verify_api_key(raw)
+        if not found:
+            raise HTTPException(status_code=401, detail="Invalid or revoked Decompute API key")
+        principal = AuthPrincipal(
+            project_id=found["project_id"],
+            org_id=found.get("org_id"),
+            key_id=found.get("key_id"),
+            key_prefix=found.get("key_prefix"),
+            scopes=found.get("scopes") or [],
+            auth_mode="api_key",
+        )
+    elif settings.require_auth:
+        # No key and auth is required.
+        raise HTTPException(status_code=401, detail="Missing Decompute API key")
+    else:
+        # No key provided in local/dev mode — unauthenticated passthrough.
+        principal = AuthPrincipal(
+            project_id="proj_default",
+            org_id="org_default",
+            key_id=None,
+            key_prefix=None,
+            scopes=["admin"],
+            auth_mode="local_noauth",
+        )
 
-    found = store.verify_api_key(raw or "")
-    if found:
-        return {"project_id": found["project_id"], "key_prefix": found["key_prefix"], "auth_mode": "api_key"}
-
-    if settings.require_auth:
-        raise HTTPException(status_code=401, detail="Missing or invalid Decompute API key")
-
-    return {"project_id": "proj_default", "key_prefix": None, "auth_mode": "local_noauth"}
+    if required_scope:
+        principal.require(required_scope)
+    return principal
 
 
 def upstream_anthropic_key(request: Request, settings: Settings) -> str | None:
@@ -45,5 +99,19 @@ def upstream_anthropic_key(request: Request, settings: Settings) -> str | None:
         return settings.anthropic_api_key
     if not settings.allow_client_provider_key:
         return None
-    # Claude/Anthropic-style clients usually send x-api-key. Some gateways use Bearer.
-    return request.headers.get("x-api-key") or extract_bearer(request.headers.get("authorization"))
+    # x-api-key is reserved for Anthropic/Claude clients. Bearer is used only if it is not a Decompute dc_* key.
+    api_key = request.headers.get("x-api-key")
+    if api_key:
+        return api_key
+    bearer = extract_bearer(request.headers.get("authorization"))
+    if bearer and not bearer.startswith("dc_"):
+        return bearer
+    return None
+
+
+def assert_csrf_for_browser_mutation(request: Request) -> None:
+    # API key clients are not browsers. For browser-origin admin mutations, require a CSRF header.
+    origin = request.headers.get("origin")
+    method = request.method.upper()
+    if method in {"POST", "PUT", "PATCH", "DELETE"} and origin and not request.headers.get("x-decompute-csrf"):
+        raise HTTPException(status_code=403, detail="Missing x-decompute-csrf header")

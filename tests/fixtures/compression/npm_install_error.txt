@@ -1,0 +1,40 @@
+npm ERR! code ERESOLVE
+npm ERR! ERESOLVE unable to resolve dependency tree
+npm ERR!
+npm ERR! While resolving: my-app@1.4.2
+npm ERR! Found: react@18.2.0
+npm ERR! node_modules/react
+npm ERR!   react@"^18.2.0" from the root project
+npm ERR!
+npm ERR! Could not resolve dependency:
+npm ERR! peer react@"^17.0.0" from react-legacy-table@3.1.0
+npm ERR! node_modules/react-legacy-table
+npm ERR!   react-legacy-table@"^3.1.0" from the root project
+npm ERR!
+npm ERR! Fix the upstream dependency conflict, or retry
+npm ERR! this command with --force or --legacy-peer-deps
+npm ERR! to accept an incorrect (and potentially broken) dependency resolution.
+npm ERR!
+npm WARN deprecated har-validator@5.1.5: this library is no longer supported
+npm WARN deprecated uuid@3.4.0: Please upgrade to version 7 or higher
+npm WARN deprecated request@2.88.2: request has been deprecated
+npm WARN old lockfile
+npm WARN old lockfile The package-lock.json file was created with an old version of npm
+npm notice
+npm notice New major version of npm available! 9.8.1 -> 10.2.4
+npm notice Run npm install -g npm@10.2.4 to update!
+npm ERR! A complete log of this run can be found in:
+npm ERR!     /Users/ci/.npm/_logs/2026-05-30T00_12_44_881Z-debug-0.log
+npm ERR! Exit status 1
+gyp ERR! build error
+gyp ERR! stack Error: `make` failed with exit code: 2
+gyp ERR! stack     at ChildProcess.onExit (/usr/local/lib/node_modules/npm/node_modules/node-gyp/lib/build.js:262:23)
+gyp ERR! System Darwin 25.5.0
+gyp ERR! command "node" "rebuild"
+gyp ERR! cwd /Users/ci/project/node_modules/node-sass
+gyp ERR! node -v v20.11.0
+gyp ERR! node-gyp -v v9.4.0
+gyp ERR! not ok
+npm ERR! node-sass@9.0.0 postinstall: `node scripts/build.js`
+npm ERR! Exit status 1
+npm ERR! Failed at the node-sass@9.0.0 postinstall script.

@@ -1,0 +1,22 @@
+2026-05-30T00:00:01Z INFO  kubelet  Pulling image "registry.internal/gateway:1.4.2"
+2026-05-30T00:00:04Z INFO  kubelet  Successfully pulled image in 3.21s
+2026-05-30T00:00:05Z INFO  kubelet  Created container gateway
+2026-05-30T00:00:05Z INFO  kubelet  Started container gateway
+2026-05-30T00:00:09Z INFO  gateway  Uvicorn running on http://0.0.0.0:8080
+2026-05-30T00:00:31Z WARN  gateway  db pool at 90% capacity (9/10)
+2026-05-30T00:00:42Z ERROR gateway  upstream anthropic timeout after 30000ms request-id=req_abc123
+2026-05-30T00:00:42Z ERROR gateway  OOMKilled: container exceeded memory limit 512Mi
+2026-05-30T00:00:43Z INFO  kubelet  Back-off restarting failed container gateway in pod gateway-7d9f-2xkqv
+2026-05-30T00:00:48Z WARN  kubelet  Readiness probe failed: HTTP probe returned statuscode=503
+2026-05-30T00:00:53Z ERROR kubelet  Pod gateway-7d9f-2xkqv status CrashLoopBackOff restartCount=4
+2026-05-30T00:01:02Z INFO  kubelet  Pulling image "registry.internal/gateway:1.4.2"
+2026-05-30T00:01:05Z INFO  kubelet  Started container gateway
+2026-05-30T00:01:09Z INFO  gateway  Uvicorn running on http://0.0.0.0:8080
+2026-05-30T00:01:40Z ERROR gateway  upstream anthropic timeout after 30000ms request-id=req_def456
+2026-05-30T00:01:41Z ERROR gateway  OOMKilled: container exceeded memory limit 512Mi
+2026-05-30T00:01:42Z INFO  kubelet  Back-off restarting failed container gateway in pod gateway-7d9f-2xkqv
+2026-05-30T00:01:50Z ERROR kubelet  Pod gateway-7d9f-2xkqv status CrashLoopBackOff restartCount=5
+2026-05-30T00:02:01Z WARN  hpa      unable to fetch metrics from resource metrics API
+2026-05-30T00:02:11Z INFO  scheduler Successfully assigned default/gateway-7d9f-9aab to node-3
+2026-05-30T00:02:18Z ERROR gateway  readiness gate failed: database connection refused to postgres:5432
+2026-05-30T00:02:25Z INFO  kubelet  Liveness probe succeeded after restart

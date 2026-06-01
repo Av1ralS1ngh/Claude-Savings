@@ -1,0 +1,40 @@
+diff --git a/apps/api/decompute_gateway/anthropic_provider.py b/apps/api/decompute_gateway/anthropic_provider.py
+index 1a2b3c4..5d6e7f8 100644
+--- a/apps/api/decompute_gateway/anthropic_provider.py
++++ b/apps/api/decompute_gateway/anthropic_provider.py
+@@ -81,13 +81,21 @@ async def call_anthropic_messages(
+     body: dict[str, Any],
+     *,
+     settings: Settings,
+     upstream_api_key: str | None,
+     prompt_cache_mode: str,
+     extra_headers: dict[str, str] | None = None,
+ ) -> ProviderResult:
+     if settings.mock_anthropic or not upstream_api_key:
+         return mock_claude_response(body)
+     clean_body = maybe_apply_prompt_cache(clean_gateway_fields(body), prompt_cache_mode)
+     headers = upstream_headers(settings, upstream_api_key, extra_headers)
+-    async with httpx.AsyncClient(timeout=None) as client:
+-        resp = await client.post(settings.anthropic_base_url.rstrip("/") + "/v1/messages", json=clean_body, headers=headers)
++    last_exc: Exception | None = None
++    for attempt in range(settings.upstream_max_retries + 1):
++        async with httpx.AsyncClient(timeout=None) as client:
++            resp = await client.post(settings.anthropic_base_url.rstrip("/") + "/v1/messages", json=clean_body, headers=headers)
++        if resp.status_code not in {500, 504, 529}:
++            break
++        await asyncio.sleep(settings.upstream_retry_backoff_s * (2 ** attempt))
+     try:
+         payload = resp.json()
+     except Exception:
+         payload = {"type": "error", "error": {"message": resp.text}}
+     return ProviderResult(status_code=resp.status_code, body=payload, headers=dict(resp.headers))
+diff --git a/apps/api/decompute_gateway/config.py b/apps/api/decompute_gateway/config.py
+index aaaa111..bbbb222 100644
+--- a/apps/api/decompute_gateway/config.py
++++ b/apps/api/decompute_gateway/config.py
+@@ -87,6 +87,9 @@ class Settings:
+     monthly_spend_usd: float = _float("DECOMPUTE_MONTHLY_SPEND_USD", 250.0)
++    upstream_max_retries: int = _int("DECOMPUTE_UPSTREAM_MAX_RETRIES", 2)
++    upstream_retry_backoff_s: float = _float("DECOMPUTE_UPSTREAM_RETRY_BACKOFF_S", 0.25)
+
+     allowed_models: list[str] = field(default_factory=lambda: _csv("DECOMPUTE_ALLOWED_MODELS", "claude-sonnet,claude-opus,claude-haiku"))

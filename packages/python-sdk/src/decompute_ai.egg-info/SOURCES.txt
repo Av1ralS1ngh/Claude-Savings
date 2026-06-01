@@ -3,6 +3,8 @@ pyproject.toml
 src/decompute_ai/__init__.py
 src/decompute_ai/cli.py
 src/decompute_ai/client.py
+src/decompute_ai/config.py
+src/decompute_ai/errors.py
 src/decompute_ai.egg-info/PKG-INFO
 src/decompute_ai.egg-info/SOURCES.txt
 src/decompute_ai.egg-info/dependency_links.txt

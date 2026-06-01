@@ -1,0 +1,28 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.12.11, pytest-9.0.3, pluggy-1.5.0
+rootdir: /Users/ci/project
+collected 214 items
+
+tests/test_auth.py ...........................                            [ 12%]
+tests/test_billing.py .................F......                            [ 28%]
+tests/test_compression.py .............................                   [ 47%]
+tests/test_gateway.py ..............................                      [ 68%]
+tests/test_streaming.py ............................                      [ 91%]
+tests/test_usage.py ....................                                  [100%]
+
+=================================== FAILURES ===================================
+_________________________ test_invoice_totals_match ___________________________
+
+    def test_invoice_totals_match():
+        invoice = build_invoice(project_id="proj_x", month="2026-05")
+>       assert invoice.total_usd == pytest.approx(expected_total)
+E       assert 142.07 == 138.40 ± 1.4e-04
+E        +  where 142.07 = Invoice(project='proj_x', month='2026-05').total_usd
+E        +  and   138.40 = approx(138.40)
+
+tests/test_billing.py:88: AssertionError
+----------------------------- Captured stderr call -----------------------------
+WARNING decompute.billing: cache_read tokens double-counted for 3 events
+=========================== short test summary info ============================
+FAILED tests/test_billing.py::test_invoice_totals_match - assert 142.07 == 138.40 ± 1.4e-04
+========================= 1 failed, 213 passed in 6.41s ========================
