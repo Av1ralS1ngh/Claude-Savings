@@ -118,6 +118,23 @@ sub(r'<text class="axis-label" x="0" y="36">100%</text>\s*'
     r'<text class="axis-label" x="0" y="216">25%</text>',
     _YLABELS, label='chart-ylabels')
 
+# ---- benchmark section: reference baseline / Decompute / delta / status ----
+_BENCH_SECTION = (
+    '      <!-- BENCHMARK -->\n'
+    '      <div class="section-label">Benchmark <span class="right">__BENCHMARK_META__</span></div>\n'
+    '      <div class="wl-card">\n'
+    '        <div class="wl-head"><h3>Compression vs reference baseline</h3>'
+    '<span class="meta">Reference baseline / Decompute / Delta / Status</span></div>\n'
+    '        <table class="wl-table">\n'
+    '          <thead><tr><th>Workload</th><th class="r">Reference baseline</th>'
+    '<th class="r">Decompute</th><th class="r">Delta</th><th class="r">Status</th></tr></thead>\n'
+    '          <tbody id="benchBody">__BENCHMARK_ROWS__</tbody>\n'
+    '        </table>\n'
+    '      </div>\n\n'
+    '      <!-- LOCAL SETUP -->'
+)
+sub(r'<!-- LOCAL SETUP -->', _BENCH_SECTION, label='benchmark-section')
+
 # ---- status pill reflects real health (was always-green hardcoded text) ----
 sub(r'<span class="status-pill">all systems operational</span>',
     '<span class="status-pill __STATUS_CLASS__">__STATUS_TEXT__</span>', label='status-pill')
@@ -177,7 +194,7 @@ EXPECTED_TOKENS = [
     '__CH_SENT_AREA_D__', '__CH_SENT_LINE_D__', '__CH_DOT_X__', '__CH_DOT_Y__',
     '__RANGE_DATA_JSON__', '__RANGE_LABEL__', '__RANGE_LABEL_LONG__', '__SCRIPT_NONCE__',
     '__CH_AXIS_0__', '__CH_AXIS_1__', '__CH_AXIS_2__', '__CH_AXIS_3__', '__CH_AXIS_4__',
-    '__STATUS_TEXT__', '__STATUS_CLASS__',
+    '__STATUS_TEXT__', '__STATUS_CLASS__', '__BENCHMARK_META__', '__BENCHMARK_ROWS__',
 ]
 missing = [t for t in EXPECTED_TOKENS if t not in o]
 assert not missing, f"missing tokens: {missing}"

@@ -299,7 +299,7 @@ _DASHBOARD_TEMPLATE = (Path(__file__).parent / "dashboard_template.html").read_t
 _WL_DOT_CLASSES = ["dot", "dot b", "dot o", "dot g"]
 _REQ_PALETTE = ["var(--ink)", "var(--blue)", "var(--orange)", "var(--green)", "var(--dim)"]
 _CAP_PILLS = {
-    "rust_core": ["headroom", "rust"],
+    "rust_core": ["yscompress", "rust"],
     "kompress_ml": ["torch", "Kompress-base"],
     "ast_code_aware": ["tree-sitter", "multi-lang"],
     "ccr_active": ["encrypted", "reversible"],
@@ -459,6 +459,34 @@ def _dashboard_chart(recent: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _dashboard_benchmark() -> tuple[str, str]:
+    """Latest versioned benchmark report -> (meta, table-rows HTML) for the dashboard
+    benchmark tab. Neutral terminology; reads benchmarks/reports/index.json -> latest."""
+    reports = Path(__file__).resolve().parents[3] / "benchmarks" / "reports"
+    try:
+        idx = json.loads((reports / "index.json").read_text(encoding="utf-8"))
+        rep = json.loads((reports / f"{idx['latest']}.json").read_text(encoding="utf-8"))
+    except Exception:
+        return "no report yet", ('<tr><td colspan="5" style="color:var(--dim);font-family:var(--sans)">'
+                                 'No benchmark report yet — run <code>scripts/rc_benchmark.py --release &lt;version&gt;</code>.</td></tr>')
+    meta = f"{rep.get('release', '?')} · gate {'PASS' if rep.get('gate_passed') else 'FAIL'}"
+    rows = []
+    for r in rep.get("comparison", []):
+        delta = r.get("delta_pct", 0) or 0
+        dstr = f"+{delta:g}" if delta >= 0 else f"{delta:g}"
+        dcolor = "var(--green-deep)" if delta >= 0 else "#c04646"
+        status = r.get("status", "")
+        scolor = "var(--green-deep)" if status.startswith("Pass") else "var(--orange)"
+        rows.append(
+            f'<tr><td>{html.escape(str(r.get("workload", "")))}</td>'
+            f'<td class="r">{r.get("reference_baseline_pct", "")}%</td>'
+            f'<td class="r">{r.get("decompute_pct", ""):g}%</td>'
+            f'<td class="r" style="color:{dcolor}">{dstr}</td>'
+            f'<td class="r" style="color:{scolor};font-weight:600">{html.escape(status)}</td></tr>'
+        )
+    return html.escape(meta), "".join(rows)
+
+
 _RANGE_LABELS = {
     "1h": ("last 1h", "last hour"),
     "24h": ("last 24h", "last 24 hours"),
@@ -545,6 +573,7 @@ def dashboard(request: Request, response: Response) -> str:
 
     dp = payloads[_DASHBOARD_DEFAULT_RANGE]
     chart = dp["chart"]
+    bench_meta, bench_rows = _dashboard_benchmark()
     # Embed all-range data for client-side tab switching; protect the </script> close.
     data_json = json.dumps(payloads).replace("</", "<\\/")
     repl = {
@@ -553,6 +582,8 @@ def dashboard(request: Request, response: Response) -> str:
         "__MEMBERS__": str(api_key_count),
         "__STATUS_TEXT__": html.escape(status_text),
         "__STATUS_CLASS__": status_class,
+        "__BENCHMARK_META__": bench_meta,
+        "__BENCHMARK_ROWS__": bench_rows,
         "__USER_INITIALS__": "LS",
         "__USER_NAME__": "Local session",
         "__USER_EMAIL__": html.escape(principal.key_prefix or settings.dev_api_key),

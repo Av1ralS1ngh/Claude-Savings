@@ -36,9 +36,9 @@ def _detect_rust_core() -> Capability:
         import headroom  # noqa: F401
         from headroom import compress  # noqa: F401
         ver = getattr(headroom, "__version__", "?")
-        return Capability("rust_core", True, f"headroom {ver} importable; SmartCrusher/CodeCompressor active")
+        return Capability("rust_core", True, f"YSCompress rust core {ver}; SmartCrusher/CodeCompressor active")
     except Exception as exc:  # pragma: no cover - only when lib absent
-        return Capability("rust_core", False, f"headroom not importable ({type(exc).__name__}); using local fallback")
+        return Capability("rust_core", False, f"rust core not importable ({type(exc).__name__}); using local fallback")
 
 
 @lru_cache(maxsize=1)

@@ -539,6 +539,16 @@
         <div class="req-list" id="reqList">__REQUEST_ROWS__</div>
       </div>
 
+            <!-- BENCHMARK -->
+      <div class="section-label">Benchmark <span class="right">__BENCHMARK_META__</span></div>
+      <div class="wl-card">
+        <div class="wl-head"><h3>Compression vs reference baseline</h3><span class="meta">Reference baseline / Decompute / Delta / Status</span></div>
+        <table class="wl-table">
+          <thead><tr><th>Workload</th><th class="r">Reference baseline</th><th class="r">Decompute</th><th class="r">Delta</th><th class="r">Status</th></tr></thead>
+          <tbody id="benchBody">__BENCHMARK_ROWS__</tbody>
+        </table>
+      </div>
+
       <!-- LOCAL SETUP -->
       <div class="section-label">Local setup</div>
       <div class="setup-card">
