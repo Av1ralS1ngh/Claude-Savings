@@ -28,6 +28,7 @@ from .rate_limits import RateLimitManager
 from .secret_scanner import SecretScanner
 from .security import AuthPrincipal, assert_csrf_for_browser_mutation, auth_context, upstream_anthropic_key
 from .sse import SSEUsageTracker
+from .streaming_cleanup import StreamUsageTracker, proxy_sse_stream
 from .workload import classify_workload
 from .yscompress import CCR_RETRIEVE_TOOL, YSCompressClient, estimate_tokens
 from .yellowstone import TrafficProfile, YellowstonePlanner, scan_local_devices
@@ -213,7 +214,7 @@ def _usage_from_result(result: ProviderResult) -> dict[str, int]:
     }
 
 
-def _record_usage(*, principal: AuthPrincipal, endpoint: str, model: str | None, raw_input_tokens: int, yscompress_input_tokens: int, yellowstone_final_input_tokens: int, output_tokens: int, cache_creation_input_tokens: int, cache_read_input_tokens: int, prompt_cache_mode: str, plan: Any, request_id: str, upstream_request_id: str | None, status_code: int, start_time: float, workload_class: str | None = None, optimization_steps: list[dict[str, Any]] | None = None) -> None:
+def _record_usage(*, principal: AuthPrincipal, endpoint: str, model: str | None, raw_input_tokens: int, yscompress_input_tokens: int, yellowstone_final_input_tokens: int, output_tokens: int, cache_creation_input_tokens: int, cache_read_input_tokens: int, prompt_cache_mode: str, plan: Any, request_id: str, upstream_request_id: str | None, status_code: int, start_time: float, workload_class: str | None = None, optimization_steps: list[dict[str, Any]] | None = None, stream_status: str | None = None, stream_cancelled: bool = False, stream_cancel_reason: str | None = None, stream_json: dict[str, Any] | None = None) -> None:
     elapsed_ms = int((time.perf_counter() - start_time) * 1000)
     billable_equiv = max(0, yellowstone_final_input_tokens - cache_creation_input_tokens - cache_read_input_tokens) + cache_creation_input_tokens + cache_read_input_tokens
     cost = cost_usd(model=model, input_tokens=yellowstone_final_input_tokens, output_tokens=output_tokens, cache_creation_input_tokens=cache_creation_input_tokens, cache_read_input_tokens=cache_read_input_tokens)
@@ -242,6 +243,10 @@ def _record_usage(*, principal: AuthPrincipal, endpoint: str, model: str | None,
                 "cache_mode": prompt_cache_mode,
                 "route": plan.to_dict() if plan else None,
                 "optimization_steps": optimization_steps or [],
+                "stream_status": stream_status,
+                "stream_cancelled": stream_cancelled,
+                "stream_cancel_reason": stream_cancel_reason,
+                "stream_json": stream_json,
             },
             project_id=principal.project_id,
             key_prefix=principal.key_prefix,
@@ -365,6 +370,20 @@ def _dashboard_cap_cards(caps: dict[str, dict[str, Any]]) -> str:
     return "".join(cards)
 
 
+def _stream_status_badge(r: dict[str, Any]) -> str:
+    """Inline-styled badge surfacing a cancelled / errored stream in the request feed."""
+    if r.get("stream_cancelled"):
+        return ('<span title="stream cancelled (client disconnect)" style="margin-left:6px;'
+                'font-family:var(--mono);font-size:9.5px;color:#c04646;background:#fdecec;'
+                'border-radius:4px;padding:1px 5px">cancelled</span>')
+    st = r.get("stream_status")
+    if st and st != "completed":
+        return (f'<span title="stream {html.escape(str(st))}" style="margin-left:6px;'
+                'font-family:var(--mono);font-size:9.5px;color:#9a6700;background:#fff4d6;'
+                f'border-radius:4px;padding:1px 5px">{html.escape(str(st))}</span>')
+    return ""
+
+
 def _dashboard_request_rows(recent: list[dict[str, Any]]) -> str:
     if not recent:
         return '<div class="req-empty">No requests yet — run a prompt through /v1/messages.</div>'
@@ -380,7 +399,7 @@ def _dashboard_request_rows(recent: list[dict[str, Any]]) -> str:
         cost = r.get("estimated_cost_usd") or 0.0
         rows.append(
             f'<div class="req-row"><span class="req-id">#{html.escape(rid)}</span>'
-            f'<div class="req-wl"><span class="d" style="background:{colors[wl]}"></span>{html.escape(wl)}</div>'
+            f'<div class="req-wl"><span class="d" style="background:{colors[wl]}"></span>{html.escape(wl)}{_stream_status_badge(r)}</div>'
             f'<div class="req-tokens"><span class="a">{raw:,}</span><span class="arr">&#8594;</span><span class="b">{sent:,}</span></div>'
             f'<span class="req-saved">{_row_saved_pct(r):.1f}%</span>'
             f'<span class="req-cost">${cost:.4f}</span>'
@@ -884,24 +903,61 @@ async def anthropic_messages_proxy(request: Request, payload: MessagesRequest) -
     upstream_key = upstream_anthropic_key(request, settings)
     headers = _response_headers(request_id=request_id, comp=comp, plan=plan)
     if bool(body.get("stream")):
-        tracker = SSEUsageTracker()
-        async def body_iter():
-            status_code = 200
-            try:
-                async with rate_limits.stream_slot(principal.project_id):
-                    async for chunk in stream_anthropic_messages(compressed_body, settings=settings, upstream_api_key=upstream_key, prompt_cache_mode=prompt_cache_mode, tracker=tracker, extra_headers=dict(request.headers)):
-                        yield chunk
-            except Exception as exc:
+        # Streaming with client-disconnect cleanup. proxy_sse_stream polls the
+        # downstream client; on disconnect/cancel it closes the upstream Anthropic
+        # stream and runs on_complete exactly once so usage is always finalized.
+        # `legacy` is fed by our provider only to capture the upstream request-id
+        # (an HTTP header the byte-parsing tracker can't see).
+        legacy = SSEUsageTracker()
+        stream_tracker = StreamUsageTracker()
+
+        def record_stream_usage(done: StreamUsageTracker) -> None:
+            done.upstream_request_id = done.upstream_request_id or legacy.upstream_request_id
+            if done.cancelled:
                 status_code = 499
-                log.warning("stream aborted", extra={"extra": {"request_id": request_id, "error": str(exc)}})
-                raise
+            elif done.stream_error:
+                # Prefer the real upstream HTTP status (429/500/529/...) when the
+                # provider propagated it; fall back to a generic 502 otherwise.
+                status_code = done.upstream_status_code or 502
+            else:
+                status_code = 200
+            if done.cancelled:
+                log.info("stream cancelled", extra={"extra": {"request_id": request_id, "reason": done.cancel_reason}})
+            _record_usage(
+                principal=principal, endpoint="/v1/messages:stream", model=model,
+                raw_input_tokens=comp.tokens_before, yscompress_input_tokens=comp.tokens_after,
+                yellowstone_final_input_tokens=plan.yellowstone_final_input_tokens,
+                output_tokens=done.output_tokens,
+                cache_creation_input_tokens=done.cache_creation_input_tokens,
+                cache_read_input_tokens=done.cache_read_input_tokens,
+                prompt_cache_mode=prompt_cache_mode, plan=plan, request_id=request_id,
+                upstream_request_id=done.upstream_request_id, status_code=status_code,
+                start_time=start, workload_class=workload,
+                stream_status=done.status, stream_cancelled=done.cancelled,
+                stream_cancel_reason=done.cancel_reason, stream_json=done.to_dict(),
+            )
+
+        async def body_iter(release_slot):
+            upstream = stream_anthropic_messages(
+                compressed_body, settings=settings, upstream_api_key=upstream_key,
+                prompt_cache_mode=prompt_cache_mode, tracker=legacy, extra_headers=dict(request.headers),
+            )
+            # The slot is released on every exit — normal completion, client
+            # disconnect, or task cancellation — via this generator's finally,
+            # which Starlette runs when it closes the response body.
+            try:
+                async for chunk in proxy_sse_stream(
+                    upstream, request=request, tracker=stream_tracker, on_complete=record_stream_usage,
+                ):
+                    yield chunk
             finally:
-                u = tracker.to_usage()
-                # If the stream emitted an SSE error event after the 200, record it as failed.
-                if tracker.error and status_code == 200:
-                    status_code = 502
-                _record_usage(principal=principal, endpoint="/v1/messages:stream", model=model, raw_input_tokens=comp.tokens_before, yscompress_input_tokens=comp.tokens_after, yellowstone_final_input_tokens=plan.yellowstone_final_input_tokens, output_tokens=int(u.get("output_tokens") or 0), cache_creation_input_tokens=int(u.get("cache_creation_input_tokens") or 0), cache_read_input_tokens=int(u.get("cache_read_input_tokens") or 0), prompt_cache_mode=prompt_cache_mode, plan=plan, request_id=request_id, upstream_request_id=tracker.upstream_request_id, status_code=status_code, start_time=start, workload_class=workload)
-        return StreamingResponse(body_iter(), media_type="text/event-stream", headers=headers)
+                release_slot()
+
+        # Reserve the concurrent-stream slot here, in the request cycle, so an
+        # over-limit raises a real HTTP 429 (a limit enforced inside body_iter would
+        # fire only after the 200 status line is already committed on the wire).
+        release_slot = rate_limits.acquire_stream_slot(principal.project_id)
+        return StreamingResponse(body_iter(release_slot), media_type="text/event-stream", headers=headers)
     result = await call_anthropic_messages(compressed_body, settings=settings, upstream_api_key=upstream_key, prompt_cache_mode=prompt_cache_mode, extra_headers=dict(request.headers))
     # Honest accounting: CCR savings only materialize if Claude does NOT retrieve.
     # When it does, the originals come back and must be counted as tokens sent.

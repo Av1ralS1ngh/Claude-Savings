@@ -444,6 +444,10 @@ class Store:
             cache_mode=event.get("cache_mode"),
             route_json=event.get("route"),
             optimization_steps_json=event.get("optimization_steps"),
+            stream_status=event.get("stream_status"),
+            stream_cancelled=bool(event.get("stream_cancelled", False)),
+            stream_cancel_reason=event.get("stream_cancel_reason"),
+            stream_json=event.get("stream_json"),
         )
         with self.session() as s:
             s.add(row)
@@ -598,6 +602,10 @@ class Store:
             "cache_mode": u.cache_mode,
             "route": u.route_json,
             "optimization_steps": u.optimization_steps_json,
+            "stream_status": u.stream_status,
+            "stream_cancelled": bool(u.stream_cancelled),
+            "stream_cancel_reason": u.stream_cancel_reason,
+            "stream_json": u.stream_json,
             "created_at": u.created_at.isoformat() if u.created_at else None,
         }
 

@@ -200,8 +200,14 @@ async def stream_anthropic_messages(
                 try:
                     err_body = await resp.aread()
                     err_json = json.loads(err_body.decode("utf-8"))
+                    if not isinstance(err_json, dict):
+                        err_json = {"type": "error", "error": {"message": str(err_json)}}
                 except Exception:
                     err_json = {"type": "error", "error": {"message": f"upstream HTTP {resp.status_code}"}}
+                # Carry the real upstream HTTP status on the SSE error payload so the
+                # gateway can record it (rather than collapsing every stream error to
+                # 502); SSE events otherwise have no place for an HTTP status.
+                err_json.setdefault("http_status", resp.status_code)
                 chunk = f"event: error\ndata: {json_dumps(err_json)}\n\n".encode()
                 tracker.feed(chunk)
                 yield chunk

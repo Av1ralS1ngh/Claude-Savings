@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import asyncio
 import time
-from typing import AsyncIterator
+from typing import AsyncIterator, Callable
 
 from fastapi import HTTPException
 
@@ -50,7 +50,12 @@ class RateLimitManager:
         self.settings = settings
         self.key_rpm: dict[str, WindowCounter] = defaultdict(lambda: WindowCounter(deque()))
         self.project_tokens: dict[str, SlidingTokenWindow] = defaultdict(SlidingTokenWindow)
-        self.project_stream_semaphores: dict[str, asyncio.Semaphore] = defaultdict(lambda: asyncio.Semaphore(settings.max_concurrent_streams_per_project))
+        # Concurrent-stream gate as a plain in-flight counter. A counter (not a
+        # Semaphore) is used deliberately: the limit is enforced as immediate
+        # accept/reject from the request handler, so there is no waiting — and the
+        # synchronous check-then-increment cannot over-admit under single-threaded
+        # asyncio, avoiding the wait_for(acquire) permit-leak race entirely.
+        self.project_stream_active: dict[str, int] = defaultdict(int)
         # Process-local for V0 (matches the in-memory limiter); move to Redis/DB with the limiter.
         self.overrides: dict[str, dict[str, float]] = {}
 
@@ -99,14 +104,39 @@ class RateLimitManager:
         if monthly >= limits["monthly_spend_usd"]:
             raise HTTPException(status_code=402, detail="Project monthly spend cap exceeded")
 
+    def acquire_stream_slot(self, project_id: str) -> Callable[[], None]:
+        """Reserve a concurrent-stream slot, returning an idempotent release callable.
+
+        Must be called from the request handler BEFORE the StreamingResponse is
+        constructed: a StreamingResponse commits the 200 status line as soon as the
+        body generator yields, so a limit enforced inside the generator can never
+        surface as an HTTP 429. Acquiring here lets the 429 raise in the request
+        cycle, where FastAPI converts it to a real response.
+
+        The check-and-increment below is synchronous (no await between them), so under
+        single-threaded asyncio it cannot over-admit. The returned release is
+        idempotent, so wiring it into a generator's ``finally`` (which may run more
+        than once across close/GC) never double-decrements.
+        """
+        limit = int(self.settings.max_concurrent_streams_per_project)
+        if self.project_stream_active[project_id] >= limit:
+            raise HTTPException(status_code=429, detail="Too many concurrent streams", headers={"retry-after": "10"})
+        self.project_stream_active[project_id] += 1
+        released = False
+
+        def release() -> None:
+            nonlocal released
+            if released:
+                return
+            released = True
+            self.project_stream_active[project_id] = max(0, self.project_stream_active[project_id] - 1)
+
+        return release
+
     @asynccontextmanager
     async def stream_slot(self, project_id: str) -> AsyncIterator[None]:
-        sem = self.project_stream_semaphores[project_id]
-        try:
-            await asyncio.wait_for(sem.acquire(), timeout=0.01)
-        except asyncio.TimeoutError:
-            raise HTTPException(status_code=429, detail="Too many concurrent streams", headers={"retry-after": "10"})
+        release = self.acquire_stream_slot(project_id)
         try:
             yield
         finally:
-            sem.release()
+            release()

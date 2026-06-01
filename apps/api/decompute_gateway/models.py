@@ -135,11 +135,17 @@ class UsageEvent(Base):
     cache_mode: Mapped[str | None] = mapped_column(String(32))
     route_json: Mapped[dict[str, Any] | None] = mapped_column(JSONField)
     optimization_steps_json: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONField)
+    # Streaming accounting (nullable: only set on streamed requests; legacy rows stay NULL).
+    stream_status: Mapped[str | None] = mapped_column(String(40), index=True)
+    stream_cancelled: Mapped[bool | None] = mapped_column(Boolean, default=False)
+    stream_cancel_reason: Mapped[str | None] = mapped_column(String(64))
+    stream_json: Mapped[dict[str, Any] | None] = mapped_column(JSONField)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     __table_args__ = (
         Index("ix_usage_project_created", "project_id", "created_at"),
         Index("ix_usage_project_model_created", "project_id", "model", "created_at"),
         Index("ix_usage_project_workload_created", "project_id", "workload_class", "created_at"),
+        Index("ix_usage_project_stream_status_created", "project_id", "stream_status", "created_at"),
     )
 
 
