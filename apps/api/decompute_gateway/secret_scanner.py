@@ -43,17 +43,25 @@ def _mask(kind: str, raw: str) -> str:
     return f"<{kind}:{len(raw)}chars>"
 
 
+# Which finding kinds are user PII (vs credentials/secrets). Secrets are ALWAYS
+# hard-redacted; PII follows pii_mode (tokenize by default).
+_PII_KINDS = frozenset(k for k, _p, pii in _PATTERNS if pii)
+
+
 class SecretScanner:
-    """Fast local secret + PII scanner for CCR governance.
+    """Fast local secret + PII scanner for outbound privacy governance.
 
-    Conservative by design: any finding switches CCR into redacted / non-storing
-    mode rather than persisting raw credentials or user details. Previews never
-    contain reconstructable secret material.
+    Two surfaces:
+      - redact(): hard-redact EVERY finding to [REDACTED:<kind>]. Used for stored CCR
+        previews where maximum safety is wanted (no reconstructable material at all).
+      - scrub(): the outbound privacy filter applied before content reaches Claude or
+        the store. Secrets are ALWAYS hard-redacted (a credential has no value to the
+        model and is pure liability). PII is *tokenized* with a stable per-value
+        pseudonym when mode == "tokenize" (so the model keeps "user A vs B" structure
+        without the raw value), or hard-redacted when mode == "redact".
 
-    mode controls how a finding is rewritten by redact():
-      "redact"   -> [REDACTED:<kind>]   (removes the value)
-      "tokenize" -> <kind:Nchars>        (keeps kind + length, no secret material)
-    An unrecognized mode falls back to "redact" — never passthrough.
+    mode (pii_mode) governs PII handling only; secrets ignore it. Unknown mode falls
+    back to "redact" — never passthrough.
     """
 
     def __init__(self, mode: str = "redact") -> None:
@@ -68,10 +76,10 @@ class SecretScanner:
 
     @staticmethod
     def has_pii(findings: list[SecretFinding]) -> bool:
-        pii_kinds = {k for k, _p, pii in _PATTERNS if pii}
-        return any(f.kind in pii_kinds for f in findings)
+        return any(f.kind in _PII_KINDS for f in findings)
 
     def redact(self, text: str, findings: list[SecretFinding] | None = None) -> str:
+        """Hard-redact every finding (secrets AND PII) to [REDACTED:<kind>]."""
         findings = findings if findings is not None else self.scan(text)
         if not findings:
             return text
@@ -81,7 +89,44 @@ class SecretScanner:
             if f.start < last:  # overlapping match — skip
                 continue
             out.append(text[last:f.start])
-            out.append(f.masked if self.mode == "tokenize" else f"[REDACTED:{f.kind}]")
+            out.append(f"[REDACTED:{f.kind}]")
+            last = f.end
+        out.append(text[last:])
+        return "".join(out)
+
+    def scrub(self, text: str, *, scrub_pii: bool = True, registry: dict | None = None) -> str:
+        """Outbound privacy filter. Secrets -> hard-redacted always. PII -> stable
+        pseudonym token when mode=='tokenize' (and scrub_pii), hard-redacted when
+        mode=='redact', or left intact when scrub_pii is False (e.g. the user's own
+        latest instruction — their deliberate input). `registry` carries the
+        value->token map so the same value gets the same token across the request."""
+        if not text:
+            return text
+        findings = self.scan(text)
+        if not findings:
+            return text
+        if registry is None:
+            registry = {}
+        out: list[str] = []
+        last = 0
+        for f in sorted(findings, key=lambda x: x.start):
+            if f.start < last:
+                continue
+            out.append(text[last:f.start])
+            raw = text[f.start:f.end]
+            if f.kind not in _PII_KINDS:                 # secret -> always removed
+                out.append(f"[REDACTED:{f.kind}]")
+            elif not scrub_pii:                          # user's own instruction -> keep PII
+                out.append(raw)
+            elif self.mode == "tokenize":                # PII -> stable pseudonym
+                key = (f.kind, raw)
+                tok = registry.get(key)
+                if tok is None:
+                    tok = f"<{f.kind}_{sum(1 for k in registry if k[0] == f.kind) + 1}>"
+                    registry[key] = tok
+                out.append(tok)
+            else:                                        # pii_mode == redact
+                out.append(f"[REDACTED:{f.kind}]")
             last = f.end
         out.append(text[last:])
         return "".join(out)

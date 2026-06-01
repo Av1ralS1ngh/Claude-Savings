@@ -42,7 +42,7 @@ CODE_PATTERNS = [
 # CCR reference-replacement is an atomic, self-contained stage (see ccr.py).
 # Re-exported here so existing imports (`from .yscompress import CCR_RETRIEVE_TOOL`)
 # keep working.
-from .ccr import CCR_RETRIEVE_TOOL, CCRStage  # noqa: E402
+from .ccr import CCR_RETRIEVE_TOOL, CCRStage, scrub_messages  # noqa: E402
 
 
 @dataclass
@@ -136,8 +136,12 @@ class YSCompressClient:
         mode = mode or self.settings.yscompress_default_mode
         ccr_enabled = self.settings.ccr_enabled if ccr is None else bool(ccr)
         tokens_before = estimate_tokens(messages)
+        # Privacy filter (always on, even when compression is off): hard-redact secrets
+        # and tokenize/redact PII BEFORE anything reaches Claude or the store.
+        messages = scrub_messages(messages, self.scanner, preserve_latest_user=preserve_latest_user)
         if mode == "off":
-            return CompressionResult(messages=messages, tokens_before=tokens_before, tokens_after=tokens_before, tokens_saved=0, compression_ratio=1.0, mode=mode, engine="off", transforms_applied=[], ccr_keys=[])
+            after = estimate_tokens(messages)
+            return CompressionResult(messages=messages, tokens_before=tokens_before, tokens_after=after, tokens_saved=max(0, tokens_before - after), compression_ratio=round(after / max(tokens_before, 1), 4), mode=mode, engine="off", transforms_applied=["privacy_scrub"], ccr_keys=[])
 
         # ── Stage 0: iterative CCR (reference-replacement) ─────────────────────
         # Replace bulky tool outputs with an encrypted-and-stored reference + a

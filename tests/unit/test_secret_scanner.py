@@ -43,3 +43,36 @@ def test_pii_redaction_removes_user_details():
     redacted = scanner.redact("Contact alice@customer.com about order")
     assert "alice@customer.com" not in redacted
     assert "[REDACTED:email]" in redacted
+
+
+# ── scrub(): outbound privacy filter (secrets hard-redacted, PII per mode) ──
+def test_scrub_secrets_always_hard_redacted_even_in_tokenize_mode():
+    scanner = SecretScanner(mode="tokenize")
+    out = scanner.scrub("deploy key sk-ant-abcdefghijklmnopqrstuvwxyz012345 here")
+    assert "sk-ant-" not in out
+    assert "[REDACTED:anthropic_key]" in out  # secret removed, not tokenized
+
+
+def test_scrub_tokenizes_pii_with_stable_tokens():
+    scanner = SecretScanner(mode="tokenize")
+    out = scanner.scrub("from alice@corp.com and bob@corp.com and alice@corp.com again")
+    assert "alice@corp.com" not in out and "bob@corp.com" not in out
+    assert out.count("<email_1>") == 2  # same value -> same token
+    assert "<email_2>" in out           # distinct value -> distinct token
+
+
+def test_scrub_redact_mode_removes_pii():
+    scanner = SecretScanner(mode="redact")
+    out = scanner.scrub("contact alice@corp.com")
+    assert "alice@corp.com" not in out
+    assert "[REDACTED:email]" in out
+
+
+def test_scrub_keeps_pii_when_not_scrubbing_but_still_kills_secrets():
+    """The user's own latest instruction: keep their PII, still remove secrets."""
+    scanner = SecretScanner(mode="tokenize")
+    out = scanner.scrub("email alice@corp.com using key sk-ant-abcdefghijklmnopqrstuvwxyz012345",
+                        scrub_pii=False)
+    assert "alice@corp.com" in out                 # deliberate user PII kept
+    assert "sk-ant-" not in out                     # secret still removed
+    assert "[REDACTED:anthropic_key]" in out

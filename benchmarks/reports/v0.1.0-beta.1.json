@@ -2,9 +2,9 @@
   "schema_version": 2,
   "release": "v0.1.0-beta.1",
   "benchmark_version": "rc-2026.06.01",
-  "generated_at": "2026-06-01T08:54:07+00:00",
+  "generated_at": "2026-06-01T10:05:53+00:00",
   "gate_passed": true,
-  "release_note": "SRE incident compression improved from 66% to 75%+; GitHub issue triage improved from 71.2% to 77.6%.",
+  "release_note": "SRE incident compression improved from 66% to 75%+; GitHub issue triage improved from 71.2% to 77.4%.",
   "invariants": [
     {
       "invariant": "benchmark_version",
@@ -48,7 +48,7 @@
         "redact",
         "tokenize"
       ],
-      "actual": "redact",
+      "actual": "tokenize",
       "ok": true
     },
     {
@@ -98,8 +98,8 @@
     {
       "workload": "SRE incident",
       "reference_baseline_pct": 92,
-      "decompute_pct": 76.3,
-      "delta_pct": -15.7,
+      "decompute_pct": 77.5,
+      "delta_pct": -14.5,
       "threshold_pct": 75,
       "status": "V0 pass / V1 LogPack target: 85\u201390%"
     }
@@ -111,7 +111,7 @@
     "ccr_active": true
   },
   "kompress_loaded_at_runtime": true,
-  "pii_mode": "redact",
+  "pii_mode": "tokenize",
   "excluded_workloads": [],
   "measured_workloads": [
     {
@@ -187,11 +187,11 @@
       "engine": "yscompress_rust+ccr",
       "fallback_used": false,
       "ccr_engaged": true,
-      "measured_pct": 76.3,
-      "decompute_pct": 76.3,
+      "measured_pct": 77.5,
+      "decompute_pct": 77.5,
       "excluded": [],
       "valid": true,
-      "delta_pct": -15.7,
+      "delta_pct": -14.5,
       "status": "V0 pass / V1 LogPack target: 85\u201390%"
     },
     {
@@ -204,11 +204,11 @@
         "ast"
       ],
       "v1_target": null,
-      "engine": "yscompress_rust",
+      "engine": "yscompress_rust+ccr",
       "fallback_used": false,
-      "ccr_engaged": false,
-      "measured_pct": 93.1,
-      "decompute_pct": 93.1,
+      "ccr_engaged": true,
+      "measured_pct": 93.6,
+      "decompute_pct": 93.6,
       "excluded": [],
       "valid": true,
       "delta_pct": null,

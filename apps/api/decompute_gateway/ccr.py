@@ -232,6 +232,45 @@ def _latest_user_index(messages: list[dict[str, Any]]) -> int | None:
     return None
 
 
+def _scrub_content(content: Any, scanner: SecretScanner, *, scrub_pii: bool, registry: dict) -> Any:
+    """Apply scanner.scrub to every string surface of a message content (plain string,
+    text blocks, tool_result content). tool_use inputs are left untouched (model-
+    generated calls, not user data)."""
+    if isinstance(content, str):
+        return scanner.scrub(content, scrub_pii=scrub_pii, registry=registry)
+    if isinstance(content, list):
+        new_blocks: list[Any] = []
+        for b in content:
+            if isinstance(b, dict):
+                nb = dict(b)
+                if isinstance(nb.get("text"), str):
+                    nb["text"] = scanner.scrub(nb["text"], scrub_pii=scrub_pii, registry=registry)
+                if nb.get("type") == "tool_result" and "content" in nb:
+                    nb["content"] = _scrub_content(nb["content"], scanner, scrub_pii=scrub_pii, registry=registry)
+                new_blocks.append(nb)
+            else:
+                new_blocks.append(b)
+        return new_blocks
+    return content
+
+
+def scrub_messages(messages: list[dict[str, Any]], scanner: SecretScanner, *, preserve_latest_user: bool = True) -> list[dict[str, Any]]:
+    """Outbound privacy filter applied before compression/forwarding: secrets are
+    hard-redacted everywhere; PII is tokenized (or redacted) everywhere EXCEPT the
+    user's own latest instruction, whose PII is their deliberate input and is kept
+    (secrets there are still removed). Returns new message objects."""
+    latest = _latest_user_index(messages) if preserve_latest_user else None
+    registry: dict = {}
+    out: list[dict[str, Any]] = []
+    for idx, msg in enumerate(messages):
+        new_msg = dict(msg)
+        new_msg["content"] = _scrub_content(
+            msg.get("content"), scanner, scrub_pii=(idx != latest), registry=registry
+        )
+        out.append(new_msg)
+    return out
+
+
 class CCRStage:
     """Reference-replacement stage. One instance per request is cheap; all state
     lives in the injected store/crypto/scanner."""

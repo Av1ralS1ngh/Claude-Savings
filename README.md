@@ -1,15 +1,35 @@
 # Decompute Claude Optimization Gateway
 
-A first platform iteration for **Claude optimization through Headroom + Yellowstone**.
+A first platform iteration for **Claude optimization through YSCompress + Yellowstone**.
 
 This project intentionally drops Echelon from the v0 request path. The product is a self-serve gateway that sits in front of Claude and reduces input tokens / repeated context by combining:
 
-- **Headroom**: context compression for tool outputs, logs, RAG chunks, files, and long conversation context.
+- **YSCompress**: context compression (rust core + optional ML) for tool outputs, logs, RAG chunks, files, and long conversation context.
 - **Yellowstone**: routing, device/profile awareness, KV-cache estimation, and cost/latency planning.
 - **Claude proxy**: Anthropic-compatible `/v1/messages` and OpenAI-compatible `/v1/chat/completions` endpoints.
 - **Self-serve platform shell**: API keys, projects, device scan, usage metrics, dashboard, Python SDK, CLI, Docker.
 
 > Important: this does not host Claude weights. It hosts the optimization layer in front of Claude.
+
+## Install the CLI
+
+One line — installs the `decompute` CLI into an isolated venv and links it onto your PATH:
+
+```bash
+curl -fsSL https://<host>/install.sh | bash
+# or from a checkout:
+bash scripts/install.sh
+```
+
+Then:
+
+```bash
+decompute init        # save gateway URL + API key  ->  ~/.decompute/config.json
+decompute doctor      # verify connection, auth, and active capabilities
+decompute claude      # route Claude Code through the gateway
+decompute vscode .    # configure the current VS Code project to use the gateway
+decompute uninstall   # remove ~/.decompute and the CLI shim
+```
 
 ## Quickstart on Mac
 
@@ -47,32 +67,30 @@ ANTHROPIC_API_KEY=sk-ant-...
 
 Restart `make dev`.
 
-## Add Headroom
+## Compression engine
 
-```bash
-pip install "yscompress[all]"
-export YSCOMPRESS_TELEMETRY=off
-yscompress proxy --port 8787 --no-telemetry
-```
-
-Edit `.env`:
-
-```bash
-YSCOMPRESS_BASE_URL=http://127.0.0.1:8787
-```
-
-Restart the gateway. If Headroom is not running, the gateway falls back to a local safe compressor.
+The gateway bundles the YSCompress **rust core** (SmartCrusher / CodeCompressor) plus an optional **ML** pass (Kompress). Both run in-process — no separate service to start. If the rust core can't be imported, the gateway falls back to a local safe compressor. Run `decompute doctor` (or open the dashboard) to see which engines are active.
 
 ## Claude Code through the gateway
 
-For local Claude Code proxying:
+Easiest — let the CLI configure it:
+
+```bash
+decompute claude                 # writes ~/.decompute/claude.env
+source ~/.decompute/claude.env
+claude                           # now routed through the gateway
+```
+
+Or set the env manually:
 
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
-export ANTHROPIC_API_KEY=sk-ant-...   # sent to gateway and/or used by gateway
+export ANTHROPIC_API_KEY=dc_dev_local   # your Decompute key; the gateway holds the real upstream key
 ```
 
-Then start Claude Code normally. For production, prefer running the gateway with `ANTHROPIC_API_KEY` set server-side and `DECOMPUTE_REQUIRE_AUTH=true` for platform endpoints.
+**VS Code:** `decompute vscode .` writes `.vscode/settings.json` so Claude Code in the integrated terminal routes through the gateway.
+
+For production, run the gateway with `ANTHROPIC_API_KEY` set server-side and `DECOMPUTE_DASHBOARD_AUTH_REQUIRED=true`.
 
 ## SDK example
 
@@ -102,8 +120,10 @@ print(resp["yellowstone"])
 GET  /health
 GET  /dashboard
 POST /v1/messages                 Anthropic-compatible proxy
+POST /v1/messages/count_tokens     Anthropic-compatible token count
+GET  /v1/models                    Anthropic-compatible model list
 POST /v1/chat/completions          OpenAI-compatible proxy
-POST /v1/compression/preview       Headroom/fallback compression preview
+POST /v1/compression/preview       YSCompress/fallback compression preview
 POST /v1/routes/plan               Yellowstone route plan
 POST /v1/devices/scan              Local device profile scan
 GET  /v1/usage                     Token savings and usage summary
@@ -118,8 +138,8 @@ apps/api/decompute_gateway/
   yscompress.py           YSCompress client + local fallback compressor
   anthropic_provider.py    Claude upstream/mock provider
   yellowstone/             Device profiles, KV estimator, router/planner
-  db.py                    SQLite persistence
-packages/python-sdk/       Thin SDK + CLI
+  db.py                    Postgres persistence (SQLite for local dev) + Alembic
+packages/python-sdk/       Thin SDK + CLI (decompute init/doctor/claude/vscode/uninstall)
 research/yellowstone_legacy Legacy Yellowstone files, not imported in v0
 ```
 

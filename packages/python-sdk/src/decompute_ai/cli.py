@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -9,8 +11,11 @@ from rich import print
 from rich.table import Table
 
 from .client import Decompute
-from .config import CONFIG_PATH, load_config, save_config
+from .config import CONFIG_DIR, CONFIG_PATH, load_config, save_config
 from .errors import DecomputeError
+
+DEFAULT_BASE_URL = "http://127.0.0.1:8080"
+DEFAULT_API_KEY = "dc_dev_local"
 
 app = typer.Typer(help="Decompute Gateway CLI")
 
@@ -50,6 +55,115 @@ def config_set(key: str, value: str):
 @app.command("config-show")
 def config_show():
     print(json.dumps(load_config(), indent=2))
+
+
+def _conn() -> tuple[str, str]:
+    """(base_url, api_key) from saved config, falling back to local-dev defaults."""
+    cfg = load_config()
+    return (cfg.get("base_url") or DEFAULT_BASE_URL).rstrip("/"), (cfg.get("api_key") or DEFAULT_API_KEY)
+
+
+@app.command()
+def init(
+    base_url: str = typer.Option(DEFAULT_BASE_URL, "--base-url", help="Gateway URL"),
+    api_key: str = typer.Option(DEFAULT_API_KEY, "--api-key", help="Decompute API key (dc_...)"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="non-interactive (accept defaults)"),
+):
+    """Initialize local config (~/.decompute/config.json) and verify the gateway."""
+    if not yes:
+        base_url = typer.prompt("Gateway URL", default=base_url)
+        api_key = typer.prompt("Decompute API key", default=api_key)
+    base_url = base_url.rstrip("/")
+    save_config({"base_url": base_url, "api_key": api_key})
+    print(f"[green]✓[/green] saved {CONFIG_PATH}")
+    try:
+        h = Decompute(api_key=api_key, base_url=base_url).get("/health")
+        print(f"[green]✓ gateway reachable[/green] — env={h.get('environment')} mock={h.get('mock_anthropic')}")
+        print("Next: [bold]decompute claude[/bold] (or [bold]decompute vscode .[/bold]) to route your tools through it.")
+    except DecomputeError as exc:
+        print(f"[yellow]Config saved, but the gateway isn't reachable yet:[/yellow] {exc}")
+        print("Start it (scripts/run_gateway.sh), then run [bold]decompute doctor[/bold].")
+
+
+@app.command()
+def claude(
+    write_profile: bool = typer.Option(False, "--write-profile", help="append the source line to your shell rc"),
+):
+    """Configure Claude Code to route through the Decompute gateway (writes a sourceable env file)."""
+    base_url, api_key = _conn()
+    env_lines = [f'export ANTHROPIC_BASE_URL="{base_url}"', f'export ANTHROPIC_API_KEY="{api_key}"']
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    env_path = CONFIG_DIR / "claude.env"
+    env_path.write_text("\n".join(env_lines) + "\n", encoding="utf-8")
+    try:
+        env_path.chmod(0o600)
+    except Exception:
+        pass
+    print(f"[green]✓[/green] wrote {env_path}")
+    print("Activate it for Claude Code:")
+    print(f"  [bold]source {env_path}[/bold]   # then run `claude` as usual")
+    if write_profile:
+        rc = Path.home() / (".zshrc" if str(os.getenv("SHELL", "")).endswith("zsh") else ".bashrc")
+        line = f"source {env_path}"
+        existing = rc.read_text(encoding="utf-8") if rc.exists() else ""
+        if line in existing:
+            print(f"[green]✓[/green] already in {rc}")
+        else:
+            rc.write_text(existing + ("" if existing.endswith("\n") or not existing else "\n") + line + "\n", encoding="utf-8")
+            print(f"[green]✓[/green] appended to {rc} — restart your shell")
+    else:
+        print(f"  make it permanent: [bold]echo 'source {env_path}' >> ~/.zshrc[/bold]")
+
+
+@app.command()
+def vscode(
+    path: Path = typer.Argument(Path("."), help="project directory to configure (default: .)"),
+):
+    """Configure a VS Code project so Claude Code in its terminal routes through the gateway."""
+    base_url, api_key = _conn()
+    vsdir = path / ".vscode"
+    vsdir.mkdir(parents=True, exist_ok=True)
+    settings_path = vsdir / "settings.json"
+    try:
+        settings = json.loads(settings_path.read_text(encoding="utf-8")) if settings_path.exists() else {}
+        if not isinstance(settings, dict):
+            settings = {}
+    except Exception:
+        settings = {}
+    env_block = {"ANTHROPIC_BASE_URL": base_url, "ANTHROPIC_API_KEY": api_key}
+    for key in ("terminal.integrated.env.osx", "terminal.integrated.env.linux", "terminal.integrated.env.windows"):
+        block = settings.get(key)
+        if not isinstance(block, dict):
+            block = {}
+        block.update(env_block)
+        settings[key] = block
+    settings_path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+    print(f"[green]✓[/green] configured {settings_path}")
+    print("Reopen the VS Code integrated terminal; `claude` there now routes through the gateway.")
+
+
+@app.command()
+def uninstall(
+    yes: bool = typer.Option(False, "--yes", "-y", help="skip the confirmation prompt"),
+):
+    """Remove local Decompute config + credentials (~/.decompute) and the CLI shim."""
+    removed = []
+    if CONFIG_DIR.exists():
+        if not yes and not typer.confirm(f"Remove {CONFIG_DIR} (config, credentials, env files, venv)?"):
+            raise typer.Exit(code=1)
+        shutil.rmtree(CONFIG_DIR, ignore_errors=True)
+        removed.append(str(CONFIG_DIR))
+    shim = Path.home() / ".local" / "bin" / "decompute"
+    if shim.exists() or shim.is_symlink():
+        shim.unlink(missing_ok=True)
+        removed.append(str(shim))
+    if removed:
+        print("[green]✓ removed[/green] " + ", ".join(removed))
+    else:
+        print("Nothing to remove — Decompute is not installed in the usual locations.")
+    print("If you ran `decompute claude --write-profile` or `decompute vscode`, remove the "
+          "`source ~/.decompute/claude.env` line from your shell rc and the env block from "
+          ".vscode/settings.json manually.")
 
 
 @app.command()

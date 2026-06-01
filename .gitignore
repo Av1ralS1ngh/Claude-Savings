@@ -17,3 +17,9 @@ __pycache__/
 .venv/
 dist/
 build/
+
+# Local-only work-tracking checklists — never committed
+docs/prod_checklist.md
+docs/prod_readiness_checklist.md
+docs/*checklist*.md
+docs/*CHECKLIST*.md

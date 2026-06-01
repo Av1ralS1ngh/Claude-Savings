@@ -70,12 +70,13 @@ class Settings:
     ccr_enabled: bool = _bool("DECOMPUTE_CCR_ENABLED", yscompress_ccr_enabled)
     ccr_retention_days: int = _int("DECOMPUTE_CCR_RETENTION_DAYS", 7)
     ccr_redaction_mode: str = os.getenv("DECOMPUTE_CCR_REDACTION_MODE", "metadata_only_on_secret")
-    # How detected PII/secrets are rewritten before they can reach Claude or the store:
-    #   "redact"   -> [REDACTED:<kind>]            (default; removes the value entirely)
-    #   "tokenize" -> <kind:Nchars>                (keeps kind+length, no secret material)
+    # How detected PII is rewritten before it can reach Claude or the store. Secrets
+    # (credentials/keys) are ALWAYS hard-redacted regardless of this setting.
+    #   "tokenize" -> <email_1> stable pseudonym (default; keeps referential structure)
+    #   "redact"   -> [REDACTED:<kind>]            (stricter; removes PII entirely)
     # Anything else is treated as "redact" (never passthrough). Release gate requires
     # one of these two safe modes.
-    pii_mode: str = os.getenv("DECOMPUTE_PII_MODE", "redact")
+    pii_mode: str = os.getenv("DECOMPUTE_PII_MODE", "tokenize")
     ccr_encryption_key: str | None = os.getenv("DECOMPUTE_CCR_ENCRYPTION_KEY")
     ccr_key_id: str = os.getenv("DECOMPUTE_CCR_KEY_ID", "local-v1")
 

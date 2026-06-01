@@ -76,7 +76,7 @@ PROJECT = "proj_default"
 # Release note shown in the artifact and the dashboard benchmark tab.
 RELEASE_NOTE = (
     "SRE incident compression improved from 66% to 75%+; "
-    "GitHub issue triage improved from 71.2% to 77.6%."
+    "GitHub issue triage improved from 71.2% to 77.4%."
 )
 
 # A real source file — exercises AST / code-aware compression (not a JSON result).
@@ -171,12 +171,20 @@ def _kompress_loaded_at_runtime() -> bool:
 
 
 def _pii_is_scrubbed() -> bool:
+    """Verify the OUTBOUND scrub: no raw value survives, secrets are always
+    hard-redacted, and PII is handled per pii_mode (tokenized or redacted)."""
     sample = ("contact alice@example.com or call (415) 555-1234, ssn 123-45-6789, "
               "key sk-ant-abcdefghijklmnopqrstuvwxyz012345")
-    out = M.scanner.redact(sample)
+    out = M.scanner.scrub(sample)
     raw = ["alice@example.com", "(415) 555-1234", "123-45-6789",
            "sk-ant-abcdefghijklmnopqrstuvwxyz012345"]
-    return not any(tok in out for tok in raw)
+    if any(tok in out for tok in raw):
+        return False
+    if "[REDACTED:anthropic_key]" not in out:  # secrets always hard-redacted
+        return False
+    if M.scanner.mode == "tokenize":
+        return "<email_1>" in out               # PII pseudonymized
+    return "[REDACTED:email]" in out            # PII redacted (strict mode)
 
 
 def _status(row) -> str:
