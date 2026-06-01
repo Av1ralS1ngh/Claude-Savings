@@ -1,0 +1,148 @@
+{
+  "release": "v0.1.0-beta.1",
+  "benchmark_version": "rc-2026.06.01",
+  "generated_at": "2026-06-01T08:36:43+00:00",
+  "gate_passed": true,
+  "invariants": [
+    {
+      "invariant": "benchmark_version",
+      "expected": "rc-2026.06.01",
+      "actual": "rc-2026.06.01",
+      "ok": true
+    },
+    {
+      "invariant": "engine",
+      "expected": "yscompress_rust",
+      "actual": "yscompress_rust",
+      "ok": true
+    },
+    {
+      "invariant": "fallback_used",
+      "expected": false,
+      "actual": false,
+      "ok": true
+    },
+    {
+      "invariant": "ccr_active",
+      "expected": true,
+      "actual": true,
+      "ok": true
+    },
+    {
+      "invariant": "ast_code_aware",
+      "expected": true,
+      "actual": true,
+      "ok": true
+    },
+    {
+      "invariant": "kompress_ml",
+      "expected": true,
+      "actual": true,
+      "ok": true
+    },
+    {
+      "invariant": "pii_mode",
+      "expected": [
+        "redact",
+        "tokenize"
+      ],
+      "actual": "redact",
+      "ok": true
+    }
+  ],
+  "comparison": [
+    {
+      "workload": "Code search",
+      "reference_baseline_pct": 92,
+      "decompute_pct": 94.0,
+      "delta_pct": 2.0,
+      "status": "Pass",
+      "note": ""
+    },
+    {
+      "workload": "GitHub issue triage",
+      "reference_baseline_pct": 73,
+      "decompute_pct": 77.2,
+      "delta_pct": 4.2,
+      "status": "Pass",
+      "note": "CCR log-record dedup on the log-bearing tool output"
+    },
+    {
+      "workload": "Codebase exploration",
+      "reference_baseline_pct": 47,
+      "decompute_pct": 53.0,
+      "delta_pct": 6.0,
+      "status": "Pass",
+      "note": "rust-core baseline; with the ML pass pinned (deterministic) this workload reaches ~93%, but that path is lossy (drops the low-relevance search tail) so V0 claims the conservative floor"
+    },
+    {
+      "workload": "SRE incident",
+      "reference_baseline_pct": 92,
+      "decompute_pct": 76.3,
+      "delta_pct": -15.7,
+      "status": "V0 pass / V1 target",
+      "note": "log-heavy workload; V1 target closes the gap with a dedicated log compressor"
+    }
+  ],
+  "capabilities": {
+    "rust_core": true,
+    "kompress_ml": true,
+    "ast_code_aware": true,
+    "ccr_active": true
+  },
+  "kompress_loaded_at_runtime": true,
+  "pii_mode": "redact",
+  "measured_workloads": [
+    {
+      "name": "structured_json",
+      "applies": [
+        "ccr"
+      ],
+      "engine": "yscompress_rust+ccr",
+      "fallback_used": false,
+      "ccr_engaged": true,
+      "savings_pct": 94.0,
+      "transforms": [
+        "router:protected:user_message",
+        "router:tool_result:smart_crusher",
+        "router:protected:user_message",
+        "ccr:reference_replacement:1"
+      ]
+    },
+    {
+      "name": "source_code",
+      "applies": [
+        "ast_code_aware",
+        "ccr"
+      ],
+      "engine": "yscompress_rust",
+      "fallback_used": false,
+      "ccr_engaged": false,
+      "savings_pct": 90.6,
+      "transforms": [
+        "router:protected:user_message",
+        "router:tool_result:kompress",
+        "router:protected:user_message"
+      ]
+    },
+    {
+      "name": "prose_text",
+      "applies": [
+        "ccr",
+        "kompress_ml"
+      ],
+      "engine": "yscompress_rust+ccr",
+      "fallback_used": false,
+      "ccr_engaged": true,
+      "savings_pct": 74.9,
+      "transforms": [
+        "router:protected:user_message",
+        "router:tool_result:text",
+        "router:tool_result:mixed",
+        "router:protected:user_message",
+        "ccr:reference_replacement:1"
+      ]
+    }
+  ],
+  "methodology": "Input-token reduction on the real agent message shape; deterministic seeded data + ML model pinned to local cache for reproducibility. 'Reference baseline' is published reference figures for comparable agent-context compression. Codebase reported at the rust-core floor (ML upside not claimed in V0); SRE trails baseline in V0 (V1 target)."
+}

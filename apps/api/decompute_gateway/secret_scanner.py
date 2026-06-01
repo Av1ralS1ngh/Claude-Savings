@@ -49,7 +49,15 @@ class SecretScanner:
     Conservative by design: any finding switches CCR into redacted / non-storing
     mode rather than persisting raw credentials or user details. Previews never
     contain reconstructable secret material.
+
+    mode controls how a finding is rewritten by redact():
+      "redact"   -> [REDACTED:<kind>]   (removes the value)
+      "tokenize" -> <kind:Nchars>        (keeps kind + length, no secret material)
+    An unrecognized mode falls back to "redact" — never passthrough.
     """
+
+    def __init__(self, mode: str = "redact") -> None:
+        self.mode = mode if mode in ("tokenize", "redact") else "redact"
 
     def scan(self, text: str) -> list[SecretFinding]:
         findings: list[SecretFinding] = []
@@ -73,7 +81,7 @@ class SecretScanner:
             if f.start < last:  # overlapping match — skip
                 continue
             out.append(text[last:f.start])
-            out.append(f"[REDACTED:{f.kind}]")
+            out.append(f.masked if self.mode == "tokenize" else f"[REDACTED:{f.kind}]")
             last = f.end
         out.append(text[last:])
         return "".join(out)

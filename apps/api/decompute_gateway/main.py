@@ -45,7 +45,7 @@ else:
     # local_noauth/dev request (project_id=proj_default) fails the FK constraint.
     store.ensure_default_project()
 crypto = CCRCrypto(settings.ccr_encryption_key, settings.ccr_key_id)
-scanner = SecretScanner()
+scanner = SecretScanner(mode=settings.pii_mode)
 yscompress = YSCompressClient(settings, store, crypto, scanner)
 rate_limits = RateLimitManager(settings)
 

@@ -43,11 +43,38 @@ def _detect_rust_core() -> Capability:
 
 @lru_cache(maxsize=1)
 def _detect_kompress_ml() -> Capability:
+    """The ML text compressor (Kompress) only engages if its model actually LOADS at
+    runtime — not merely if PyTorch imports. The old check (`import torch`) reported
+    "active" even when the model never loaded, so the gateway silently fell back to the
+    rust core (~half the compression) while the dashboard claimed ML was on.
+
+    Verify the real load path instead: (1) a Kompress runtime is installed
+    (onnxruntime or pytorch), AND (2) the model is present in the local HuggingFace
+    cache — so it loads deterministically without a network fetch that can fail and
+    silently downgrade. This is a cheap, network-free, side-effect-free check.
+    """
     try:
-        import torch  # noqa: F401
-        return Capability("kompress_ml", True, f"torch {torch.__version__}; Kompress-base ML text compression available")
+        from headroom.transforms.kompress_compressor import (
+            HF_MODEL_ID,
+            _is_onnx_available,
+            is_kompress_available,
+        )
+    except Exception as exc:
+        return Capability("kompress_ml", False, f"Kompress module unavailable ({type(exc).__name__}); rust-core compression only")
+    if not is_kompress_available():
+        return Capability("kompress_ml", False, "neither onnxruntime nor pytorch installed; ML text compression off (rust-core only)")
+    backend = "onnx" if _is_onnx_available() else "pytorch"
+    model_file = "onnx/kompress-int8.onnx" if backend == "onnx" else "config.json"
+    try:
+        from huggingface_hub import hf_hub_download
+        hf_hub_download(HF_MODEL_ID, model_file, local_files_only=True)  # cache-only; raises if absent
     except Exception:
-        return Capability("kompress_ml", False, "PyTorch not installed; ML text compression degraded (tokenizer-only)")
+        return Capability(
+            "kompress_ml", False,
+            f"{backend} runtime present but Kompress model '{HF_MODEL_ID}' not in local cache; "
+            "ML engages only if it can download at runtime — pre-cache it and set HF_HUB_OFFLINE=1 for deterministic engagement",
+        )
+    return Capability("kompress_ml", True, f"Kompress model cached + {backend} runtime ({HF_MODEL_ID}); ML text compression will engage")
 
 
 @lru_cache(maxsize=1)
