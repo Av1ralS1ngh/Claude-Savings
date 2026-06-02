@@ -167,19 +167,13 @@ def uninstall(
 
 
 @app.command()
-def doctor():
+def doctor(json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON (used by `support bundle`).")):
     """Diagnose the gateway connection, auth, and capabilities."""
     client = _client()
-    table = Table(title="decompute doctor", show_header=True, header_style="bold")
-    table.add_column("check")
-    table.add_column("status")
-    table.add_column("detail")
-    ok_all = True
+    checks: list[dict[str, object]] = []
 
     def add(name: str, ok: bool, detail: str = "") -> None:
-        nonlocal ok_all
-        ok_all = ok_all and ok
-        table.add_row(name, "[green]ok[/green]" if ok else "[red]FAIL[/red]", detail)
+        checks.append({"check": name, "ok": bool(ok), "detail": detail})
 
     add("base_url", True, client.base_url)
     add("api_key", bool(client.api_key), (client.api_key[:10] + "…") if client.api_key else "missing")
@@ -205,8 +199,60 @@ def doctor():
     except DecomputeError as exc:
         add("auth (/v1/usage)", False, str(exc))
 
-    print(table)
+    ok_all = all(c["ok"] for c in checks)
+    if json_output:
+        print(json.dumps({"ok": ok_all, "checks": checks}, indent=2))
+    else:
+        table = Table(title="decompute doctor", show_header=True, header_style="bold")
+        table.add_column("check"); table.add_column("status"); table.add_column("detail")
+        for c in checks:
+            table.add_row(str(c["check"]), "[green]ok[/green]" if c["ok"] else "[red]FAIL[/red]", str(c["detail"]))
+        print(table)
     raise typer.Exit(code=0 if ok_all else 1)
+
+
+support_app = typer.Typer(help="Support / debugging utilities.")
+app.add_typer(support_app, name="support")
+
+
+@support_app.command("bundle")
+def support_bundle(
+    output_dir: Optional[str] = typer.Option(None, "--output-dir", help="Where to write the zip (default: <data-dir>/support)."),
+    data_dir: str = typer.Option(".decompute", "--data-dir", help="Gateway data dir holding logs/config."),
+    project_root: str = typer.Option(".", "--project-root"),
+    pii_mode: str = typer.Option("tokenize", "--pii-mode", help="tokenize | redact | passthrough"),
+    release_version: str = typer.Option("v0.1.0-beta.1", "--release-version"),
+    canary: list[str] = typer.Option([], "--canary", help="A fake secret/prompt that must NOT appear in the bundle (repeatable)."),
+):
+    """Create a privacy-scrubbed support bundle — no raw prompts, CCR payloads, secrets, or PII."""
+    try:
+        from decompute_gateway.support_bundle import build_support_bundle
+    except Exception:
+        print("[red]decompute_gateway.support_bundle is not importable[/red] — run this from the gateway environment.")
+        raise typer.Exit(code=1)
+
+    data = Path(data_dir).expanduser()
+    out = Path(output_dir).expanduser() if output_dir else data / "support"
+    result = build_support_bundle(
+        output_dir=out,
+        data_dir=data,
+        project_root=Path(project_root),
+        pii_mode=pii_mode,
+        release_version=release_version,
+        extra_canaries=list(canary),
+    )
+    ok = bool(result.leak_scan.get("ok"))
+    print("Support bundle created:")
+    print(f"  {result.path}")
+    print()
+    print("Raw prompts included: no")
+    print("CCR payloads included: no")
+    print("Secrets scrubbed: yes")
+    print(f"PII mode: {pii_mode}")
+    print(f"Leak scan: {'[green]PASS[/green]' if ok else '[red]FAIL[/red]'}")
+    if not ok:
+        print(json.dumps(result.leak_scan, indent=2, sort_keys=True))
+        raise typer.Exit(code=2)
 
 
 @app.command("devices-scan")

@@ -82,6 +82,16 @@ class Settings:
 
     prompt_cache_mode: str = os.getenv("DECOMPUTE_PROMPT_CACHE", "auto")
 
+    # Privacy-safe support bundle (decompute support bundle / POST /v1/support/bundle).
+    # Defaults the bundle's PII mode to the gateway-wide pii_mode so they stay aligned.
+    support_bundle_enabled: bool = _bool("DECOMPUTE_SUPPORT_BUNDLE_ENABLED", True)
+    support_bundle_output_dir: Path = Path(os.getenv("DECOMPUTE_SUPPORT_BUNDLE_DIR", "")) if os.getenv("DECOMPUTE_SUPPORT_BUNDLE_DIR") else Path(os.getenv("DECOMPUTE_DATA_DIR", ".decompute")) / "support"
+    support_bundle_pii_mode: str = os.getenv("DECOMPUTE_SUPPORT_BUNDLE_PII_MODE", os.getenv("DECOMPUTE_PII_MODE", "tokenize"))
+    support_bundle_max_log_bytes: int = int(os.getenv("DECOMPUTE_SUPPORT_BUNDLE_MAX_LOG_BYTES", "250000"))
+    support_bundle_include_env: bool = _bool("DECOMPUTE_SUPPORT_BUNDLE_INCLUDE_ENV", True)
+    support_bundle_include_logs: bool = _bool("DECOMPUTE_SUPPORT_BUNDLE_INCLUDE_LOGS", True)
+    support_bundle_include_reports: bool = _bool("DECOMPUTE_SUPPORT_BUNDLE_INCLUDE_REPORTS", True)
+
     cors_origins: list[str] = field(default_factory=lambda: _csv("DECOMPUTE_CORS_ORIGINS", "http://127.0.0.1:8080,http://localhost:8080"))
     cors_allow_credentials: bool = _bool("DECOMPUTE_CORS_ALLOW_CREDENTIALS", True)
     security_headers: bool = _bool("DECOMPUTE_SECURITY_HEADERS", True)

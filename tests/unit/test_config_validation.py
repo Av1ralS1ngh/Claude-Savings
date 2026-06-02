@@ -13,5 +13,13 @@ def test_production_refuses_sqlite_and_mock(monkeypatch):
     monkeypatch.setenv("DECOMPUTE_CCR_ENABLED", "false")
     import decompute_gateway.config as cfg
     importlib.reload(cfg)
-    with pytest.raises(RuntimeError):
-        cfg.get_settings()
+    try:
+        with pytest.raises(RuntimeError):
+            cfg.get_settings()
+    finally:
+        # Settings reads env into dataclass field defaults at class-definition time,
+        # so reloading under the production env above poisons the module for every
+        # later test that builds Settings (e.g. importing decompute_gateway.main).
+        # Revert the env and reload once more to restore clean local defaults.
+        monkeypatch.undo()
+        importlib.reload(cfg)

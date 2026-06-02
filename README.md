@@ -128,7 +128,34 @@ POST /v1/routes/plan               Yellowstone route plan
 POST /v1/devices/scan              Local device profile scan
 GET  /v1/usage                     Token savings and usage summary
 POST /v1/api_keys                  Self-serve API keys
+POST /v1/support/bundle            Privacy-safe support bundle (admin/support scope)
 ```
+
+## Support bundle
+
+When a beta install misbehaves, generate a **privacy-safe** diagnostic zip — never any raw
+prompts, CCR payloads, PII-vault mappings, DB dumps, `.env`, or provider keys:
+
+```bash
+decompute support bundle          # writes <data-dir>/support/decompute-support-<UTC>.zip
+```
+
+It collects allowlisted diagnostics only (runtime, redacted env/config, `doctor` output,
+health/capabilities, a metadata-only store snapshot, scrubbed + truncated logs, scrubbed
+reports, a manifest, and a privacy report). Every included file is scrubbed: secrets are
+hard-redacted (`[REDACTED:*]`), PII is tokenized (`<email_1>`) or redacted, and prompt-like
+fields are omitted. A final **leak scan** runs over the archive — `decompute support bundle`
+exits non-zero (and `POST /v1/support/bundle` returns 500) if anything slips through, so an
+unsafe bundle is never handed back. Admins can also create one over the API:
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/v1/support/bundle \
+  -H "Content-Type: application/json" -H "x-decompute-api-key: dc_dev_local" \
+  -d '{"download": false}'
+```
+
+Tune with `DECOMPUTE_SUPPORT_BUNDLE_PII_MODE` (`tokenize`|`redact`|`passthrough`),
+`DECOMPUTE_SUPPORT_BUNDLE_INCLUDE_LOGS`, and `DECOMPUTE_SUPPORT_BUNDLE_MAX_LOG_BYTES`.
 
 ## Development shape
 

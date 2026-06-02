@@ -609,6 +609,50 @@ class Store:
             "created_at": u.created_at.isoformat() if u.created_at else None,
         }
 
+    def support_bundle_snapshot(self) -> dict[str, Any]:
+        """Metadata-only store snapshot for the support bundle.
+
+        Deliberately returns ONLY counts and aggregate token/cost totals — never
+        rows, prompts, keys, CCR payloads, or PII. The support bundle scrubber runs
+        over this too, but by construction there is nothing sensitive to scrub.
+        """
+        with self.session() as s:
+            counts = {
+                "orgs": s.query(func.count(Org.id)).scalar() or 0,
+                "projects": s.query(func.count(Project.id)).scalar() or 0,
+                "api_keys": s.query(func.count(ApiKey.id)).scalar() or 0,
+                "api_keys_active": s.query(func.count(ApiKey.id)).filter(ApiKey.revoked_at.is_(None)).scalar() or 0,
+                "devices": s.query(func.count(Device.id)).scalar() or 0,
+                "ccr_items": s.query(func.count(CCRItem.id)).scalar() or 0,
+                "usage_events": s.query(func.count(UsageEvent.id)).scalar() or 0,
+                "audit_events": s.query(func.count(AuditLog.id)).scalar() or 0,
+            }
+            usage = s.query(
+                func.coalesce(func.sum(UsageEvent.raw_input_tokens), 0),
+                func.coalesce(func.sum(UsageEvent.yellowstone_final_input_tokens), 0),
+                func.coalesce(func.sum(UsageEvent.output_tokens), 0),
+                func.coalesce(func.sum(UsageEvent.tokens_saved), 0),
+                func.coalesce(func.sum(UsageEvent.estimated_cost_usd), 0.0),
+                func.coalesce(func.sum(UsageEvent.estimated_savings_usd), 0.0),
+                func.count(func.distinct(UsageEvent.model)),
+            ).one()
+            stream_cancelled = s.query(func.count(UsageEvent.id)).filter(UsageEvent.stream_cancelled.is_(True)).scalar() or 0
+        raw, final, out, saved, cost, savings, distinct_models = usage
+        return {
+            "dialect": self.engine.dialect.name,
+            "counts": counts,
+            "usage_totals": {
+                "raw_input_tokens": int(raw or 0),
+                "final_input_tokens": int(final or 0),
+                "output_tokens": int(out or 0),
+                "tokens_saved": int(saved or 0),
+                "estimated_cost_usd": round(float(cost or 0.0), 6),
+                "estimated_savings_usd": round(float(savings or 0.0), 6),
+                "distinct_models": int(distinct_models or 0),
+                "cancelled_streams": int(stream_cancelled),
+            },
+        }
+
     def list_audit_log(self, *, project_id: str, action: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         with self.session() as s:
             stmt = select(AuditLog).where(AuditLog.project_id == project_id).order_by(AuditLog.created_at.desc()).limit(limit)

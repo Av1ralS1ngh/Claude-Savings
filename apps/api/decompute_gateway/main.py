@@ -29,6 +29,7 @@ from .secret_scanner import SecretScanner
 from .security import AuthPrincipal, assert_csrf_for_browser_mutation, auth_context, upstream_anthropic_key
 from .sse import SSEUsageTracker
 from .streaming_cleanup import StreamUsageTracker, proxy_sse_stream
+from .support_router import include_support_bundle_router
 from .workload import classify_workload
 from .yscompress import CCR_RETRIEVE_TOOL, YSCompressClient, estimate_tokens
 from .yellowstone import TrafficProfile, YellowstonePlanner, scan_local_devices
@@ -1037,3 +1038,31 @@ async def local_preprocess_placeholder(request: Request) -> dict[str, Any]:
 @app.get("/")
 def root() -> dict[str, str]:
     return {"message": "Decompute Gateway is running", "dashboard": "/dashboard", "docs": "/docs"}
+
+
+def _support_auth_ctx(request: Request) -> dict[str, Any]:
+    """Adapt this branch's AuthPrincipal into the dict the support router expects.
+
+    Requires support:read; admin keys satisfy it (AuthPrincipal.has_scope treats
+    'admin' as a wildcard), and dev/local_noauth get admin scopes by default.
+    A non-admin key without the scope is rejected by _auth before we get here.
+    """
+    p = _auth(request, "support:read")
+    return {
+        "auth_mode": p.auth_mode,
+        "is_admin": "admin" in p.scopes,
+        "scopes": list(p.scopes),
+        "project_id": p.project_id,
+        "key_prefix": p.key_prefix,
+    }
+
+
+# Privacy-safe support bundle: POST /v1/support/bundle (admin/support scope only).
+include_support_bundle_router(
+    app,
+    store=store,
+    settings=settings,
+    auth_context_func=_support_auth_ctx,
+    capabilities_func=lambda: capabilities_dict(settings),
+    health_func=health,
+)

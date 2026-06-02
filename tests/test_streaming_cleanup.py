@@ -289,7 +289,9 @@ def test_passthrough_preserves_event_bytes_exactly():
 def test_dashboard_badge_reflects_stream_status(monkeypatch):
     """The request feed surfaces cancelled (red) and errored (amber) streams;
     a completed stream is a plain row (no badge)."""
-    monkeypatch.setenv("DATABASE_URL", "sqlite+pysqlite:///:memory:")
+    # Pin a valid local config before importing main (its module top runs
+    # get_settings()->validate_for_startup()), so this is robust to test ordering.
+    monkeypatch.setenv("DECOMPUTE_ENV", "local")
     from decompute_gateway.main import _stream_status_badge
 
     assert "cancelled" in _stream_status_badge({"stream_cancelled": True})
