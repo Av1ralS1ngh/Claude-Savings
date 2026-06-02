@@ -69,6 +69,9 @@ class ApiKeys(_Resource):
     def list(self) -> list[dict[str, Any]]:
         return self._client.get("/v1/api_keys")
 
+    def revoke(self, key_id: str) -> dict[str, Any]:
+        return self._client.post(f"/v1/api_keys/{key_id}/revoke")
+
 
 class Models(_Resource):
     def list(self) -> dict[str, Any]:

@@ -270,6 +270,118 @@ def doctor(json_output: bool = typer.Option(False, "--json", help="Emit machine-
     raise typer.Exit(code=0 if ok_all else 1)
 
 
+@app.command()
+def status():
+    """One-glance health: config, routing, gateway, and your savings so far."""
+    base_url, api_key = _conn()
+    cfg = load_config()
+    routed = os.environ.get("ANTHROPIC_BASE_URL", "").rstrip("/") == base_url.rstrip("/")
+    t = Table(title="decompute status", show_header=False)
+    t.add_column("k", style="bold"); t.add_column("v")
+    t.add_row("gateway", base_url)
+    t.add_row("api key", (api_key[:10] + "…") if api_key else "[red]missing[/red]")
+    t.add_row("session id", cfg.get("last_session_id") or "[dim]none — run `decompute claude`[/dim]")
+    t.add_row("Claude Code routed (this shell)",
+              "[green]yes[/green]" if routed else "[yellow]no — `source ~/.decompute/claude.env`[/yellow]")
+    client = _client()
+    try:
+        h = client.get("/health")
+        caps = h.get("capabilities") or {}
+        active = ", ".join(k for k, v in caps.items() if isinstance(v, dict) and v.get("active")) or "none"
+        t.add_row("gateway", f"[green]ok[/green]  env={h.get('environment')} mock={h.get('mock_anthropic')}")
+        t.add_row("capabilities", active)
+    except DecomputeError as exc:
+        t.add_row("gateway", f"[red]unreachable[/red] — {exc}")
+    try:
+        u = client.usage.summary()
+        t.add_row("usage", f"{u.get('requests', 0)} requests · {u.get('tokens_saved', 0):,} tokens saved · "
+                           f"${u.get('estimated_savings_usd', 0.0):.4f} saved")
+    except DecomputeError:
+        pass
+    print(t)
+
+
+@app.command()
+def version(check: bool = typer.Option(False, "--check", help="check PyPI for a newer release")):
+    """Show the installed CLI version (and optionally check for updates)."""
+    try:
+        from importlib.metadata import version as _pkgver
+        cur = _pkgver("decompute-ai")
+    except Exception:
+        cur = "0.0.0+dev"
+    print(f"decompute-ai {cur}")
+    if check:
+        try:
+            import httpx
+            resp = httpx.get("https://pypi.org/pypi/decompute-ai/json", timeout=5.0)
+            if resp.status_code != 200:
+                print("[dim]not yet on PyPI — nothing to compare against.[/dim]")
+                return
+            latest = resp.json()["info"]["version"]
+            if latest != cur:
+                print(f"[yellow]update available:[/yellow] {latest} — run [bold]pip install -U decompute-ai[/bold]")
+            else:
+                print("[green]✓ up to date[/green]")
+        except Exception as exc:
+            print(f"[dim]couldn't reach PyPI ({exc}).[/dim]")
+
+
+@app.command()
+def limits():
+    """Show your quota (rate limits + monthly spend cap) and current consumption."""
+    try:
+        d = _client().get("/v1/limits")
+    except DecomputeError as exc:
+        print(f"[red]could not fetch limits:[/red] {exc}")
+        raise typer.Exit(1)
+    lim = d.get("limits", {})
+    t = Table(title=f"limits — {d.get('project_id', '')}")
+    t.add_column("quota"); t.add_column("value")
+    t.add_row("requests / min (per key)", str(lim.get("per_key_rpm")))
+    t.add_row("tokens / min (project)", str(lim.get("project_tokens_per_min")))
+    t.add_row("max context tokens", str(lim.get("max_context_tokens")))
+    cap = d.get("monthly_spend_cap_usd")
+    t.add_row("monthly spend", f"${d.get('monthly_spend_usd', 0.0):.4f}" + (f" / ${cap} cap" if cap is not None else ""))
+    print(t)
+
+
+keys_app = typer.Typer(help="Manage your API keys.")
+app.add_typer(keys_app, name="keys")
+
+
+@keys_app.command("list")
+def keys_list():
+    """List your project's API keys (revoked ones included)."""
+    rows = _client().api_keys.list()
+    if not rows:
+        print("No API keys yet — create one with [bold]decompute api-key-create[/bold].")
+        return
+    t = Table(title="api keys")
+    for c in ("id", "name", "key_prefix", "scopes", "created", "revoked"):
+        t.add_column(c)
+    for r in rows:
+        t.add_row(str(r.get("id", "")), str(r.get("name", "")), str(r.get("key_prefix", "")),
+                  ",".join(r.get("scopes") or []), str(r.get("created_at", ""))[:10],
+                  "[red]revoked[/red]" if r.get("revoked_at") else "active")
+    print(t)
+
+
+@keys_app.command("revoke")
+def keys_revoke(
+    key_id: str = typer.Argument(..., help="key id from `decompute keys list`"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="skip the confirmation prompt"),
+):
+    """Revoke an API key (irreversible). Use this immediately if a key leaks."""
+    if not yes and not typer.confirm(f"Revoke key {key_id}? This cannot be undone."):
+        raise typer.Exit(1)
+    try:
+        _client().api_keys.revoke(key_id)
+    except DecomputeError as exc:
+        print(f"[red]revoke failed:[/red] {exc}")
+        raise typer.Exit(1)
+    print(f"[green]✓[/green] revoked {key_id}")
+
+
 support_app = typer.Typer(help="Support / debugging utilities.")
 app.add_typer(support_app, name="support")
 
@@ -286,6 +398,7 @@ def support_bundle(
     pii_mode: str = typer.Option("tokenize", "--pii-mode", help="tokenize | redact"),
     release_version: str = typer.Option("v0.1.0-beta.1", "--release-version"),
     canary: list[str] = typer.Option([], "--canary", help="A fake secret/prompt that must NOT appear in the bundle (repeatable)."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview exactly what a bundle would contain, then discard it (nothing kept/sent)."),
 ):
     """Create a privacy-scrubbed support bundle — no raw prompts, CCR payloads, secrets, or PII.
 
@@ -330,6 +443,22 @@ def support_bundle(
         session_report=session_report,
     )
     ok = bool(result.leak_scan.get("ok"))
+    if dry_run:
+        print("[bold]Dry run[/bold] — exactly what a bundle would contain (then discarded):")
+        for f in result.manifest.get("included_files", []):
+            print(f"  {f.get('path')}  [dim]({f.get('bytes', '?')} bytes)[/dim]")
+        pr = result.privacy_report or {}
+        print(f"\nprompt fields omitted: {pr.get('prompt_fields_omitted', 0)} · "
+              f"secrets redacted: {pr.get('secret_fields_redacted', 0)} · "
+              f"leak scan: {'[green]PASS[/green]' if ok else '[red]FAIL[/red]'}")
+        zip_path = Path(result.path)
+        for p in (zip_path, zip_path.with_suffix(".leak_scan.json")):
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
+        print("[dim](nothing written or sent — re-run without --dry-run to create the bundle.)[/dim]")
+        raise typer.Exit(code=0)
     print("Support bundle created:")
     print(f"  {result.path}")
     print()

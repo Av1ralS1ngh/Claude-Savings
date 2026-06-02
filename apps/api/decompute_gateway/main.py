@@ -829,6 +829,23 @@ def usage(request: Request) -> dict[str, Any]:
     return store.usage_summary(project_id=principal.project_id)
 
 
+@app.get("/v1/limits")
+def get_limits(request: Request) -> dict[str, Any]:
+    """The caller's own effective quota + current consumption (powers `decompute limits`).
+
+    Unlike /v1/projects/{id}/limits (admin, any project), this is scoped to the key's own
+    project so a normal user can see why they might be throttled.
+    """
+    principal = _auth(request, "usage:read")
+    limits = rate_limits.effective_limits(principal.project_id)
+    return {
+        "project_id": principal.project_id,
+        "limits": limits,
+        "monthly_spend_usd": store.monthly_spend(project_id=principal.project_id),
+        "monthly_spend_cap_usd": limits.get("monthly_spend_usd"),
+    }
+
+
 def _parse_iso(value: str | None) -> datetime | None:
     if not value:
         return None
