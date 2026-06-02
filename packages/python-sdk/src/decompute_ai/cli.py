@@ -386,25 +386,24 @@ support_app = typer.Typer(help="Support / debugging utilities.")
 app.add_typer(support_app, name="support")
 
 
-@support_app.command("bundle")
-def support_bundle(
-    session: Optional[str] = typer.Option(None, "--session", help="Scope to one Claude Code session id (default: your last `decompute claude` session)."),
-    all_sessions: bool = typer.Option(False, "--all", help="Full bundle — do not scope to a session."),
-    since: Optional[str] = typer.Option(None, "--since", help="Session activity since this time (ISO 8601, unix epoch, or '2h'/'7d')."),
-    until: Optional[str] = typer.Option(None, "--until", help="Session activity up to this time."),
-    output_dir: Optional[str] = typer.Option(None, "--output-dir", help="Where to write the zip (default: <data-dir>/support)."),
-    data_dir: str = typer.Option(".decompute", "--data-dir", help="Gateway data dir holding logs/config."),
-    project_root: str = typer.Option(".", "--project-root"),
-    pii_mode: str = typer.Option("tokenize", "--pii-mode", help="tokenize | redact"),
-    release_version: str = typer.Option("v0.1.0-beta.1", "--release-version"),
-    canary: list[str] = typer.Option([], "--canary", help="A fake secret/prompt that must NOT appear in the bundle (repeatable)."),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Preview exactly what a bundle would contain, then discard it (nothing kept/sent)."),
-):
-    """Create a privacy-scrubbed support bundle — no raw prompts, CCR payloads, secrets, or PII.
+def _upload_support_bundle(zip_path: Path) -> dict:
+    """POST the bundle zip to the gateway's support inbox; returns the server's response."""
+    import httpx
+    base_url, api_key = _conn()
+    resp = httpx.post(
+        f"{base_url}/v1/support/upload",
+        content=zip_path.read_bytes(),
+        headers={"x-decompute-api-key": api_key, "content-type": "application/zip"},
+        timeout=60.0,
+    )
+    if resp.status_code != 200:
+        raise DecomputeError(f"upload failed: HTTP {resp.status_code} — {resp.text[:300]}")
+    return resp.json()
 
-    With --session, folds in a metadata-only report for that Claude Code session (request
-    IDs, models, statuses, token/latency summaries — never prompt content).
-    """
+
+def _make_support_bundle(*, session, all_sessions, since, until, output_dir, data_dir,
+                         project_root, pii_mode, release_version, canary, dry_run, send):
+    """Build a privacy-safe support bundle; optionally preview (dry-run) or send it to Decompute."""
     try:
         from decompute_gateway.support_bundle import build_support_bundle
     except Exception:
@@ -459,19 +458,75 @@ def support_bundle(
                 pass
         print("[dim](nothing written or sent — re-run without --dry-run to create the bundle.)[/dim]")
         raise typer.Exit(code=0)
+
     print("Support bundle created:")
     print(f"  {result.path}")
-    print()
     if session:
         print(f"Session scope: {session}" + (f"  since {since}" if since else ""))
-    print("Raw prompts included: no")
-    print("CCR payloads included: no")
-    print("Secrets scrubbed: yes")
-    print(f"PII mode: {pii_mode}")
+    print(f"Raw prompts: no · CCR payloads: no · Secrets scrubbed: yes · PII mode: {pii_mode}")
     print(f"Leak scan: {'[green]PASS[/green]' if ok else '[red]FAIL[/red]'}")
     if not ok:
         print(json.dumps(result.leak_scan, indent=2, sort_keys=True))
+        print("[red]Not sending — bundle failed the local leak scan.[/red]")
         raise typer.Exit(code=2)
+
+    if send:
+        try:
+            r = _upload_support_bundle(Path(result.path))
+            print(f"\n[green]✓ sent to Decompute support[/green] — reference: [bold]{r.get('reference_id')}[/bold]")
+            print("  Quote that reference id when you contact us; it points to your scrubbed bundle.")
+        except DecomputeError as exc:
+            print(f"[red]send failed:[/red] {exc}")
+            print(f"  The bundle is saved at {result.path} — you can attach it to a ticket manually.")
+            raise typer.Exit(code=3)
+
+
+@support_app.command("bundle")
+def support_bundle(
+    session: Optional[str] = typer.Option(None, "--session", help="Scope to one Claude Code session id (default: your last `decompute claude` session)."),
+    all_sessions: bool = typer.Option(False, "--all", help="Full bundle — do not scope to a session."),
+    since: Optional[str] = typer.Option(None, "--since", help="Session activity since this time (ISO 8601, unix epoch, or '2h'/'7d')."),
+    until: Optional[str] = typer.Option(None, "--until", help="Session activity up to this time."),
+    output_dir: Optional[str] = typer.Option(None, "--output-dir", help="Where to write the zip (default: <data-dir>/support)."),
+    data_dir: str = typer.Option(".decompute", "--data-dir", help="Gateway data dir holding logs/config."),
+    project_root: str = typer.Option(".", "--project-root"),
+    pii_mode: str = typer.Option("tokenize", "--pii-mode", help="tokenize | redact"),
+    release_version: str = typer.Option("v0.1.0-beta.1", "--release-version"),
+    canary: list[str] = typer.Option([], "--canary", help="A fake secret/prompt that must NOT appear in the bundle (repeatable)."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview exactly what a bundle would contain, then discard it (nothing kept/sent)."),
+    send: bool = typer.Option(False, "--send", help="Also upload the bundle to Decompute support and print a reference id."),
+):
+    """Create a privacy-scrubbed support bundle — no raw prompts, CCR payloads, secrets, or PII.
+
+    Folds in a metadata-only report for your Claude Code session (request IDs, models,
+    statuses, token/latency summaries — never prompt content). Add --send to transmit it to us.
+    """
+    _make_support_bundle(session=session, all_sessions=all_sessions, since=since, until=until,
+                         output_dir=output_dir, data_dir=data_dir, project_root=project_root,
+                         pii_mode=pii_mode, release_version=release_version, canary=canary,
+                         dry_run=dry_run, send=send)
+
+
+@support_app.command("send")
+def support_send(
+    session: Optional[str] = typer.Option(None, "--session", help="Scope to one Claude Code session id (default: your last session)."),
+    all_sessions: bool = typer.Option(False, "--all", help="Send full diagnostics, not scoped to a session."),
+    since: Optional[str] = typer.Option(None, "--since", help="Session activity since this time (ISO 8601 / unix / '2h')."),
+    until: Optional[str] = typer.Option(None, "--until", help="Session activity up to this time."),
+    data_dir: str = typer.Option(".decompute", "--data-dir", help="Gateway data dir holding logs/config."),
+    project_root: str = typer.Option(".", "--project-root"),
+    pii_mode: str = typer.Option("tokenize", "--pii-mode", help="tokenize | redact"),
+):
+    """Create AND send a privacy-safe support bundle to Decompute — returns a reference id.
+
+    Sends only diagnostics (logs, request IDs, capabilities, session summary); raw prompts,
+    CCR payloads, secrets, and personal info are stripped + leak-scanned before sending.
+    Preview first with `decompute support bundle --dry-run`.
+    """
+    _make_support_bundle(session=session, all_sessions=all_sessions, since=since, until=until,
+                         output_dir=None, data_dir=data_dir, project_root=project_root,
+                         pii_mode=pii_mode, release_version="v0.1.0-beta.1", canary=[],
+                         dry_run=False, send=True)
 
 
 @app.command("devices-scan")

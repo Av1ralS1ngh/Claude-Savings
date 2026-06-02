@@ -195,9 +195,37 @@ def _mk_client(tmp_path: Path, monkeypatch, ctx: dict) -> tuple[TestClient, _Fak
     include_support_bundle_router(
         app, store=store, settings=settings,
         auth_context_func=lambda request: ctx,
+        user_auth_func=lambda request: ctx,
         capabilities_func=lambda: {"yscompress": {"active": True}},
     )
     return TestClient(app), store
+
+
+def _zip_bytes(files: dict) -> bytes:
+    import io
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, content in files.items():
+            zf.writestr(name, content)
+    return buf.getvalue()
+
+
+def test_upload_stores_clean_bundle_and_returns_reference(tmp_path: Path, monkeypatch) -> None:
+    client, store = _mk_client(tmp_path, monkeypatch, {"auth_mode": "dev", "scopes": ["admin"], "project_id": "proj_default", "key_prefix": "dc"})
+    resp = client.post("/v1/support/upload", content=_zip_bytes({"manifest.json": '{"ok":true}'}),
+                       headers={"content-type": "application/zip"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["stored"] is True and body["reference_id"].startswith("sup_")
+    assert (tmp_path / ".decompute" / "support_inbox" / "proj_default" / f"{body['reference_id']}.zip").exists()
+    assert any(c["action"] == "support_bundle.upload" for c in store.audit_calls)
+
+
+def test_upload_rejects_nonzip_and_leaking_bundle(tmp_path: Path, monkeypatch) -> None:
+    client, _ = _mk_client(tmp_path, monkeypatch, {"auth_mode": "dev", "scopes": ["admin"], "project_id": "proj_default", "key_prefix": "dc"})
+    assert client.post("/v1/support/upload", content=b"not a zip", headers={"content-type": "application/zip"}).status_code == 400
+    leak = _zip_bytes({"logs/x.log": "token sk-ant-REALSECRETKEY1234567890"})
+    assert client.post("/v1/support/upload", content=leak, headers={"content-type": "application/zip"}).status_code == 422
 
 
 def test_router_rejects_non_admin(tmp_path: Path, monkeypatch) -> None:

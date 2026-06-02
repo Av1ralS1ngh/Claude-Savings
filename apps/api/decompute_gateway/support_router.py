@@ -20,6 +20,8 @@ admin — which is how this branch's AuthPrincipal is adapted into a dict.
 
 import datetime as _dt
 import re
+import secrets
+import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
@@ -27,7 +29,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from .support_bundle import BundleOptions, SupportBundleBuilder
+from .support_bundle import BundleOptions, SupportBundleBuilder, scan_bundle_for_leaks
 
 _REL_RE = re.compile(r"^\s*(\d+)\s*([smhd])\s*$", re.I)
 _REL_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
@@ -83,8 +85,12 @@ def include_support_bundle_router(
     auth_context_func: Callable[[Request], dict[str, Any]],
     capabilities_func: Callable[[], Any] | None = None,
     health_func: Callable[[], Any] | None = None,
+    user_auth_func: Callable[[Request], dict[str, Any]] | None = None,
     route_prefix: str = "/v1/support",
 ) -> None:
+    # admin/support scope gates creating + reading reports; uploading a bundle is a normal
+    # USER action (they send their own), so it uses user_auth_func (any authenticated key).
+    user_auth = user_auth_func or auth_context_func
     router = APIRouter(prefix=route_prefix, tags=["support"])
 
     @router.post("/bundle")
@@ -194,5 +200,49 @@ def include_support_bundle_router(
             since=parse_timestamp(since),
             until=parse_timestamp(until),
         )
+
+    @router.post("/upload")
+    async def upload_support_bundle(request: Request):
+        """Receive a privacy-safe support bundle from a user (`decompute support send`).
+
+        Authenticated as the uploading user (their own bundle, their own project). The zip is
+        re-scanned for leaks server-side — a bundle that fails is rejected, never stored — then
+        filed in the per-project support inbox and a reference id is returned for the user to quote.
+        """
+        ctx = user_auth(request)
+        project_id = ctx.get("project_id") or "unknown"
+        data = await request.body()
+        if not data or data[:2] != b"PK":
+            raise HTTPException(status_code=400, detail="expected a zip body (Content-Type: application/zip)")
+
+        # Defense in depth: re-run the leak scan on what actually arrived; never store a leaker.
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=True) as tmp:
+            tmp.write(data)
+            tmp.flush()
+            scan = scan_bundle_for_leaks(Path(tmp.name))
+        if not scan.get("ok"):
+            raise HTTPException(status_code=422, detail={"error": "leak_scan_failed", "suspicious": scan.get("suspicious")})
+
+        reference_id = "sup_" + secrets.token_hex(6)
+        data_dir = Path(getattr(settings, "data_dir", ".decompute"))
+        inbox = data_dir / "support_inbox" / project_id
+        inbox.mkdir(parents=True, exist_ok=True)
+        (inbox / f"{reference_id}.zip").write_bytes(data)
+
+        if hasattr(store, "record_audit"):
+            try:
+                store.record_audit(
+                    project_id=ctx.get("project_id"),
+                    actor_key_prefix=ctx.get("key_prefix"),
+                    action="support_bundle.upload",
+                    target_type="support_bundle",
+                    target_id=reference_id,
+                    request_id=request.headers.get("x-decompute-request-id"),
+                    metadata={"bytes": len(data), "leak_scan_ok": True},
+                )
+            except Exception:
+                pass
+
+        return {"reference_id": reference_id, "stored": True, "bytes": len(data), "leak_scan_ok": True}
 
     app.include_router(router)

@@ -1093,7 +1093,13 @@ def _support_auth_ctx(request: Request) -> dict[str, Any]:
     }
 
 
-# Privacy-safe support bundle: POST /v1/support/bundle (admin/support scope only).
+def _support_user_ctx(request: Request) -> dict[str, Any]:
+    """Plain authenticated principal — any valid key may upload ITS OWN support bundle."""
+    p = _auth(request)
+    return {"auth_mode": p.auth_mode, "project_id": p.project_id, "key_prefix": p.key_prefix}
+
+
+# Support bundle endpoints: create/report are admin/support scope; upload is any user (own bundle).
 include_support_bundle_router(
     app,
     store=store,
@@ -1101,4 +1107,5 @@ include_support_bundle_router(
     auth_context_func=_support_auth_ctx,
     capabilities_func=lambda: capabilities_dict(settings),
     health_func=health,
+    user_auth_func=_support_user_ctx,
 )
