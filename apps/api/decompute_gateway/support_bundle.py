@@ -52,12 +52,13 @@ SECRET_ENV_NAME_RE = re.compile(
     r"(?i)(key|secret|token|password|passwd|pwd|private|credential|fernet|encrypt|salt|seed|passphrase|dsn)"
 )
 
-# Prompt-ish key names whose VALUE is omitted outright. Deliberately avoids generic
-# tokens that collide with numeric metadata (input/output/text/user — cf. output_tokens,
-# raw_input_tokens); long free-text under arbitrary keys is caught by the value-length
-# heuristic below instead.
+# Prompt-ish key names whose VALUE is omitted outright. Deliberately CONSERVATIVE:
+# only unambiguous prompt/payload keys. Generic tokens (note/summary/input/output/text)
+# are NOT here — they collide with legitimate metadata (summary aggregates, *_tokens),
+# and over-omitting destroys useful diagnostics. Prompt PROSE under an arbitrary key is
+# caught by the value-length heuristic below instead.
 PROMPT_FIELD_RE = re.compile(
-    r"(?i)(^|[_\-.])(prompt|raw[_\-.]?prompt|messages|message[_\-.]?body|request[_\-.]?body|response[_\-.]?body|body|content|tool[_\-.]?output|completion|assistant[_\-.]?response|user[_\-.]?message|original[_\-.]?text|plaintext|note|summary|conversation|transcript|dialog|dialogue|utterance|ccr[_\-.]?payload|pii[_\-.]?mapping|pii[_\-.]?vault)($|[_\-.])"
+    r"(?i)(^|[_\-.])(prompt|raw[_\-.]?prompt|messages|message[_\-.]?body|request[_\-.]?body|response[_\-.]?body|tool[_\-.]?output|completion|assistant[_\-.]?response|user[_\-.]?message|original[_\-.]?text|plaintext|ccr[_\-.]?payload|pii[_\-.]?mapping|pii[_\-.]?vault)($|[_\-.])"
 )
 
 # String values longer than this under a non-allowlisted key are omitted as a prose
@@ -76,8 +77,10 @@ SAFE_CONTENT_FIELD_ALLOWLIST = {
     "content_sha256",
 }
 
+# Line-anchored on purpose: a leading-anchored "label: value" line is a real assignment,
+# whereas matching mid-string would mangle values like "/v1/messages:stream".
 PROMPT_TEXT_ASSIGNMENT_RE = re.compile(
-    r"(?im)((?:^|\b)(?:raw[_\-.]?prompt|prompt|messages|message[_\-.]?body|request[_\-.]?body|response[_\-.]?body|tool[_\-.]?output|original[_\-.]?text|ccr[_\-.]?payload|pii[_\-.]?vault|completion|user[_\-.]?message|user[_\-.]?said|assistant[_\-.]?response|conversation|transcript|utterance|note|summary)\s*[:=]\s*)(.*)$"
+    r"(?im)^(\s*(?:raw[_\-.]?prompt|prompt|messages|message[_\-.]?body|request[_\-.]?body|response[_\-.]?body|tool[_\-.]?output|original[_\-.]?text|ccr[_\-.]?payload|pii[_\-.]?vault|completion|user[_\-.]?message|assistant[_\-.]?response)\s*[:=]\s*)(.*)$"
 )
 
 # Skip files that should never be bundled, even scrubbed.
@@ -431,6 +434,7 @@ class SupportBundleBuilder:
         settings: Any | None = None,
         health_snapshot_func: Callable[[], Any] | None = None,
         capabilities_func: Callable[[], Any] | None = None,
+        session_report: JSON | None = None,
         command_runner: Callable[[list[str], float], tuple[int, str, str]] | None = None,
     ):
         self.options = options or BundleOptions()
@@ -440,6 +444,7 @@ class SupportBundleBuilder:
         self.scrubber = SecretAndPIIScrubber(pii_mode=self.options.pii_mode, report=self.report)
         self.health_snapshot_func = health_snapshot_func
         self.capabilities_func = capabilities_func
+        self.session_report = session_report
         self.command_runner = command_runner or self._run_command
         self._included: list[dict[str, Any]] = []
         self._skipped: list[dict[str, Any]] = []
@@ -504,6 +509,9 @@ class SupportBundleBuilder:
         self._collect_doctor(tmp)
         self._collect_health(tmp)
         self._collect_capabilities(tmp)
+        if self.session_report is not None:
+            # Metadata-only per-session diagnostics; scrubbed like everything else.
+            self._write_json(tmp, "session_report.json", self.session_report)
         if self.options.include_store_snapshot:
             self._collect_store_snapshot(tmp)
         if self.options.include_logs:
@@ -776,8 +784,10 @@ class SupportBundleBuilder:
 _UNREDACTED_SECRET_FIELD_RE = re.compile(
     r"(?i)[\"']?[A-Za-z0-9_\-.]*(?:encryption[_\-.]?key|api[_\-.]?key|private[_\-.]?key|secret|token|password|passphrase|fernet|credential|[_\-.]key)[\"']?\s*[:=]\s*(?P<val>[^\s,;}{]+)"
 )
+# Leading boundary (start / quote / whitespace / brace / comma) so this matches a real
+# field key — '"messages":' — but NOT 'messages:' inside a value like '/v1/messages:stream'.
 _RAW_PROMPT_FIELD_RE = re.compile(
-    r"(?i)(?:raw[_\-.]?prompt|original[_\-.]?text|ccr[_\-.]?payload|pii[_\-.]?vault|messages|completion|user[_\-.]?message|assistant[_\-.]?response|tool[_\-.]?output|request[_\-.]?body|response[_\-.]?body)[\"']?\s*[:=](?!\s*[\"']?(?:\[OMITTED|\[REDACTED))"
+    r"(?i)(?:^|[\"'\s,{])(?:raw[_\-.]?prompt|original[_\-.]?text|ccr[_\-.]?payload|pii[_\-.]?vault|messages|completion|user[_\-.]?message|assistant[_\-.]?response|tool[_\-.]?output|request[_\-.]?body|response[_\-.]?body)[\"']?\s*[:=](?!\s*[\"']?(?:\[OMITTED|\[REDACTED))"
 )
 
 
@@ -842,6 +852,7 @@ def build_support_bundle(
     store: Any | None = None,
     settings: Any | None = None,
     extra_canaries: list[str] | None = None,
+    session_report: JSON | None = None,
 ) -> BundleResult:
     options = BundleOptions(
         output_dir=Path(output_dir),
@@ -851,7 +862,7 @@ def build_support_bundle(
         release_version=release_version,
         extra_canaries=extra_canaries or [],
     )
-    return SupportBundleBuilder(options=options, store=store, settings=settings).build()
+    return SupportBundleBuilder(options=options, store=store, settings=settings, session_report=session_report).build()
 
 
 def _main(argv: list[str] | None = None) -> int:

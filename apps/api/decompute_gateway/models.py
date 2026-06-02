@@ -116,6 +116,9 @@ class UsageEvent(Base):
     api_key_prefix: Mapped[str | None] = mapped_column(String(24), index=True)
     request_id: Mapped[str | None] = mapped_column(String(64), index=True)
     upstream_request_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    # Client-supplied session correlator (Claude Code's x-decompute-session-id). Groups a
+    # run's requests so a privacy-safe support report can be scoped to one session.
+    session_id: Mapped[str | None] = mapped_column(String(128), index=True)
     endpoint: Mapped[str] = mapped_column(String(128), nullable=False)
     model: Mapped[str | None] = mapped_column(String(128), index=True)
     status_code: Mapped[int | None] = mapped_column(Integer)
@@ -146,6 +149,7 @@ class UsageEvent(Base):
         Index("ix_usage_project_model_created", "project_id", "model", "created_at"),
         Index("ix_usage_project_workload_created", "project_id", "workload_class", "created_at"),
         Index("ix_usage_project_stream_status_created", "project_id", "stream_status", "created_at"),
+        Index("ix_usage_session_created", "project_id", "session_id", "created_at"),
     )
 
 

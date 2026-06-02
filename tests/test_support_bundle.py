@@ -171,13 +171,16 @@ class _FakeStore:
     def support_bundle_snapshot(self) -> dict:
         return {"counts": {"projects": 1}, "usage_totals": {"output_tokens": 0}}
 
+    def support_session_report(self, *, project_id, session_id, since=None, until=None):
+        return {"summary": {"session_id": session_id, "requests": 1}, "requests": [{"request_id": "r1"}]}
+
     def record_audit(self, **kwargs) -> None:
         self.audit_calls.append(kwargs)
 
 
 def _mk_client(tmp_path: Path, monkeypatch, ctx: dict) -> tuple[TestClient, _FakeStore]:
     monkeypatch.chdir(tmp_path)  # isolate project_root=cwd() so the bundle doesn't scan the repo
-    (tmp_path / ".decompute" / "logs").mkdir(parents=True)
+    (tmp_path / ".decompute" / "logs").mkdir(parents=True, exist_ok=True)
     settings = SimpleNamespace(
         data_dir=tmp_path / ".decompute",
         support_bundle_enabled=True,
@@ -217,6 +220,81 @@ def test_router_admin_records_audit_and_returns_metadata(tmp_path: Path, monkeyp
     assert call["metadata"]["leak_scan_ok"] is True
 
 
+# ── session-scoped support (Phase 2) ─────────────────────────────────────────
+
+def test_support_session_report_is_metadata_only(tmp_path: Path) -> None:
+    from decompute_gateway.config import Settings
+    from decompute_gateway.db import Store
+
+    st = Store(Settings(database_url=f"sqlite+pysqlite:///{tmp_path}/s.db"))
+    st.create_schema_for_local_dev()
+    pid = "proj_default"
+    st.record_usage({"endpoint": "/v1/messages:stream", "model": "claude-haiku-4-5", "request_id": "req_1",
+                     "upstream_request_id": "ur_1", "session_id": "sess_x", "status_code": 200,
+                     "raw_input_tokens": 100, "yellowstone_final_input_tokens": 40, "output_tokens": 12,
+                     "tokens_saved": 60, "stream_status": "completed", "stream_cancelled": False},
+                    project_id=pid, key_prefix=None)
+    st.record_usage({"endpoint": "/v1/messages", "session_id": "sess_other", "status_code": 200},
+                    project_id=pid, key_prefix=None)
+
+    rep = st.support_session_report(project_id=pid, session_id="sess_x")
+    assert rep["summary"]["requests"] == 1                       # scoped to sess_x only
+    assert rep["summary"]["by_model"] == {"claude-haiku-4-5": 1}
+    assert rep["summary"]["tokens_saved"] == 60
+    assert rep["requests"][0]["request_id"] == "req_1"
+    blob = json.dumps(rep).lower()                                # metadata only — no prompt content
+    assert all(k not in blob for k in ['"prompt"', '"content"', '"messages":', '"original_text"', '"body"'])
+
+
+def test_session_report_folds_into_bundle(tmp_path: Path) -> None:
+    data = tmp_path / ".decompute"
+    (data / "logs").mkdir(parents=True)
+    report = {"summary": {"session_id": "s1", "requests": 2}, "requests": [{"request_id": "r1", "endpoint": "/v1/messages:stream"}]}
+    result = build_support_bundle(output_dir=data / "support", data_dir=data, project_root=tmp_path, session_report=report)
+    assert result.leak_scan["ok"], result.leak_scan
+    texts = read_zip_texts(result.path)
+    assert "session_report.json" in texts
+    assert json.loads(texts["session_report.json"])["summary"]["session_id"] == "s1"
+
+
+def test_parse_timestamp_forms() -> None:
+    import datetime as dt
+    from decompute_gateway.support_router import parse_timestamp
+    assert parse_timestamp(None) is None
+    assert parse_timestamp("2026-06-03T00:00:00+00:00").year == 2026
+    assert isinstance(parse_timestamp("2h"), dt.datetime)
+    assert isinstance(parse_timestamp("1717000000"), dt.datetime)
+    with _pytest.raises(Exception):
+        parse_timestamp("not-a-time")
+
+
+def test_parse_timestamp_naive_is_normalized_to_utc() -> None:
+    """Date-only / tz-less ISO must become tz-aware UTC, or it 500s vs a timestamptz column."""
+    from decompute_gateway.support_router import parse_timestamp
+    assert parse_timestamp("2026-05-01").tzinfo is not None
+    assert parse_timestamp("2026-05-01T12:00:00").tzinfo is not None
+
+
+def test_session_id_is_sanitized_and_bounded() -> None:
+    """PII-shaped / oversized session ids are reduced to a safe, bounded correlator."""
+    from decompute_gateway.main import _clean_session_id
+    assert _clean_session_id(None) is None
+    assert _clean_session_id("") is None
+    assert _clean_session_id("jane@acme.com you@x") == "janeacme.comyoux"   # '@' and spaces stripped
+    assert _clean_session_id("sess_abc-123.v2") == "sess_abc-123.v2"        # safe chars preserved
+    assert len(_clean_session_id("x" * 500)) == 64                           # clamped under VARCHAR(128)
+    assert _clean_session_id("@@@ ///") is None                              # nothing safe left -> None
+
+
+def test_session_endpoint_admin_only_and_returns_report(tmp_path: Path, monkeypatch) -> None:
+    client, _ = _mk_client(tmp_path, monkeypatch, {"auth_mode": "dev", "scopes": ["admin"], "project_id": "proj_default", "key_prefix": "dc"})
+    resp = client.get("/v1/support/session", params={"session_id": "s1"})
+    assert resp.status_code == 200
+    assert resp.json()["summary"]["session_id"] == "s1"
+    deny, _ = _mk_client(tmp_path, monkeypatch, {"auth_mode": "api_key", "scopes": ["messages:write"]})
+    assert deny.get("/v1/support/session", params={"session_id": "s1"}).status_code == 403
+
+
 # ── review-driven leak regressions ───────────────────────────────────────────
 
 def test_encryption_key_and_opaque_secrets_are_redacted() -> None:
@@ -235,10 +313,17 @@ def test_dotted_card_and_ssn_are_tokenized() -> None:
     assert "123.45.6789" not in s.scrub_text("ssn 123.45.6789")
 
 
-def test_prompt_under_benign_key_and_long_prose_are_omitted() -> None:
+def test_prompt_keys_and_long_prose_are_omitted_without_clobbering_metadata() -> None:
     s = SecretAndPIIScrubber()
-    assert s.scrub_jsonish({"note": "the user's confidential prompt"})["note"].startswith("[OMITTED")
-    assert s.scrub_jsonish({"input": "x " * 200})["input"] == "[OMITTED:long_text_value]"
+    # Unambiguous prompt/payload keys are omitted regardless of length.
+    assert s.scrub_jsonish({"messages": [{"content": "hi"}]})["messages"].startswith("[OMITTED")
+    assert s.scrub_jsonish({"original_text": "x"})["original_text"].startswith("[OMITTED")
+    # Long free-text under ANY key is omitted by the value-length heuristic.
+    assert s.scrub_jsonish({"note": "x " * 200})["note"] == "[OMITTED:long_text_value]"
+    # Legitimate metadata must NOT be clobbered: 'summary' aggregate and an endpoint value
+    # containing 'messages:' both survive intact.
+    assert s.scrub_jsonish({"summary": {"requests": 3}}) == {"summary": {"requests": 3}}
+    assert s.scrub_jsonish({"endpoint": "/v1/messages:stream"}) == {"endpoint": "/v1/messages:stream"}
 
 
 def test_store_snapshot_metadata_is_not_over_omitted() -> None:

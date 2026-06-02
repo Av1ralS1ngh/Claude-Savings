@@ -65,7 +65,7 @@ app.add_middleware(
     allow_origins=settings.cors_origins,
     allow_credentials=settings.cors_allow_credentials,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["authorization", "content-type", "x-api-key", "x-decompute-api-key", "x-decompute-key", "x-decompute-csrf", "x-decompute-request-id", "anthropic-beta", "x-yscompress-bypass", "x-headroom-bypass"],
+    allow_headers=["authorization", "content-type", "x-api-key", "x-decompute-api-key", "x-decompute-key", "x-decompute-csrf", "x-decompute-request-id", "x-decompute-session-id", "anthropic-beta", "x-yscompress-bypass", "x-headroom-bypass"],
     expose_headers=["x-decompute-request-id", "x-decompute-tokens-before", "x-decompute-tokens-after", "x-decompute-route", "request-id"],
 )
 
@@ -215,7 +215,23 @@ def _usage_from_result(result: ProviderResult) -> dict[str, int]:
     }
 
 
-def _record_usage(*, principal: AuthPrincipal, endpoint: str, model: str | None, raw_input_tokens: int, yscompress_input_tokens: int, yellowstone_final_input_tokens: int, output_tokens: int, cache_creation_input_tokens: int, cache_read_input_tokens: int, prompt_cache_mode: str, plan: Any, request_id: str, upstream_request_id: str | None, status_code: int, start_time: float, workload_class: str | None = None, optimization_steps: list[dict[str, Any]] | None = None, stream_status: str | None = None, stream_cancelled: bool = False, stream_cancel_reason: str | None = None, stream_json: dict[str, Any] | None = None) -> None:
+_SESSION_ID_ALLOWED = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+
+
+def _clean_session_id(raw: str | None) -> str | None:
+    """Sanitize the client-supplied x-decompute-session-id into a safe, bounded correlator.
+
+    Keeps only [A-Za-z0-9._-] and clamps to 64 chars. This (a) keeps a PII-shaped value
+    (email/hostname/free text) from being echoed back in a support report, and (b) prevents
+    an over-128-char header from aborting the usage insert on Postgres (VARCHAR(128)).
+    """
+    if not raw:
+        return None
+    cleaned = "".join(c for c in raw if c in _SESSION_ID_ALLOWED)[:64]
+    return cleaned or None
+
+
+def _record_usage(*, principal: AuthPrincipal, endpoint: str, model: str | None, raw_input_tokens: int, yscompress_input_tokens: int, yellowstone_final_input_tokens: int, output_tokens: int, cache_creation_input_tokens: int, cache_read_input_tokens: int, prompt_cache_mode: str, plan: Any, request_id: str, upstream_request_id: str | None, status_code: int, start_time: float, workload_class: str | None = None, optimization_steps: list[dict[str, Any]] | None = None, stream_status: str | None = None, stream_cancelled: bool = False, stream_cancel_reason: str | None = None, stream_json: dict[str, Any] | None = None, session_id: str | None = None) -> None:
     elapsed_ms = int((time.perf_counter() - start_time) * 1000)
     billable_equiv = max(0, yellowstone_final_input_tokens - cache_creation_input_tokens - cache_read_input_tokens) + cache_creation_input_tokens + cache_read_input_tokens
     cost = cost_usd(model=model, input_tokens=yellowstone_final_input_tokens, output_tokens=output_tokens, cache_creation_input_tokens=cache_creation_input_tokens, cache_read_input_tokens=cache_read_input_tokens)
@@ -227,6 +243,7 @@ def _record_usage(*, principal: AuthPrincipal, endpoint: str, model: str | None,
                 "model": model,
                 "request_id": request_id,
                 "upstream_request_id": upstream_request_id,
+                "session_id": session_id,
                 "status_code": status_code,
                 "latency_ms": elapsed_ms,
                 "raw_input_tokens": raw_input_tokens,
@@ -872,6 +889,7 @@ def _check_model_allowed(model: str, principal: AuthPrincipal) -> None:
 @app.post("/v1/messages")
 async def anthropic_messages_proxy(request: Request, payload: MessagesRequest) -> Response:
     request_id = current_request_id()
+    session_id = _clean_session_id(request.headers.get("x-decompute-session-id"))
     principal = _auth(request, "messages:write")
     start = time.perf_counter()
     body = payload.model_dump(exclude_none=True, mode="python")
@@ -933,7 +951,7 @@ async def anthropic_messages_proxy(request: Request, payload: MessagesRequest) -
                 cache_read_input_tokens=done.cache_read_input_tokens,
                 prompt_cache_mode=prompt_cache_mode, plan=plan, request_id=request_id,
                 upstream_request_id=done.upstream_request_id, status_code=status_code,
-                start_time=start, workload_class=workload,
+                start_time=start, workload_class=workload, session_id=session_id,
                 stream_status=done.status, stream_cancelled=done.cancelled,
                 stream_cancel_reason=done.cancel_reason, stream_json=done.to_dict(),
             )
@@ -972,7 +990,7 @@ async def anthropic_messages_proxy(request: Request, payload: MessagesRequest) -
             headers["x-decompute-tokens-after"] = str(final_input_tokens)
             headers["x-decompute-tokens-saved"] = str(max(0, comp.tokens_before - final_input_tokens))
     usage = _usage_from_result(result)
-    _record_usage(principal=principal, endpoint="/v1/messages", model=model, raw_input_tokens=comp.tokens_before, yscompress_input_tokens=comp.tokens_after, yellowstone_final_input_tokens=final_input_tokens, output_tokens=usage["output_tokens"], cache_creation_input_tokens=usage["cache_creation_input_tokens"], cache_read_input_tokens=usage["cache_read_input_tokens"], prompt_cache_mode=prompt_cache_mode, plan=plan, request_id=request_id, upstream_request_id=result.upstream_request_id, status_code=result.status_code, start_time=start, workload_class=workload)
+    _record_usage(principal=principal, endpoint="/v1/messages", model=model, raw_input_tokens=comp.tokens_before, yscompress_input_tokens=comp.tokens_after, yellowstone_final_input_tokens=final_input_tokens, output_tokens=usage["output_tokens"], cache_creation_input_tokens=usage["cache_creation_input_tokens"], cache_read_input_tokens=usage["cache_read_input_tokens"], prompt_cache_mode=prompt_cache_mode, plan=plan, request_id=request_id, upstream_request_id=result.upstream_request_id, status_code=result.status_code, start_time=start, workload_class=workload, session_id=session_id)
     body_out = result.body
     if (settings.return_proxy_metadata or request.headers.get("x-decompute-metadata", "false").lower() == "true") and isinstance(body_out, dict):
         body_out = dict(body_out)
@@ -988,6 +1006,7 @@ async def anthropic_messages_proxy(request: Request, payload: MessagesRequest) -
 @app.post("/v1/chat/completions")
 async def openai_chat_proxy(request: Request) -> JSONResponse:
     principal = _auth(request, "messages:write")
+    session_id = _clean_session_id(request.headers.get("x-decompute-session-id"))
     start = time.perf_counter()
     body = await request.json()
     model = body.get("model", "claude-sonnet-4-5")
@@ -1020,7 +1039,7 @@ async def openai_chat_proxy(request: Request) -> JSONResponse:
             if isinstance(block, dict) and block.get("type") == "text":
                 text_out += block.get("text", "")
     usage = _usage_from_result(result)
-    _record_usage(principal=principal, endpoint="/v1/chat/completions", model=model, raw_input_tokens=comp.tokens_before, yscompress_input_tokens=comp.tokens_after, yellowstone_final_input_tokens=plan.yellowstone_final_input_tokens, output_tokens=usage["output_tokens"] or estimate_tokens(text_out), cache_creation_input_tokens=usage["cache_creation_input_tokens"], cache_read_input_tokens=usage["cache_read_input_tokens"], prompt_cache_mode=settings.prompt_cache_mode, plan=plan, request_id=current_request_id(), upstream_request_id=result.upstream_request_id, status_code=result.status_code, start_time=start, workload_class=workload)
+    _record_usage(principal=principal, endpoint="/v1/chat/completions", model=model, raw_input_tokens=comp.tokens_before, yscompress_input_tokens=comp.tokens_after, yellowstone_final_input_tokens=plan.yellowstone_final_input_tokens, output_tokens=usage["output_tokens"] or estimate_tokens(text_out), cache_creation_input_tokens=usage["cache_creation_input_tokens"], cache_read_input_tokens=usage["cache_read_input_tokens"], prompt_cache_mode=settings.prompt_cache_mode, plan=plan, request_id=current_request_id(), upstream_request_id=result.upstream_request_id, status_code=result.status_code, start_time=start, workload_class=workload, session_id=session_id)
     if result.status_code >= 400:
         return JSONResponse(result.body, status_code=result.status_code)
     return JSONResponse({"id": result.body.get("id", "chatcmpl_mock"), "object": "chat.completion", "model": model, "choices": [{"index": 0, "message": {"role": "assistant", "content": text_out}, "finish_reason": result.body.get("stop_reason", "stop")}], "usage": {"prompt_tokens": comp.tokens_after, "completion_tokens": usage["output_tokens"], "total_tokens": comp.tokens_after + usage["output_tokens"], "raw_prompt_tokens": comp.tokens_before, "tokens_saved": comp.tokens_saved}, "yellowstone": plan.to_dict(), "yscompress": comp.to_dict()}, status_code=200)

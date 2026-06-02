@@ -18,6 +18,8 @@ auth_mode=dev, an is_admin marker, or scopes containing support:read / support:w
 admin — which is how this branch's AuthPrincipal is adapted into a dict.
 """
 
+import datetime as _dt
+import re
 from pathlib import Path
 from typing import Any, Callable
 
@@ -26,6 +28,30 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from .support_bundle import BundleOptions, SupportBundleBuilder
+
+_REL_RE = re.compile(r"^\s*(\d+)\s*([smhd])\s*$", re.I)
+_REL_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def parse_timestamp(value: str | None) -> _dt.datetime | None:
+    """Parse a since/until value: ISO 8601, a unix epoch, or a relative span (e.g. 2h, 7d)."""
+    if not value:
+        return None
+    now = _dt.datetime.now(tz=_dt.timezone.utc)
+    rel = _REL_RE.match(value)
+    if rel:
+        return now - _dt.timedelta(seconds=int(rel.group(1)) * _REL_UNITS[rel.group(2).lower()])
+    try:
+        dt = _dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        # Normalize naive (date-only / tz-less) input to UTC — comparing a naive value
+        # against a timestamptz column raises on Postgres (a 500). Mirrors main._parse_iso.
+        return dt.replace(tzinfo=_dt.timezone.utc) if dt.tzinfo is None else dt
+    except ValueError:
+        pass
+    try:
+        return _dt.datetime.fromtimestamp(float(value), tz=_dt.timezone.utc)
+    except (ValueError, OverflowError):
+        raise HTTPException(status_code=400, detail=f"unparseable timestamp: {value!r} (use ISO 8601, unix epoch, or '2h'/'7d')")
 
 
 class SupportBundleRequest(BaseModel):
@@ -149,5 +175,24 @@ def include_support_bundle_router(
                 },
             )
         return result.to_dict()
+
+    @router.get("/session")
+    async def support_session_report(request: Request, session_id: str, since: str | None = None, until: str | None = None):
+        """Privacy-safe per-session diagnostics (metadata only) for a support bundle.
+
+        Returns request IDs, endpoints, models, statuses, token/latency summaries — never
+        prompts or response bodies. The CLI folds this into a `decompute support bundle`.
+        """
+        ctx = auth_context_func(request)
+        if not is_support_admin(ctx):
+            raise HTTPException(status_code=403, detail="support session report requires admin/support scope")
+        if not hasattr(store, "support_session_report"):
+            raise HTTPException(status_code=501, detail="store does not support session reports")
+        return store.support_session_report(
+            project_id=ctx.get("project_id"),
+            session_id=session_id,
+            since=parse_timestamp(since),
+            until=parse_timestamp(until),
+        )
 
     app.include_router(router)

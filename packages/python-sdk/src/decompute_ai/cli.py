@@ -63,6 +63,21 @@ def _conn() -> tuple[str, str]:
     return (cfg.get("base_url") or DEFAULT_BASE_URL).rstrip("/"), (cfg.get("api_key") or DEFAULT_API_KEY)
 
 
+def _write_claude_env(base_url: str, api_key: str) -> Path:
+    """Write the sourceable Claude Code env file (ANTHROPIC_BASE_URL/API_KEY). Returns its path."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    env_path = CONFIG_DIR / "claude.env"
+    env_path.write_text(
+        f'export ANTHROPIC_BASE_URL="{base_url}"\nexport ANTHROPIC_API_KEY="{api_key}"\n',
+        encoding="utf-8",
+    )
+    try:
+        env_path.chmod(0o600)
+    except Exception:
+        pass
+    return env_path
+
+
 @app.command()
 def init(
     base_url: str = typer.Option(DEFAULT_BASE_URL, "--base-url", help="Gateway URL"),
@@ -74,15 +89,31 @@ def init(
         base_url = typer.prompt("Gateway URL", default=base_url)
         api_key = typer.prompt("Decompute API key", default=api_key)
     base_url = base_url.rstrip("/")
+    if not api_key.startswith("dc_"):
+        print("[yellow]⚠[/yellow] API keys normally start with 'dc_' — double-check the value if auth fails.")
     save_config({"base_url": base_url, "api_key": api_key})
     print(f"[green]✓[/green] saved {CONFIG_PATH}")
+    reachable = False
     try:
         h = Decompute(api_key=api_key, base_url=base_url).get("/health")
+        reachable = True
         print(f"[green]✓ gateway reachable[/green] — env={h.get('environment')} mock={h.get('mock_anthropic')}")
-        print("Next: [bold]decompute claude[/bold] (or [bold]decompute vscode .[/bold]) to route your tools through it.")
+        caps = h.get("capabilities") or {}
+        active = [k for k, v in caps.items() if isinstance(v, dict) and v.get("active")]
+        if active:
+            print(f"  capabilities: [cyan]{', '.join(active)}[/cyan]")
     except DecomputeError as exc:
         print(f"[yellow]Config saved, but the gateway isn't reachable yet:[/yellow] {exc}")
-        print("Start it (scripts/run_gateway.sh), then run [bold]decompute doctor[/bold].")
+        print("Start it (scripts/run_gateway.sh), then re-run [bold]decompute init[/bold] or [bold]decompute doctor[/bold].")
+    # Finish the job: leave Claude Code ready to route through the gateway.
+    wire = yes or typer.confirm("Configure Claude Code to route through the gateway now?", default=True)
+    if wire:
+        env_path = _write_claude_env(base_url, api_key)
+        print(f"[green]✓[/green] Claude Code env written: {env_path}")
+        print(f"  Activate: [bold]source {env_path}[/bold]   then run [bold]claude[/bold]")
+        print(f"  Permanent: [bold]decompute claude --write-profile[/bold]   (or [bold]decompute vscode .[/bold] for VS Code)")
+    else:
+        print("Next: [bold]decompute claude[/bold] (or [bold]decompute vscode .[/bold]) when you're ready.")
 
 
 @app.command()
@@ -91,14 +122,7 @@ def claude(
 ):
     """Configure Claude Code to route through the Decompute gateway (writes a sourceable env file)."""
     base_url, api_key = _conn()
-    env_lines = [f'export ANTHROPIC_BASE_URL="{base_url}"', f'export ANTHROPIC_API_KEY="{api_key}"']
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    env_path = CONFIG_DIR / "claude.env"
-    env_path.write_text("\n".join(env_lines) + "\n", encoding="utf-8")
-    try:
-        env_path.chmod(0o600)
-    except Exception:
-        pass
+    env_path = _write_claude_env(base_url, api_key)
     print(f"[green]✓[/green] wrote {env_path}")
     print("Activate it for Claude Code:")
     print(f"  [bold]source {env_path}[/bold]   # then run `claude` as usual")
@@ -217,19 +241,40 @@ app.add_typer(support_app, name="support")
 
 @support_app.command("bundle")
 def support_bundle(
+    session: Optional[str] = typer.Option(None, "--session", help="Scope to one Claude Code session id (x-decompute-session-id)."),
+    since: Optional[str] = typer.Option(None, "--since", help="Session activity since this time (ISO 8601, unix epoch, or '2h'/'7d')."),
+    until: Optional[str] = typer.Option(None, "--until", help="Session activity up to this time."),
     output_dir: Optional[str] = typer.Option(None, "--output-dir", help="Where to write the zip (default: <data-dir>/support)."),
     data_dir: str = typer.Option(".decompute", "--data-dir", help="Gateway data dir holding logs/config."),
     project_root: str = typer.Option(".", "--project-root"),
-    pii_mode: str = typer.Option("tokenize", "--pii-mode", help="tokenize | redact | passthrough"),
+    pii_mode: str = typer.Option("tokenize", "--pii-mode", help="tokenize | redact"),
     release_version: str = typer.Option("v0.1.0-beta.1", "--release-version"),
     canary: list[str] = typer.Option([], "--canary", help="A fake secret/prompt that must NOT appear in the bundle (repeatable)."),
 ):
-    """Create a privacy-scrubbed support bundle — no raw prompts, CCR payloads, secrets, or PII."""
+    """Create a privacy-scrubbed support bundle — no raw prompts, CCR payloads, secrets, or PII.
+
+    With --session, folds in a metadata-only report for that Claude Code session (request
+    IDs, models, statuses, token/latency summaries — never prompt content).
+    """
     try:
         from decompute_gateway.support_bundle import build_support_bundle
     except Exception:
         print("[red]decompute_gateway.support_bundle is not importable[/red] — run this from the gateway environment.")
         raise typer.Exit(code=1)
+
+    session_report = None
+    if session:
+        params = {"session_id": session}
+        if since:
+            params["since"] = since
+        if until:
+            params["until"] = until
+        try:
+            session_report = _client().get("/v1/support/session", params=params)
+            n = (session_report or {}).get("summary", {}).get("requests", 0)
+            print(f"[green]✓[/green] session report: {n} request(s) for [bold]{session}[/bold]")
+        except DecomputeError as exc:
+            print(f"[yellow]⚠ couldn't fetch the session report ({exc}); building the bundle without it.[/yellow]")
 
     data = Path(data_dir).expanduser()
     out = Path(output_dir).expanduser() if output_dir else data / "support"
@@ -240,11 +285,14 @@ def support_bundle(
         pii_mode=pii_mode,
         release_version=release_version,
         extra_canaries=list(canary),
+        session_report=session_report,
     )
     ok = bool(result.leak_scan.get("ok"))
     print("Support bundle created:")
     print(f"  {result.path}")
     print()
+    if session:
+        print(f"Session scope: {session}" + (f"  since {since}" if since else ""))
     print("Raw prompts included: no")
     print("CCR payloads included: no")
     print("Secrets scrubbed: yes")

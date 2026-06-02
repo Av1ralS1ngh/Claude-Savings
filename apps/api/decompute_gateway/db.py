@@ -31,6 +31,8 @@ ALL_SCOPES = [
     "devices:write",
     "routes:read",
     "dashboard:read",
+    "support:read",
+    "support:write",
     "admin",
 ]
 
@@ -425,6 +427,7 @@ class Store:
             api_key_prefix=key_prefix,
             request_id=event.get("request_id"),
             upstream_request_id=event.get("upstream_request_id"),
+            session_id=event.get("session_id"),
             endpoint=event.get("endpoint", "unknown"),
             model=event.get("model"),
             status_code=event.get("status_code"),
@@ -583,6 +586,7 @@ class Store:
             "api_key_prefix": u.api_key_prefix,
             "request_id": u.request_id,
             "upstream_request_id": u.upstream_request_id,
+            "session_id": u.session_id,
             "endpoint": u.endpoint,
             "model": u.model,
             "status_code": u.status_code,
@@ -652,6 +656,79 @@ class Store:
                 "cancelled_streams": int(stream_cancelled),
             },
         }
+
+    def support_session_report(
+        self,
+        *,
+        project_id: str,
+        session_id: str,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        limit: int = 2000,
+    ) -> dict[str, Any]:
+        """Privacy-safe per-session diagnostics for a support bundle.
+
+        Returns ONLY metadata — request IDs, endpoints, models, status codes, token
+        counts, latencies, stream status. Usage rows store no prompt/response content,
+        so there is nothing here to leak; the support-bundle scrubber runs over it anyway.
+        """
+        with self.session() as s:
+            q = s.query(UsageEvent).filter(
+                UsageEvent.project_id == project_id, UsageEvent.session_id == session_id
+            )
+            if since is not None:
+                q = q.filter(UsageEvent.created_at >= since)
+            if until is not None:
+                q = q.filter(UsageEvent.created_at <= until)
+            rows = q.order_by(UsageEvent.created_at.asc()).limit(limit).all()
+
+        requests = [
+            {
+                "request_id": r.request_id,
+                "upstream_request_id": r.upstream_request_id,
+                "endpoint": r.endpoint,
+                "model": r.model,
+                "status_code": r.status_code,
+                "latency_ms": r.latency_ms,
+                "raw_input_tokens": r.raw_input_tokens,
+                "final_input_tokens": r.yellowstone_final_input_tokens,
+                "output_tokens": r.output_tokens,
+                "tokens_saved": r.tokens_saved,
+                "estimated_cost_usd": r.estimated_cost_usd,
+                "workload_class": r.workload_class,
+                "stream_status": r.stream_status,
+                "stream_cancelled": bool(r.stream_cancelled),
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in rows
+        ]
+
+        def tally(field: str) -> dict[str, int]:
+            out: dict[str, int] = {}
+            for x in requests:
+                k = str(x.get(field))
+                out[k] = out.get(k, 0) + 1
+            return out
+
+        summary = {
+            "session_id": session_id,
+            "requests": len(requests),
+            "truncated": len(requests) >= limit,
+            "since": since.isoformat() if since else None,
+            "until": until.isoformat() if until else None,
+            "first_at": requests[0]["created_at"] if requests else None,
+            "last_at": requests[-1]["created_at"] if requests else None,
+            "raw_input_tokens": sum(x["raw_input_tokens"] or 0 for x in requests),
+            "final_input_tokens": sum(x["final_input_tokens"] or 0 for x in requests),
+            "output_tokens": sum(x["output_tokens"] or 0 for x in requests),
+            "tokens_saved": sum(x["tokens_saved"] or 0 for x in requests),
+            "estimated_cost_usd": round(sum(x["estimated_cost_usd"] or 0.0 for x in requests), 6),
+            "cancelled_streams": sum(1 for x in requests if x["stream_cancelled"]),
+            "by_endpoint": tally("endpoint"),
+            "by_model": tally("model"),
+            "by_status": tally("status_code"),
+        }
+        return {"summary": summary, "requests": requests}
 
     def list_audit_log(self, *, project_id: str, action: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         with self.session() as s:
