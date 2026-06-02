@@ -106,11 +106,18 @@ def init(
 ):
     """Initialize local config (~/.decompute/config.json) and verify the gateway."""
     if not yes:
+        print("This is your [bold]Decompute[/bold] gateway URL and key — [dim]not[/dim] your Anthropic key.")
+        print("Get your key at [bold]https://decompute.ai[/bold] after signup, or use [bold]dc_dev_local[/bold] for local dev.\n")
         base_url = typer.prompt("Gateway URL", default=base_url)
-        api_key = typer.prompt("Decompute API key", default=api_key)
+        api_key  = typer.prompt("Decompute API key  (starts with dc_)", default=api_key)
     base_url = base_url.rstrip("/")
+    if not base_url.startswith(("http://", "https://")):
+        print(f"[red]✗[/red] Gateway URL must start with http:// or https://  (got: {base_url!r})")
+        raise typer.Exit(1)
     if not api_key.startswith("dc_"):
-        print("[yellow]⚠[/yellow] API keys normally start with 'dc_' — double-check the value if auth fails.")
+        print("[yellow]⚠[/yellow] Decompute keys start with 'dc_' — you may have entered your Anthropic key by mistake.")
+        if not typer.confirm("Continue anyway?", default=False):
+            raise typer.Exit(1)
     save_config({"base_url": base_url, "api_key": api_key})
     print(f"[green]✓[/green] saved {CONFIG_PATH}")
     reachable = False
