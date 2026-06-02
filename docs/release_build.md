@@ -36,30 +36,43 @@ files), but it errors `out of license` on the gateway's larger files (`main.py` 
 - production CLI builds (remove the trial watermark/limits), and
 - obfuscating the gateway at all.
 
-## Gateway obfuscation (only if self-hosted)
+## Gateway obfuscation — NOT needed (hosted by us)
 
-If customers run the gateway on their own infra, obfuscate it the same way (needs a license):
+**Decision:** the gateway is a **hosted website** run by us (free/pro/enterprise tiers), so its
+Python never ships to customers and needs no obfuscation. Only the thin `decompute-ai` client
+goes out (PyPI), and that is obfuscated above.
+
+If an enterprise tier later offers a *self-hosted* gateway, obfuscate it the same way (a license
+is required — the trial errors `out of license` on the gateway's larger files):
 
 ```bash
 pyarmor gen -O build/gateway -r apps/api/decompute_gateway
-# then package build/gateway for your deployment target (Docker image / wheel)
+# then ship the obfuscated tree as a Docker image
 ```
 
-**Open decision:** is the gateway *self-hosted by customers* (then obfuscate + ship it,
-e.g. a Docker image) or *hosted by us* (then no obfuscation needed — it never leaves our
-infra)? This drives whether the gateway build above is part of the release at all.
+## CI: multi-platform release
 
-## Publish to PyPI (final step — deferred)
+`.github/workflows/release.yml` builds the obfuscated wheel for the full matrix
+(ubuntu / macos-arm64 / macos-x86 / windows × Python 3.10–3.13) and publishes on a `v*` tag.
 
-Before publishing, fill the `TODO(confirm)` fields in `packages/python-sdk/pyproject.toml`
-(license, authors, project URLs), then:
+Required repository secrets:
+- `PYARMOR_REGFILE_B64` — base64 of your PyArmor license regfile (`base64 -i pyarmor-regfile.zip`).
+- `PYPI_API_TOKEN` — PyPI API token (used only by the publish job).
+
+Cut a release: `git tag v0.1.0 && git push origin v0.1.0`. The publish job runs `twine check`
+then `twine upload`; it's gated behind a GitHub *environment* (`pypi`) — add a manual-approval
+rule there, and validate on TestPyPI first.
+
+## Publish manually (if not using CI)
 
 ```bash
 pip install twine
-twine upload dist/decompute_ai-*.whl          # all per-platform wheels
+python -m twine check dist/*.whl
+python -m twine upload dist/*.whl          # all per-platform wheels
 ```
 
-Use a private index or TestPyPI first to validate the install on a clean machine.
+The package metadata (license/authors/URLs) in `packages/python-sdk/pyproject.toml` is finalized;
+adjust the author email / homepage there if the company prefers different values.
 
 ## Build artifacts
 

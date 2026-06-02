@@ -1,0 +1,81 @@
+name: release-cli
+
+# Builds the PyArmor-obfuscated `decompute-ai` wheel for every supported platform/Python
+# and publishes them to PyPI on a version tag. The obfuscated wheel bundles a native
+# pyarmor runtime .so, so it is platform+python specific — hence the matrix.
+#
+# Required repository secrets:
+#   PYARMOR_REGFILE_B64  base64 of your PyArmor license regfile (pyarmor-regfile.zip)
+#   PYPI_API_TOKEN       PyPI API token (publish job only)
+#
+# Trigger: push a tag like v0.1.0, or run manually (workflow_dispatch, build-only).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: build ${{ matrix.os }} py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, macos-13, windows-latest]
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install build tooling
+        run: python -m pip install --upgrade pip pyarmor setuptools wheel
+
+      - name: Register PyArmor license
+        shell: bash
+        env:
+          PYARMOR_REGFILE_B64: ${{ secrets.PYARMOR_REGFILE_B64 }}
+        run: |
+          if [ -z "$PYARMOR_REGFILE_B64" ]; then
+            echo "::error::PYARMOR_REGFILE_B64 secret is not set — a PyArmor license is required for release builds." && exit 1
+          fi
+          echo "$PYARMOR_REGFILE_B64" | base64 -d > pyarmor-regfile.zip
+          pyarmor reg pyarmor-regfile.zip
+          rm -f pyarmor-regfile.zip
+
+      - name: Build + verify obfuscated wheel
+        run: python scripts/build_release.py --verify
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}-py${{ matrix.python }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  publish:
+    name: publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment: pypi          # add a manual-approval gate on this environment for safety
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Publish
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          python -m pip install --upgrade twine
+          python -m twine check dist/*.whl
+          python -m twine upload dist/*.whl

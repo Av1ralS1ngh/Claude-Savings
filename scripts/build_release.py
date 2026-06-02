@@ -21,10 +21,10 @@ Notes:
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
-import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -55,34 +55,20 @@ def build() -> Path:
         sys.exit("error: pyarmor runtime package not found in build output")
     print(f"→ runtime package: {runtime}")
 
-    meta = tomllib.loads((SDK / "pyproject.toml").read_text())["project"]
     shutil.copy(SDK / "README.md", BUILD / "README.md")
 
-    deps = meta.get("dependencies", [])
-    (BUILD / "pyproject.toml").write_text(
-        f"""[build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"
-
-[project]
-name = "{meta['name']}"
-version = "{meta['version']}"
-description = "{meta['description']}"
-readme = "README.md"
-requires-python = "{meta['requires-python']}"
-dependencies = {deps!r}
-
-[project.scripts]
-decompute = "decompute_ai.cli:app"
-
-[tool.setuptools]
-packages = ["decompute_ai", "{runtime}"]
-
-[tool.setuptools.package-data]
-"{runtime}" = ["*.so", "*.pyd", "*.dll", "*.dylib"]
-""",
-        encoding="utf-8",
+    # Carry the FULL source metadata (license/authors/keywords/classifiers/urls/scripts) into
+    # the published wheel — only swap the src-layout package discovery for the obfuscated flat
+    # layout (obfuscated decompute_ai + the pyarmor runtime package).
+    src_pyproject = (SDK / "pyproject.toml").read_text()
+    marker = '[tool.setuptools.packages.find]\nwhere = ["src"]'
+    if marker not in src_pyproject:
+        sys.exit("error: expected packages.find block not found in source pyproject — update build_release.py")
+    obf_packages = (
+        f'[tool.setuptools]\npackages = ["decompute_ai", "{runtime}"]\n\n'
+        f'[tool.setuptools.package-data]\n"{runtime}" = ["*.so", "*.pyd", "*.dll", "*.dylib"]\n'
     )
+    (BUILD / "pyproject.toml").write_text(src_pyproject.replace(marker, obf_packages), encoding="utf-8")
 
     # The pyarmor runtime ships a native .so, so this is NOT a pure-Python wheel. Force a
     # platform tag (has_ext_modules=True) so pip won't install a macOS build on Linux/Windows.
@@ -114,8 +100,9 @@ def verify(wheel: Path) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         venv = Path(tmp) / "venv"
         run([sys.executable, "-m", "venv", str(venv)])
-        pip = venv / "bin" / "pip"
-        dec = venv / "bin" / "decompute"
+        bindir = venv / ("Scripts" if os.name == "nt" else "bin")
+        pip = bindir / ("pip.exe" if os.name == "nt" else "pip")
+        dec = bindir / ("decompute.exe" if os.name == "nt" else "decompute")
         run([str(pip), "install", "--quiet", str(wheel)])
         # The obfuscated cli.py must import + expose `app` via the pyarmor runtime.
         run([str(dec), "--help"])

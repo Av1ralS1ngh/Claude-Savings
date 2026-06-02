@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -63,12 +64,31 @@ def _conn() -> tuple[str, str]:
     return (cfg.get("base_url") or DEFAULT_BASE_URL).rstrip("/"), (cfg.get("api_key") or DEFAULT_API_KEY)
 
 
-def _write_claude_env(base_url: str, api_key: str) -> Path:
-    """Write the sourceable Claude Code env file (ANTHROPIC_BASE_URL/API_KEY). Returns its path."""
+def _new_session_id() -> str:
+    """A fresh, opaque working-session id (safe charset, well under the gateway's 64-char cap)."""
+    return f"cc-{uuid.uuid4().hex[:20]}"
+
+
+def _claude_env_lines(base_url: str, api_key: str, session_id: str) -> dict[str, str]:
+    """The env Claude Code needs: gateway routing, auth, and the session-id custom header.
+
+    ANTHROPIC_CUSTOM_HEADERS makes Claude Code stamp x-decompute-session-id on every upstream
+    request (main model + background + token-count), which the gateway stores so support
+    bundles can be scoped to one session. Format is `Name: Value` (Claude Code env reference).
+    """
+    return {
+        "ANTHROPIC_BASE_URL": base_url,
+        "ANTHROPIC_API_KEY": api_key,
+        "ANTHROPIC_CUSTOM_HEADERS": f"x-decompute-session-id: {session_id}",
+    }
+
+
+def _write_claude_env(base_url: str, api_key: str, session_id: str) -> Path:
+    """Write the sourceable Claude Code env file. Returns its path."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     env_path = CONFIG_DIR / "claude.env"
     env_path.write_text(
-        f'export ANTHROPIC_BASE_URL="{base_url}"\nexport ANTHROPIC_API_KEY="{api_key}"\n',
+        "".join(f'export {k}="{v}"\n' for k, v in _claude_env_lines(base_url, api_key, session_id).items()),
         encoding="utf-8",
     )
     try:
@@ -108,8 +128,11 @@ def init(
     # Finish the job: leave Claude Code ready to route through the gateway.
     wire = yes or typer.confirm("Configure Claude Code to route through the gateway now?", default=True)
     if wire:
-        env_path = _write_claude_env(base_url, api_key)
+        sid = _new_session_id()
+        env_path = _write_claude_env(base_url, api_key, sid)
+        save_config({"last_session_id": sid})
         print(f"[green]✓[/green] Claude Code env written: {env_path}")
+        print(f"  Session id: [cyan]{sid}[/cyan]")
         print(f"  Activate: [bold]source {env_path}[/bold]   then run [bold]claude[/bold]")
         print(f"  Permanent: [bold]decompute claude --write-profile[/bold]   (or [bold]decompute vscode .[/bold] for VS Code)")
     else:
@@ -119,11 +142,19 @@ def init(
 @app.command()
 def claude(
     write_profile: bool = typer.Option(False, "--write-profile", help="append the source line to your shell rc"),
+    session_id: Optional[str] = typer.Option(None, "--session-id", help="reuse a specific session id (default: mint a fresh one)"),
 ):
-    """Configure Claude Code to route through the Decompute gateway (writes a sourceable env file)."""
+    """Configure Claude Code to route through the Decompute gateway (writes a sourceable env file).
+
+    Each run mints a fresh x-decompute-session-id (via ANTHROPIC_CUSTOM_HEADERS) so the
+    working session can be scoped in a support bundle; reuse one with --session-id.
+    """
     base_url, api_key = _conn()
-    env_path = _write_claude_env(base_url, api_key)
+    sid = session_id or _new_session_id()
+    env_path = _write_claude_env(base_url, api_key, sid)
+    save_config({"last_session_id": sid})
     print(f"[green]✓[/green] wrote {env_path}")
+    print(f"  Session id: [cyan]{sid}[/cyan]   (support: [bold]decompute support bundle[/bold])")
     print("Activate it for Claude Code:")
     print(f"  [bold]source {env_path}[/bold]   # then run `claude` as usual")
     if write_profile:
@@ -142,9 +173,11 @@ def claude(
 @app.command()
 def vscode(
     path: Path = typer.Argument(Path("."), help="project directory to configure (default: .)"),
+    session_id: Optional[str] = typer.Option(None, "--session-id", help="reuse a specific session id (default: mint a fresh one)"),
 ):
     """Configure a VS Code project so Claude Code in its terminal routes through the gateway."""
     base_url, api_key = _conn()
+    sid = session_id or _new_session_id()
     vsdir = path / ".vscode"
     vsdir.mkdir(parents=True, exist_ok=True)
     settings_path = vsdir / "settings.json"
@@ -154,7 +187,7 @@ def vscode(
             settings = {}
     except Exception:
         settings = {}
-    env_block = {"ANTHROPIC_BASE_URL": base_url, "ANTHROPIC_API_KEY": api_key}
+    env_block = _claude_env_lines(base_url, api_key, sid)
     for key in ("terminal.integrated.env.osx", "terminal.integrated.env.linux", "terminal.integrated.env.windows"):
         block = settings.get(key)
         if not isinstance(block, dict):
@@ -162,7 +195,9 @@ def vscode(
         block.update(env_block)
         settings[key] = block
     settings_path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+    save_config({"last_session_id": sid})
     print(f"[green]✓[/green] configured {settings_path}")
+    print(f"  Session id: [cyan]{sid}[/cyan]")
     print("Reopen the VS Code integrated terminal; `claude` there now routes through the gateway.")
 
 
@@ -241,7 +276,8 @@ app.add_typer(support_app, name="support")
 
 @support_app.command("bundle")
 def support_bundle(
-    session: Optional[str] = typer.Option(None, "--session", help="Scope to one Claude Code session id (x-decompute-session-id)."),
+    session: Optional[str] = typer.Option(None, "--session", help="Scope to one Claude Code session id (default: your last `decompute claude` session)."),
+    all_sessions: bool = typer.Option(False, "--all", help="Full bundle — do not scope to a session."),
     since: Optional[str] = typer.Option(None, "--since", help="Session activity since this time (ISO 8601, unix epoch, or '2h'/'7d')."),
     until: Optional[str] = typer.Option(None, "--until", help="Session activity up to this time."),
     output_dir: Optional[str] = typer.Option(None, "--output-dir", help="Where to write the zip (default: <data-dir>/support)."),
@@ -261,6 +297,12 @@ def support_bundle(
     except Exception:
         print("[red]decompute_gateway.support_bundle is not importable[/red] — run this from the gateway environment.")
         raise typer.Exit(code=1)
+
+    # Default to the working session set by `decompute claude` unless --all or an explicit --session.
+    if not all_sessions and not session:
+        session = load_config().get("last_session_id")
+        if session:
+            print(f"[dim]Scoping to your last session {session} — use --session to override, --all for everything.[/dim]")
 
     session_report = None
     if session:
