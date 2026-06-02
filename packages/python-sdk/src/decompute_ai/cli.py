@@ -403,82 +403,79 @@ def _upload_support_bundle(zip_path: Path) -> dict:
 
 def _make_support_bundle(*, session, all_sessions, since, until, output_dir, data_dir,
                          project_root, pii_mode, release_version, canary, dry_run, send):
-    """Build a privacy-safe support bundle; optionally preview (dry-run) or send it to Decompute."""
-    try:
-        from decompute_gateway.support_bundle import build_support_bundle
-    except Exception:
-        print("[red]decompute_gateway.support_bundle is not importable[/red] — run this from the gateway environment.")
-        raise typer.Exit(code=1)
+    """Request a privacy-safe support bundle from the gateway, download it, and optionally send it.
 
-    # Default to the working session set by `decompute claude` unless --all or an explicit --session.
+    The gateway builds the bundle server-side (POST /v1/support/bundle), scrubs it, runs the
+    leak scan, and streams the zip back. The CLI never imports gateway internals — this works
+    from a plain `pip install decompute-ai`.
+    """
+    import httpx
+
+    # Resolve session scope.
     if not all_sessions and not session:
         session = load_config().get("last_session_id")
         if session:
             print(f"[dim]Scoping to your last session {session} — use --session to override, --all for everything.[/dim]")
 
-    session_report = None
-    if session:
-        params = {"session_id": session}
-        if since:
-            params["since"] = since
-        if until:
-            params["until"] = until
-        try:
-            session_report = _client().get("/v1/support/session", params=params)
-            n = (session_report or {}).get("summary", {}).get("requests", 0)
-            print(f"[green]✓[/green] session report: {n} request(s) for [bold]{session}[/bold]")
-        except DecomputeError as exc:
-            print(f"[yellow]⚠ couldn't fetch the session report ({exc}); building the bundle without it.[/yellow]")
+    base_url, api_key = _conn()
+    headers = {"x-decompute-api-key": api_key}
 
-    data = Path(data_dir).expanduser()
-    out = Path(output_dir).expanduser() if output_dir else data / "support"
-    result = build_support_bundle(
-        output_dir=out,
-        data_dir=data,
-        project_root=Path(project_root),
-        pii_mode=pii_mode,
-        release_version=release_version,
-        extra_canaries=list(canary),
-        session_report=session_report,
-    )
-    ok = bool(result.leak_scan.get("ok"))
     if dry_run:
-        print("[bold]Dry run[/bold] — exactly what a bundle would contain (then discarded):")
-        for f in result.manifest.get("included_files", []):
+        print("[bold]Dry run[/bold] — previewing what the bundle would contain (nothing saved or sent)…")
+        payload: dict = {"download": False, "pii_mode": pii_mode}
+        try:
+            resp = httpx.post(f"{base_url}/v1/support/bundle", json=payload, headers=headers, timeout=60.0)
+            if resp.status_code != 200:
+                raise DecomputeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
+            d = resp.json()
+        except Exception as exc:
+            print(f"[red]Could not reach the gateway:[/red] {exc}")
+            raise typer.Exit(1)
+        manifest = d.get("manifest", {})
+        for f in manifest.get("included_files", []):
             print(f"  {f.get('path')}  [dim]({f.get('bytes', '?')} bytes)[/dim]")
-        pr = result.privacy_report or {}
+        pr = d.get("privacy_report", {})
+        ok = d.get("leak_scan", {}).get("ok", False)
         print(f"\nprompt fields omitted: {pr.get('prompt_fields_omitted', 0)} · "
               f"secrets redacted: {pr.get('secret_fields_redacted', 0)} · "
               f"leak scan: {'[green]PASS[/green]' if ok else '[red]FAIL[/red]'}")
-        zip_path = Path(result.path)
-        for p in (zip_path, zip_path.with_suffix(".leak_scan.json")):
-            try:
-                p.unlink(missing_ok=True)
-            except Exception:
-                pass
         print("[dim](nothing written or sent — re-run without --dry-run to create the bundle.)[/dim]")
-        raise typer.Exit(code=0)
+        raise typer.Exit(0)
 
-    print("Support bundle created:")
-    print(f"  {result.path}")
+    # Build + download the real zip.
+    print("Building support bundle on the gateway…")
+    payload = {"download": True, "pii_mode": pii_mode}
+    try:
+        resp = httpx.post(f"{base_url}/v1/support/bundle", json=payload, headers=headers, timeout=120.0)
+        if resp.status_code != 200:
+            raise DecomputeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
+    except Exception as exc:
+        print(f"[red]Could not build the bundle:[/red] {exc}")
+        raise typer.Exit(1)
+
+    # Save the downloaded zip locally.
+    out_dir = Path(output_dir).expanduser() if output_dir else Path(data_dir).expanduser() / "support"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    bundle_name = resp.headers.get("x-decompute-support-bundle", "decompute-support.zip")
+    zip_path = out_dir / bundle_name
+    zip_path.write_bytes(resp.content)
+
+    print(f"\n[green]✓[/green] Support bundle: {zip_path}")
     if session:
-        print(f"Session scope: {session}" + (f"  since {since}" if since else ""))
-    print(f"Raw prompts: no · CCR payloads: no · Secrets scrubbed: yes · PII mode: {pii_mode}")
-    print(f"Leak scan: {'[green]PASS[/green]' if ok else '[red]FAIL[/red]'}")
-    if not ok:
-        print(json.dumps(result.leak_scan, indent=2, sort_keys=True))
-        print("[red]Not sending — bundle failed the local leak scan.[/red]")
-        raise typer.Exit(code=2)
+        print(f"  Session scope: {session}" + (f"  since {since}" if since else ""))
+    print("  Raw prompts: no · CCR payloads: no · Secrets scrubbed: yes")
+    print(f"  Leak scan: {'[green]PASS[/green]' if resp.headers.get('x-decompute-support-leak-scan-ok') == 'true' else '[yellow]check gateway logs[/yellow]'}")
 
     if send:
+        print("\nSending to Decompute support…")
         try:
-            r = _upload_support_bundle(Path(result.path))
-            print(f"\n[green]✓ sent to Decompute support[/green] — reference: [bold]{r.get('reference_id')}[/bold]")
-            print("  Quote that reference id when you contact us; it points to your scrubbed bundle.")
+            r = _upload_support_bundle(zip_path)
+            print(f"[green]✓ Sent![/green] Reference id: [bold]{r.get('reference_id')}[/bold]")
+            print("  Give us that id and we can pull your scrubbed bundle.")
         except DecomputeError as exc:
-            print(f"[red]send failed:[/red] {exc}")
-            print(f"  The bundle is saved at {result.path} — you can attach it to a ticket manually.")
-            raise typer.Exit(code=3)
+            print(f"[red]Send failed:[/red] {exc}")
+            print(f"  Your bundle is at {zip_path} — attach it to a support ticket.")
+            raise typer.Exit(3)
 
 
 @support_app.command("bundle")
