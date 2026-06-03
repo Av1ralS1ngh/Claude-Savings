@@ -12,6 +12,11 @@ def _principal(project_id="proj_x") -> AuthPrincipal:
     return AuthPrincipal(project_id=project_id, org_id="o", key_id=None, key_prefix="dc_test", scopes=["admin"], auth_mode="api_key")
 
 
+def _local_principal(project_id="proj_default") -> AuthPrincipal:
+    # No platform key supplied in local/self-hosted mode -> unmetered (BYOK).
+    return AuthPrincipal(project_id=project_id, org_id="org_default", key_id=None, key_prefix=None, scopes=["admin"], auth_mode="local_noauth")
+
+
 def _store(tmp_path) -> Store:
     s = Store(Settings(database_url=f"sqlite+pysqlite:///{tmp_path}/o.db"))
     s.create_schema_for_local_dev()
@@ -50,3 +55,29 @@ def test_unknown_limit_is_rejected():
     with pytest.raises(HTTPException) as e:
         rl.set_override("p", not_a_real_limit=5)
     assert e.value.status_code == 400
+
+
+def test_local_noauth_is_unmetered(tmp_path):
+    """Regression: a local/self-hosted/BYOK caller (local_noauth) must NOT be rate-limited
+    by SaaS tier quotas. Claude Code's large, bursty turns were tripping the free-tier
+    token/min cap and looping on retries; local operators pay the provider directly."""
+    settings = Settings(database_url=f"sqlite+pysqlite:///{tmp_path}/o.db")
+    store = _store(tmp_path)
+    rl = RateLimitManager(settings, store=store)
+    local = _local_principal()
+    # Far over every free-tier cap (context + tokens/min) — would 413/429 for a customer.
+    huge = settings.max_context_tokens * 100
+    for _ in range(50):  # also blows per_key_rpm=20 if it were enforced
+        rl.check_preflight(principal=local, estimated_input_tokens=huge, estimated_output_tokens=huge, store=store)
+    assert rl.limits_for(local) == RateLimitManager.UNMETERED
+
+
+def test_api_key_caller_is_still_metered(tmp_path):
+    """The flip side: an authenticated platform customer is still enforced."""
+    settings = Settings(database_url=f"sqlite+pysqlite:///{tmp_path}/o.db")
+    store = _store(tmp_path)
+    rl = RateLimitManager(settings, store=store)
+    with pytest.raises(HTTPException) as e:
+        rl.check_preflight(principal=_principal(), estimated_input_tokens=settings.max_context_tokens + 1,
+                           estimated_output_tokens=0, store=store)
+    assert e.value.status_code == 413

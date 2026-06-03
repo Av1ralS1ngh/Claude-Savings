@@ -54,6 +54,19 @@ class RateLimitManager:
         "enterprise": {"per_key_rpm": 1000, "project_tokens_per_min": 5_000_000, "max_context_tokens": 400_000, "monthly_spend_usd": 10_000.0},
     }
 
+    # Effectively-unlimited quota for unmetered callers (local/self-hosted/BYOK). These
+    # tier quotas are a hosted-SaaS metering construct: they exist to ration a *platform
+    # customer*. A local operator running their own gateway with their own provider key
+    # pays the upstream provider directly, so the provider's account limits are the real
+    # ceiling — Decompute must not throttle them. Finite (JSON-safe) but far above any
+    # single-user burst, including a full 1M-context Claude Code turn.
+    UNMETERED: dict[str, float] = {
+        "per_key_rpm": 1_000_000,
+        "project_tokens_per_min": 1_000_000_000,
+        "max_context_tokens": 10_000_000,
+        "monthly_spend_usd": 1_000_000_000.0,
+    }
+
     def __init__(self, settings: Settings, store: Any | None = None):
         self.settings = settings
         # When a store is provided, per-project quotas derive from the project's tier
@@ -103,6 +116,20 @@ class RateLimitManager:
         ov = self.overrides.get(project_id, {})
         return {k: ov.get(k, base.get(k, getattr(self.settings, k))) for k in self.OVERRIDABLE}
 
+    @staticmethod
+    def _metered(principal: AuthPrincipal) -> bool:
+        """True only for authenticated platform customers. SaaS quotas ration a paying/
+        hosted tenant identified by their Decompute platform key (auth_mode 'api_key').
+        A local operator with no platform key (local_noauth) or the dev key is unmetered:
+        their own upstream-provider account is the ceiling (BYOK), not a Decompute tier."""
+        return getattr(principal, "auth_mode", None) == "api_key"
+
+    def limits_for(self, principal: AuthPrincipal) -> dict[str, float]:
+        """Quota that actually applies to this caller (unmetered for local/self-hosted)."""
+        if not self._metered(principal):
+            return dict(self.UNMETERED)
+        return self.effective_limits(principal.project_id)
+
     def check_body_size(self, content_length: str | None) -> None:
         if content_length:
             try:
@@ -112,6 +139,12 @@ class RateLimitManager:
                 pass
 
     def check_preflight(self, *, principal: AuthPrincipal, estimated_input_tokens: int, estimated_output_tokens: int, store: Store) -> None:
+        # SaaS quota metering applies only to authenticated platform customers. Local/
+        # self-hosted/BYOK callers (local_noauth, dev) run unmetered — they pay the upstream
+        # provider directly, so its account limits are the ceiling. Body-size and
+        # concurrent-stream safety caps still apply to everyone (enforced elsewhere).
+        if not self._metered(principal):
+            return
         now = time.time()
         limits = self.effective_limits(principal.project_id)  # admin overrides win over global defaults
         key_identity = principal.key_prefix or principal.auth_mode or "anonymous"

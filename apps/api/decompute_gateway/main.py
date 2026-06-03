@@ -842,13 +842,15 @@ def get_limits(request: Request) -> dict[str, Any]:
     project so a normal user can see why they might be throttled.
     """
     principal = _auth(request, "usage:read")
-    limits = rate_limits.effective_limits(principal.project_id)
+    metered = rate_limits._metered(principal)
+    limits = rate_limits.limits_for(principal)  # unmetered for local/self-hosted/BYOK
     return {
         "project_id": principal.project_id,
-        "tier": store.get_project_tier(principal.project_id),
+        "tier": store.get_project_tier(principal.project_id) if metered else "unmetered",
+        "metered": metered,
         "limits": limits,
         "monthly_spend_usd": store.monthly_spend(project_id=principal.project_id),
-        "monthly_spend_cap_usd": limits.get("monthly_spend_usd"),
+        "monthly_spend_cap_usd": limits.get("monthly_spend_usd") if metered else None,
     }
 
 
@@ -858,7 +860,8 @@ def billing_status(request: Request) -> dict[str, Any]:
     principal = _auth(request, "usage:read")
     info = store.get_project_billing(principal.project_id) or {"project_id": principal.project_id, "tier": "free"}
     info["billing_enabled"] = billing.enabled
-    info["limits"] = rate_limits.effective_limits(principal.project_id)
+    info["metered"] = rate_limits._metered(principal)
+    info["limits"] = rate_limits.limits_for(principal)
     return info
 
 

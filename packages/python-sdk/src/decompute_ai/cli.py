@@ -620,6 +620,16 @@ def limits():
         print(f"[red]could not fetch limits:[/red] {exc}")
         raise typer.Exit(1)
     lim = d.get("limits", {})
+    # Self-hosted / BYOK gateways report metered=false: no Decompute quota applies —
+    # your own Anthropic account limits are the ceiling. Show that plainly.
+    if d.get("metered") is False:
+        t = Table(title=f"limits — {d.get('project_id', '')}")
+        t.add_column("quota"); t.add_column("value")
+        t.add_row("metering", "[green]unmetered[/green] (self-hosted / BYOK)")
+        t.add_row("ceiling", "your own Anthropic account limits")
+        t.add_row("monthly usage (est.)", f"${d.get('monthly_spend_usd', 0.0):.4f}")
+        print(t)
+        return
     t = Table(title=f"limits — {d.get('project_id', '')}")
     t.add_column("quota"); t.add_column("value")
     t.add_row("requests / min (per key)", str(lim.get("per_key_rpm")))
