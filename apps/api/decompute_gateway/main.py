@@ -24,6 +24,7 @@ from .crypto import CCRCrypto
 from .db import Store
 from .observability import BodySizeLimitMiddleware, RequestContextMiddleware, SecurityHeadersMiddleware, configure_logging, current_request_id, metrics_response, project_id_var
 from .pricing import cost_usd, savings_usd
+from .billing import BillingError, BillingService
 from .rate_limits import RateLimitManager
 from .secret_scanner import SecretScanner
 from .security import AuthPrincipal, assert_csrf_for_browser_mutation, auth_context, upstream_anthropic_key
@@ -49,7 +50,8 @@ else:
 crypto = CCRCrypto(settings.ccr_encryption_key, settings.ccr_key_id)
 scanner = SecretScanner(mode=settings.pii_mode)
 yscompress = YSCompressClient(settings, store, crypto, scanner)
-rate_limits = RateLimitManager(settings)
+rate_limits = RateLimitManager(settings, store=store)  # store-backed: per-project quota follows the licensed tier
+billing = BillingService(settings, store)
 
 app = FastAPI(
     title="Decompute Claude Optimization Gateway",
@@ -840,10 +842,79 @@ def get_limits(request: Request) -> dict[str, Any]:
     limits = rate_limits.effective_limits(principal.project_id)
     return {
         "project_id": principal.project_id,
+        "tier": store.get_project_tier(principal.project_id),
         "limits": limits,
         "monthly_spend_usd": store.monthly_spend(project_id=principal.project_id),
         "monthly_spend_cap_usd": limits.get("monthly_spend_usd"),
     }
+
+
+# ── Billing / licensing ───────────────────────────────────────────────────────
+@app.get("/v1/billing/status")
+def billing_status(request: Request) -> dict[str, Any]:
+    principal = _auth(request, "usage:read")
+    info = store.get_project_billing(principal.project_id) or {"project_id": principal.project_id, "tier": "free"}
+    info["billing_enabled"] = billing.enabled
+    info["limits"] = rate_limits.effective_limits(principal.project_id)
+    return info
+
+
+@app.post("/v1/billing/checkout")
+async def billing_checkout(request: Request) -> JSONResponse:
+    """Start a subscription checkout for the caller's project; returns the Stripe Checkout URL."""
+    principal = _auth(request, "messages:write")
+    assert_csrf_for_browser_mutation(request)
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    try:
+        result = billing.create_checkout_session(project_id=principal.project_id, customer_email=(body or {}).get("email"))
+    except BillingError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    return JSONResponse({"checkout_url": result["url"], "session_id": result["id"]})
+
+
+@app.post("/v1/billing/portal")
+async def billing_portal(request: Request) -> JSONResponse:
+    """Open the Stripe billing portal for the caller's project (manage/cancel)."""
+    principal = _auth(request, "messages:write")
+    assert_csrf_for_browser_mutation(request)
+    try:
+        result = billing.create_portal_session(project_id=principal.project_id)
+    except BillingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse({"portal_url": result["url"]})
+
+
+@app.post("/v1/billing/webhook")
+async def billing_webhook(request: Request) -> JSONResponse:
+    """Stripe webhook — the ONLY path that grants/revokes a license. No auth; signature-verified.
+
+    Tier changes never come from a client request; they come from a signature-verified Stripe
+    event keyed back to the project via client_reference_id / stored customer id.
+    """
+    payload = await request.body()
+    sig = request.headers.get("stripe-signature")
+    try:
+        event = billing.construct_event(payload, sig)
+    except BillingError as exc:
+        # Bad/forged signature, or no webhook secret configured.
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
+        result = billing.handle_event(event)
+    except Exception as exc:
+        log.error("billing webhook handler failed", extra={"extra": {"type": event.get("type"), "error": str(exc)}})
+        raise HTTPException(status_code=500, detail="webhook processing failed")
+    if result.get("action") in {"granted", "revoked", "synced"} and result.get("project_id"):
+        try:
+            store.record_audit(project_id=result["project_id"], actor_key_prefix=None,
+                               action=f"billing.{result['action']}", target_type="subscription",
+                               target_id=result.get("project_id"), metadata={k: result.get(k) for k in ("tier", "status", "type")})
+        except Exception:
+            pass
+    return JSONResponse({"received": True, **{k: result.get(k) for k in ("handled", "action")}})
 
 
 def _parse_iso(value: str | None) -> datetime | None:

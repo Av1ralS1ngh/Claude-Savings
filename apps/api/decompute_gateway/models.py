@@ -55,8 +55,17 @@ class Project(Base):
     monthly_spend_cap_usd: Mapped[float | None] = mapped_column(Float)
     ccr_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     ccr_retention_days: Mapped[int] = mapped_column(Integer, default=7, nullable=False)
+    # Billing / licensing: the active Stripe subscription IS the license; tier drives quotas.
+    tier: Mapped[str] = mapped_column(String(32), default="free", nullable=False)
+    stripe_customer_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    stripe_subscription_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    subscription_status: Mapped[str | None] = mapped_column(String(32))  # active|trialing|past_due|canceled|...
+    subscription_current_period_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
-    __table_args__ = (Index("ix_projects_org_created", "org_id", "created_at"),)
+    __table_args__ = (
+        Index("ix_projects_org_created", "org_id", "created_at"),
+        Index("ix_projects_stripe_customer", "stripe_customer_id"),
+    )
 
 
 class ApiKey(Base):

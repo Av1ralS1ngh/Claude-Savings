@@ -103,6 +103,26 @@ class Settings:
     max_concurrent_streams_per_project: int = _int("DECOMPUTE_MAX_CONCURRENT_STREAMS", 10)
     monthly_spend_usd: float = _float("DECOMPUTE_MONTHLY_SPEND_USD", 250.0)
 
+    # ── Billing / licensing (Stripe) ──────────────────────────────────────────
+    # Billing is OFF unless a Stripe secret key is set, so local/dev never touches Stripe.
+    stripe_secret_key: str | None = os.getenv("DECOMPUTE_STRIPE_SECRET_KEY")
+    stripe_webhook_secret: str | None = os.getenv("DECOMPUTE_STRIPE_WEBHOOK_SECRET")
+    stripe_price_id: str | None = os.getenv("DECOMPUTE_STRIPE_PRICE_ID", "price_1Te0pKFbGwqVxzy7wyp1yQ1d")
+    stripe_product_id: str | None = os.getenv("DECOMPUTE_STRIPE_PRODUCT_ID", "prod_UdHOGNcyVN2V4e")
+    # The tier granted by a successful subscription to stripe_price_id.
+    stripe_price_tier: str = os.getenv("DECOMPUTE_STRIPE_PRICE_TIER", "pro")
+    # Pin the Stripe API version for deterministic payloads (optional; None = account default).
+    stripe_api_version: str | None = os.getenv("DECOMPUTE_STRIPE_API_VERSION")
+    # Grace after a subscription period lapses before a missed-deletion webhook self-heals to free.
+    billing_grace_days: int = _int("DECOMPUTE_BILLING_GRACE_DAYS", 3)
+    billing_success_url: str = os.getenv("DECOMPUTE_BILLING_SUCCESS_URL", "https://decompute.ai/billing/success")
+    billing_cancel_url: str = os.getenv("DECOMPUTE_BILLING_CANCEL_URL", "https://decompute.ai/billing/cancel")
+    billing_portal_return_url: str = os.getenv("DECOMPUTE_BILLING_PORTAL_RETURN_URL", "https://decompute.ai/account")
+
+    @property
+    def billing_enabled(self) -> bool:
+        return bool(self.stripe_secret_key)
+
     # Retry transient upstream failures (500/504/529) with exponential backoff.
     upstream_max_retries: int = _int("DECOMPUTE_UPSTREAM_MAX_RETRIES", 2)
     upstream_retry_backoff_s: float = _float("DECOMPUTE_UPSTREAM_RETRY_BACKOFF_S", 0.25)

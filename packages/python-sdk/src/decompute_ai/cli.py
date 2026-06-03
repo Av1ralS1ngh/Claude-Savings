@@ -349,7 +349,73 @@ def limits():
     t.add_row("max context tokens", str(lim.get("max_context_tokens")))
     cap = d.get("monthly_spend_cap_usd")
     t.add_row("monthly spend", f"${d.get('monthly_spend_usd', 0.0):.4f}" + (f" / ${cap} cap" if cap is not None else ""))
+    if d.get("tier"):
+        t.add_row("plan tier", d["tier"])
     print(t)
+
+
+def _open(url: str) -> None:
+    import webbrowser
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+
+
+@app.command()
+def upgrade():
+    """Subscribe to a paid plan — opens Stripe Checkout in your browser."""
+    client = _client()
+    try:
+        status = client.get("/v1/billing/status")
+    except DecomputeError as exc:
+        print(f"[red]could not reach the gateway:[/red] {exc}")
+        raise typer.Exit(1)
+    if not status.get("billing_enabled"):
+        print("[yellow]Billing isn't configured on this gateway (local/dev).[/yellow]")
+        raise typer.Exit(1)
+    if status.get("tier", "free") != "free":
+        print(f"You're already on the [bold]{status['tier']}[/bold] plan. Manage it with [bold]decompute billing --portal[/bold].")
+        raise typer.Exit(0)
+    try:
+        r = client.post("/v1/billing/checkout")
+    except DecomputeError as exc:
+        print(f"[red]checkout failed:[/red] {exc}")
+        raise typer.Exit(1)
+    url = r.get("checkout_url")
+    print("Complete your subscription in the browser:")
+    print(f"  [bold]{url}[/bold]")
+    _open(url)
+
+
+@app.command()
+def billing(portal: bool = typer.Option(False, "--portal", help="open the Stripe billing portal to manage/cancel")):
+    """Show your plan + subscription status (or --portal to manage it)."""
+    client = _client()
+    if portal:
+        try:
+            r = client.post("/v1/billing/portal")
+        except DecomputeError as exc:
+            print(f"[red]could not open the billing portal:[/red] {exc}")
+            raise typer.Exit(1)
+        url = r.get("portal_url")
+        print(f"Manage your subscription:\n  [bold]{url}[/bold]")
+        _open(url)
+        return
+    try:
+        s = client.get("/v1/billing/status")
+    except DecomputeError as exc:
+        print(f"[red]could not fetch billing status:[/red] {exc}")
+        raise typer.Exit(1)
+    t = Table(title="billing")
+    t.add_column("field"); t.add_column("value")
+    t.add_row("plan tier", s.get("tier", "free"))
+    t.add_row("subscription", s.get("subscription_status") or "—")
+    t.add_row("renews / ends", s.get("current_period_end") or "—")
+    t.add_row("billing enabled", "yes" if s.get("billing_enabled") else "no (local/dev)")
+    print(t)
+    if s.get("tier", "free") == "free" and s.get("billing_enabled"):
+        print("Upgrade with [bold]decompute upgrade[/bold].")
 
 
 keys_app = typer.Typer(help="Manage your API keys.")

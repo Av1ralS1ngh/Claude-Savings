@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
+import logging
 import secrets
 from typing import Any, Iterator
 
@@ -17,6 +18,8 @@ from .config import Settings
 from .crypto import CCRCrypto
 from .models import ApiKey, AuditLog, Base, CCRItem, Deployment, Device, Membership, Org, Project, UsageEvent, User, utcnow
 from .secret_scanner import SecretScanner
+
+log = logging.getLogger("decompute.gateway.db")
 
 
 ALL_SCOPES = [
@@ -233,8 +236,89 @@ class Store:
             "monthly_spend_cap_usd": p.monthly_spend_cap_usd,
             "ccr_enabled": p.ccr_enabled,
             "ccr_retention_days": p.ccr_retention_days,
+            "tier": p.tier,
             "created_at": p.created_at.isoformat() if p.created_at else None,
         }
+
+    # ── billing / licensing ───────────────────────────────────────────────────
+    def get_project_tier(self, project_id: str, *, grace_days: int | None = None) -> str:
+        """Cheap tier lookup for per-request enforcement; defaults to 'free'.
+
+        Read-side backstop: if a paid period lapsed more than grace_days ago (e.g. a
+        customer.subscription.deleted webhook was dropped/missed), self-heal to 'free' so a
+        canceled project can't keep paid access indefinitely on stale state.
+        """
+        gd = grace_days if grace_days is not None else int(getattr(self.settings, "billing_grace_days", 3))
+        with self.session() as s:
+            p = s.get(Project, project_id)
+            if not p or not p.tier or p.tier == "free":
+                return "free"
+            pend = p.subscription_current_period_end
+            if pend is not None:
+                if pend.tzinfo is None:
+                    pend = pend.replace(tzinfo=timezone.utc)
+                if utcnow() > pend + timedelta(days=max(0, gd)):
+                    return "free"
+            return p.tier
+
+    def get_project_billing(self, project_id: str) -> dict[str, Any] | None:
+        with self.session() as s:
+            p = s.get(Project, project_id)
+            if not p:
+                return None
+            return {
+                "project_id": p.id,
+                "tier": p.tier or "free",
+                "subscription_status": p.subscription_status,
+                "stripe_customer_id": p.stripe_customer_id,
+                "stripe_subscription_id": p.stripe_subscription_id,
+                "current_period_end": p.subscription_current_period_end.isoformat() if p.subscription_current_period_end else None,
+            }
+
+    def set_stripe_customer(self, *, project_id: str, customer_id: str) -> None:
+        with self.session() as s:
+            p = s.get(Project, project_id)
+            if p and not p.stripe_customer_id:
+                p.stripe_customer_id = customer_id
+
+    def find_project_by_customer(self, customer_id: str) -> str | None:
+        with self.session() as s:
+            p = s.execute(select(Project).where(Project.stripe_customer_id == customer_id)).scalars().first()
+            return p.id if p else None
+
+    def apply_subscription(
+        self,
+        *,
+        project_id: str,
+        tier: str,
+        status: str | None,
+        stripe_customer_id: str | None = None,
+        stripe_subscription_id: str | None = None,
+        current_period_end: datetime | None = None,
+    ) -> bool:
+        """Idempotently apply a subscription state to a project — the license-issuance write.
+
+        This is the ONLY place a tier is granted/revoked from a billing event. Returns False
+        if the project doesn't exist.
+        """
+        with self.session() as s:
+            p = s.get(Project, project_id)
+            if not p:
+                return False
+            p.tier = tier
+            p.subscription_status = status
+            if stripe_customer_id:
+                # Never silently rebind a project to a DIFFERENT Stripe customer (cross-tenant /
+                # mapping-corruption guard). First bind wins; a mismatch is left as-is.
+                if not p.stripe_customer_id:
+                    p.stripe_customer_id = stripe_customer_id
+                elif p.stripe_customer_id != stripe_customer_id:
+                    log.warning("refusing to rebind project %s from customer %s to %s",
+                                project_id, p.stripe_customer_id, stripe_customer_id)
+            if stripe_subscription_id is not None:
+                p.stripe_subscription_id = stripe_subscription_id
+            p.subscription_current_period_end = current_period_end
+            return True
 
     def create_api_key(self, *, project_id: str, name: str, scopes: list[str]) -> dict[str, Any]:
         if not scopes:

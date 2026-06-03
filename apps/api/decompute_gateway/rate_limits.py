@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import asyncio
 import time
-from typing import AsyncIterator, Callable
+from typing import Any, AsyncIterator, Callable
 
 from fastapi import HTTPException
 
@@ -43,11 +43,22 @@ class RateLimitManager:
     """
 
     # Per-project quota overrides an admin can raise/lower at runtime. Keys match
-    # the Settings field names; an absent key falls back to the global default.
+    # the Settings field names; an absent key falls back to the tier/global default.
     OVERRIDABLE = ("per_key_rpm", "project_tokens_per_min", "max_context_tokens", "monthly_spend_usd")
 
-    def __init__(self, settings: Settings):
+    # Tier -> base quota. The active Stripe subscription sets a project's tier; these are the
+    # entitlements that tier buys. Admin overrides (and lower global settings) layer on top.
+    TIER_LIMITS: dict[str, dict[str, float]] = {
+        "free":       {"per_key_rpm": 20,   "project_tokens_per_min": 50_000,    "max_context_tokens": 100_000, "monthly_spend_usd": 10.0},
+        "pro":        {"per_key_rpm": 120,  "project_tokens_per_min": 500_000,   "max_context_tokens": 200_000, "monthly_spend_usd": 500.0},
+        "enterprise": {"per_key_rpm": 1000, "project_tokens_per_min": 5_000_000, "max_context_tokens": 400_000, "monthly_spend_usd": 10_000.0},
+    }
+
+    def __init__(self, settings: Settings, store: Any | None = None):
         self.settings = settings
+        # When a store is provided, per-project quotas derive from the project's tier
+        # (the license). Without it (unit tests), fall back to flat global settings.
+        self.store = store
         self.key_rpm: dict[str, WindowCounter] = defaultdict(lambda: WindowCounter(deque()))
         self.project_tokens: dict[str, SlidingTokenWindow] = defaultdict(SlidingTokenWindow)
         # Concurrent-stream gate as a plain in-flight counter. A counter (not a
@@ -76,9 +87,21 @@ class RateLimitManager:
     def clear_override(self, project_id: str) -> None:
         self.overrides.pop(project_id, None)
 
+    def tier_base(self, project_id: str) -> dict[str, float]:
+        """Base quota for a project: its tier's limits if the store is wired, else flat settings."""
+        if self.store is not None:
+            try:
+                tier = self.store.get_project_tier(project_id)
+            except Exception:
+                tier = "free"
+            base = self.TIER_LIMITS.get(tier) or self.TIER_LIMITS["free"]
+            return dict(base)
+        return {k: getattr(self.settings, k) for k in self.OVERRIDABLE}
+
     def effective_limits(self, project_id: str) -> dict[str, float]:
+        base = self.tier_base(project_id)
         ov = self.overrides.get(project_id, {})
-        return {k: ov.get(k, getattr(self.settings, k)) for k in self.OVERRIDABLE}
+        return {k: ov.get(k, base.get(k, getattr(self.settings, k))) for k in self.OVERRIDABLE}
 
     def check_body_size(self, content_length: str | None) -> None:
         if content_length:
