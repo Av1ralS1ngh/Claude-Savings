@@ -109,7 +109,10 @@ class MessagesRequest(BaseModel):
             MessageContent(role="user", content="Run the build.\n\n2026-05-30T00:00:01Z INFO compiling step 1 ... ok\n2026-05-30T00:00:02Z INFO compiling step 2 ... ok\n2026-05-30T00:00:03Z INFO compiling step 3 ... ok\n2026-05-30T00:00:04Z INFO compiling step 4 ... ok\n2026-05-30T00:00:05Z INFO compiling step 5 ... ok\n2026-05-30T00:00:06Z ERROR cannot find symbol `compress_messages` for architecture arm64\n2026-05-30T00:00:06Z FATAL build failed after 3 retries"),
         ]
     )
-    system: str | None = None
+    # Anthropic's Messages API allows `system` to be a plain string OR an array of
+    # content blocks (text blocks, optionally with cache_control). Claude Code sends the
+    # array form for prompt caching, so accept both — mirrors MessageContent.content above.
+    system: str | list[dict[str, Any]] | None = None
     stream: bool = False
     tools: list[dict[str, Any]] | None = None
     decompute: dict[str, Any] | None = None
