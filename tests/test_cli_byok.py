@@ -1,0 +1,158 @@
+"""BYOK CLI + config tests — the `decompute init/claude/uninstall` rewrite.
+
+Covers the security-relevant invariants of the bring-your-own-key model:
+  - non-secret settings live in config.toml; the Claude key lives in claude.key (chmod 600)
+  - the key is NEVER printed by config-show and NEVER written to a project file by `vscode`
+  - the SDK forwards the key as x-api-key only when set (else local_noauth, no auth header)
+  - uninstall keeps config/data/key by default; only --purge removes them
+  - the old dc_-key surface (login / keys / api-key-create) is gone
+
+These don't need a running gateway; the live launch sequence is covered by the smoke test.
+"""
+from __future__ import annotations
+
+import importlib
+import json
+import os
+from pathlib import Path
+
+import pytest
+from typer.testing import CliRunner
+
+runner = CliRunner()
+
+
+@pytest.fixture()
+def env(tmp_path, monkeypatch):
+    """Reload config + cli with ~/.decompute redirected into a tmp dir, key/base env cleared."""
+    cfgdir = tmp_path / ".decompute"
+    monkeypatch.setenv("DECOMPUTE_CONFIG_DIR", str(cfgdir))
+    for k in ("DECOMPUTE_CLAUDE_KEY", "ANTHROPIC_API_KEY", "DECOMPUTE_BASE_URL"):
+        monkeypatch.delenv(k, raising=False)
+    config = importlib.reload(importlib.import_module("decompute_ai.config"))
+    importlib.reload(importlib.import_module("decompute_ai.client"))
+    cli = importlib.reload(importlib.import_module("decompute_ai.cli"))
+    return config, cli, cfgdir
+
+
+# ── config.toml + claude.key separation ────────────────────────────────────────
+
+def test_config_toml_roundtrip_preserves_defaults(env):
+    config, _, cfgdir = env
+    config.save_config({"gateway": {"base_url": "http://127.0.0.1:9000"}, "ccr": {"enabled": False}})
+    cfg = config.load_config()
+    assert config.base_url() == "http://127.0.0.1:9000"
+    assert cfg["ccr"]["enabled"] is False            # override applied
+    assert cfg["ccr"]["retention_days"] == 7         # default preserved by deep-merge
+    assert cfg["privacy"]["pii_mode"] == "tokenize"  # untouched section keeps defaults
+    assert "[gateway]" in (cfgdir / "config.toml").read_text()
+
+
+def test_claude_key_is_secret_and_chmod_600(env):
+    config, _, cfgdir = env
+    config.save_claude_key("sk-ant-secret")
+    keyfile = cfgdir / "claude.key"
+    assert config.load_claude_key() == "sk-ant-secret"
+    assert oct(keyfile.stat().st_mode & 0o777) == "0o600"
+    # The secret must never land in the non-secret config.toml.
+    assert "sk-ant-secret" not in (cfgdir / "config.toml").read_text() if (cfgdir / "config.toml").exists() else True
+    config.clear_claude_key()
+    assert config.load_claude_key() is None
+
+
+def test_legacy_json_is_migrated(env):
+    config, _, cfgdir = env
+    cfgdir.mkdir(parents=True, exist_ok=True)
+    (cfgdir / "config.json").write_text(json.dumps({"base_url": "http://old:8080", "last_session_id": "cc-old"}))
+    cfg = config.load_config()
+    assert config.base_url() == "http://old:8080"
+    assert cfg["claude"]["last_session_id"] == "cc-old"
+
+
+def test_env_overrides_keyfile(env, monkeypatch):
+    config, _, _ = env
+    config.save_claude_key("sk-ant-from-file")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-from-env")
+    assert config.load_claude_key() == "sk-ant-from-env"  # env wins
+
+
+# ── BYOK SDK headers ────────────────────────────────────────────────────────────
+
+def test_client_sends_x_api_key_only_when_set(env):
+    config, _, _ = env
+    from decompute_ai.client import Decompute
+    assert "x-api-key" not in Decompute().headers()       # no key → local_noauth, no auth header
+    config.save_claude_key("sk-ant-byok")
+    h = Decompute().headers()
+    assert h["x-api-key"] == "sk-ant-byok"
+    assert "x-decompute-api-key" not in h                 # the old dc_ header is gone
+
+
+# ── init wizard (non-interactive) ───────────────────────────────────────────────
+
+def test_init_yes_writes_config_and_key(env):
+    config, cli, cfgdir = env
+    res = runner.invoke(cli.app, ["init", "--yes", "--claude-key", "sk-ant-demo", "--base-url", "http://127.0.0.1:8080"])
+    assert res.exit_code == 0, res.stdout
+    assert (cfgdir / "config.toml").exists()
+    assert config.load_claude_key() == "sk-ant-demo"
+    assert config.load_config()["claude"]["mode"] == "anthropic_api"
+
+
+def test_config_show_never_prints_the_key(env):
+    config, cli, _ = env
+    config.save_claude_key("sk-ant-TOPSECRET")
+    res = runner.invoke(cli.app, ["config-show"])
+    assert res.exit_code == 0
+    assert "sk-ant-TOPSECRET" not in res.stdout
+    assert '"claude_key_set": true' in res.stdout
+
+
+# ── vscode never writes the key into a project file ─────────────────────────────
+
+def test_vscode_omits_key_from_settings(env, tmp_path):
+    config, cli, _ = env
+    config.save_claude_key("sk-ant-leakcheck")
+    config.save_config({"gateway": {"base_url": "http://127.0.0.1:8080"}})
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    res = runner.invoke(cli.app, ["vscode", str(proj)])
+    assert res.exit_code == 0, res.stdout
+    settings = (proj / ".vscode" / "settings.json").read_text()
+    assert "sk-ant-leakcheck" not in settings           # the key must NOT be in a committable file
+    assert "ANTHROPIC_API_KEY" not in settings
+    assert "x-decompute-session-id" in settings          # routing IS written
+
+
+# ── uninstall: safe by default, destructive only on --purge ─────────────────────
+
+def test_uninstall_yes_keeps_config_and_key(env, monkeypatch):
+    config, cli, _ = env
+    config.save_claude_key("sk-ant-keepme")
+    config.save_config({"gateway": {"base_url": "http://127.0.0.1:8080"}})
+    monkeypatch.setattr(cli, "_stop_gateway", lambda *_a, **_k: False)  # don't touch a real gateway
+    res = runner.invoke(cli.app, ["uninstall", "--yes"])
+    assert res.exit_code == 0, res.stdout
+    assert config.load_claude_key() == "sk-ant-keepme"   # key kept
+    assert config.CONFIG_TOML.exists()                   # config kept
+
+
+def test_uninstall_purge_removes_config_and_key(env, monkeypatch):
+    config, cli, _ = env
+    config.save_claude_key("sk-ant-purge")
+    config.save_config({"gateway": {"base_url": "http://127.0.0.1:8080"}})
+    monkeypatch.setattr(cli, "_stop_gateway", lambda *_a, **_k: False)
+    res = runner.invoke(cli.app, ["uninstall", "--purge"])
+    assert res.exit_code == 0, res.stdout
+    assert config.load_claude_key() is None
+    assert not config.CONFIG_TOML.exists()
+
+
+# ── the dc_-key surface is gone ─────────────────────────────────────────────────
+
+def test_no_dc_key_commands(env):
+    _, cli, _ = env
+    names = {c.name for c in cli.app.registered_commands}
+    assert "login" not in names
+    assert "api-key-create" not in names
+    assert "keys" not in {g.name for g in cli.app.registered_groups}

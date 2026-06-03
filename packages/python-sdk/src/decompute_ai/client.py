@@ -5,7 +5,7 @@ from typing import Any
 
 import httpx
 
-from .config import load_config
+from .config import base_url as cfg_base_url, load_claude_key
 from .errors import DecomputeError, error_for_status
 
 __all__ = ["Decompute", "DecomputeError"]
@@ -92,13 +92,15 @@ class Usage(_Resource):
 
 
 class Decompute:
-    """Thin client for the Decompute Gateway.
+    """Thin client for the Decompute Gateway (BYOK — bring your own Claude key).
 
-    Resolution order for credentials: explicit argument > environment variable
-    (DECOMPUTE_BASE_URL / DECOMPUTE_API_KEY) > saved config (~/.decompute/config.json,
-    written by `decompute login`) > built-in local default.
+    Credential resolution: explicit ``api_key`` argument > ``DECOMPUTE_CLAUDE_KEY`` /
+    ``ANTHROPIC_API_KEY`` env > the saved key file (``~/.decompute/claude.key``, written
+    by ``decompute claude``). When no key is found the client sends no auth header and the
+    local gateway serves it as ``local_noauth``. Base URL: explicit > ``DECOMPUTE_BASE_URL``
+    env > ``config.toml`` ([gateway].base_url) > local default.
 
-    A custom httpx `transport` may be injected for in-process testing.
+    A custom httpx ``transport`` may be injected for in-process testing.
     """
 
     def __init__(
@@ -110,9 +112,9 @@ class Decompute:
         max_retries: int = 2,
         transport: httpx.BaseTransport | None = None,
     ):
-        cfg = load_config()
-        self.api_key = api_key or os.getenv("DECOMPUTE_API_KEY") or cfg.get("api_key") or "dc_dev_local"
-        self.base_url = (base_url or os.getenv("DECOMPUTE_BASE_URL") or cfg.get("base_url") or "http://127.0.0.1:8080").rstrip("/")
+        # BYOK: the credential is the user's own Claude/Anthropic key (sent as x-api-key).
+        self.api_key = api_key or load_claude_key() or ""
+        self.base_url = (base_url or os.getenv("DECOMPUTE_BASE_URL") or cfg_base_url()).rstrip("/")
         self.timeout = timeout
         self.max_retries = max(0, max_retries)
         self._transport = transport
@@ -127,7 +129,12 @@ class Decompute:
         self.usage = Usage(self)
 
     def headers(self) -> dict[str, str]:
-        return {"x-decompute-api-key": self.api_key, "content-type": "application/json"}
+        # BYOK: forward the user's own Claude key as x-api-key. When none is set we send
+        # no auth header and the gateway falls back to local_noauth (proj_default/admin).
+        h = {"content-type": "application/json"}
+        if self.api_key:
+            h["x-api-key"] = self.api_key
+        return h
 
     def _new_client(self) -> httpx.Client:
         return httpx.Client(base_url=self.base_url, timeout=self.timeout, transport=self._transport)

@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
+import time
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -12,13 +14,25 @@ from rich import print
 from rich.table import Table
 
 from .client import Decompute
-from .config import CONFIG_DIR, CONFIG_PATH, load_config, save_config
+from .config import (
+    CONFIG_DIR,
+    CONFIG_PATH,
+    CONFIG_TOML,
+    DEFAULT_BASE_URL,
+    KEY_FILE,
+    LEGACY_JSON,
+    base_url as cfg_base_url,
+    clear_claude_key,
+    get_session_id,
+    load_claude_key,
+    load_config,
+    save_claude_key,
+    save_config,
+    set_session_id,
+)
 from .errors import DecomputeError
 
-DEFAULT_BASE_URL = "http://127.0.0.1:8080"
-DEFAULT_API_KEY = "dc_dev_local"
-
-app = typer.Typer(help="Decompute Gateway CLI")
+app = typer.Typer(help="Decompute Gateway CLI — BYOK (bring your own Claude key)")
 
 
 def _client() -> Decompute:
@@ -30,38 +44,46 @@ def health():
     print(_client().get("/health"))
 
 
-@app.command()
-def login(
-    base_url: str = typer.Option(..., "--base-url", help="Gateway URL, e.g. http://127.0.0.1:8080"),
-    api_key: str = typer.Option(..., "--api-key", help="Decompute API key (dc_...)", prompt=True, hide_input=True),
-):
-    """Save gateway URL + API key to ~/.decompute/config.json and verify the connection."""
-    save_config({"base_url": base_url.rstrip("/"), "api_key": api_key})
-    client = Decompute(api_key=api_key, base_url=base_url)
-    try:
-        client.get("/health")
-    except DecomputeError as exc:
-        print(f"[yellow]Saved config, but health check failed:[/yellow] {exc}")
-        raise typer.Exit(code=1)
-    print(f"[green]✓ logged in[/green] — saved to {CONFIG_PATH}")
+def _set_dotted(updates: dict, dotted: str, value) -> dict:
+    """Build a nested update dict from a 'section.key' path, e.g. 'gateway.base_url'."""
+    parts = dotted.split(".")
+    node = updates
+    for p in parts[:-1]:
+        node = node.setdefault(p, {})
+    node[parts[-1]] = value
+    return updates
+
+
+def _coerce(value: str):
+    low = value.strip().lower()
+    if low in ("true", "false"):
+        return low == "true"
+    if value.isdigit():
+        return int(value)
+    return value
 
 
 @app.command("config-set")
 def config_set(key: str, value: str):
-    """Set a single config value, e.g. `decompute config-set base_url http://host:8080`."""
-    path = save_config({key: value})
+    """Set a config value by dotted path, e.g. `decompute config-set gateway.base_url http://host:8080`."""
+    if "." not in key:
+        print("[yellow]Use a dotted path:[/yellow] section.key  (gateway|privacy|ccr|claude).<name>")
+        raise typer.Exit(1)
+    path = save_config(_set_dotted({}, key, _coerce(value)))
     print(f"[green]✓[/green] {key} = {value}  ({path})")
 
 
 @app.command("config-show")
 def config_show():
-    print(json.dumps(load_config(), indent=2))
+    """Print the non-secret config (config.toml). The Claude key is never shown."""
+    cfg = load_config()
+    cfg.setdefault("_meta", {})["claude_key_set"] = bool(load_claude_key())
+    print(json.dumps(cfg, indent=2))
 
 
 def _conn() -> tuple[str, str]:
-    """(base_url, api_key) from saved config, falling back to local-dev defaults."""
-    cfg = load_config()
-    return (cfg.get("base_url") or DEFAULT_BASE_URL).rstrip("/"), (cfg.get("api_key") or DEFAULT_API_KEY)
+    """(base_url, claude_key) — base from config.toml, key from the BYOK secret file (may be '')."""
+    return cfg_base_url(), (load_claude_key() or "")
 
 
 def _new_session_id() -> str:
@@ -69,26 +91,30 @@ def _new_session_id() -> str:
     return f"cc-{uuid.uuid4().hex[:20]}"
 
 
-def _claude_env_lines(base_url: str, api_key: str, session_id: str) -> dict[str, str]:
-    """The env Claude Code needs: gateway routing, auth, and the session-id custom header.
+def _claude_env_lines(base_url: str, claude_key: str, session_id: str, *, include_key: bool = True) -> dict[str, str]:
+    """The env Claude Code needs: gateway routing, the BYOK Claude key, and the session header.
 
     ANTHROPIC_CUSTOM_HEADERS makes Claude Code stamp x-decompute-session-id on every upstream
     request (main model + background + token-count), which the gateway stores so support
     bundles can be scoped to one session. Format is `Name: Value` (Claude Code env reference).
+    ANTHROPIC_API_KEY is the user's own Claude key — the gateway forwards it upstream (BYOK).
+    Set include_key=False when writing to a file that might be committed (e.g. .vscode/settings.json).
     """
-    return {
+    env = {
         "ANTHROPIC_BASE_URL": base_url,
-        "ANTHROPIC_API_KEY": api_key,
         "ANTHROPIC_CUSTOM_HEADERS": f"x-decompute-session-id: {session_id}",
     }
+    if include_key and claude_key:
+        env["ANTHROPIC_API_KEY"] = claude_key
+    return env
 
 
-def _write_claude_env(base_url: str, api_key: str, session_id: str) -> Path:
-    """Write the sourceable Claude Code env file. Returns its path."""
+def _write_claude_env(base_url: str, claude_key: str, session_id: str) -> Path:
+    """Write the sourceable Claude Code env file (opt-in persistent path). Returns its path."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     env_path = CONFIG_DIR / "claude.env"
     env_path.write_text(
-        "".join(f'export {k}="{v}"\n' for k, v in _claude_env_lines(base_url, api_key, session_id).items()),
+        "".join(f'export {k}="{v}"\n' for k, v in _claude_env_lines(base_url, claude_key, session_id).items()),
         encoding="utf-8",
     )
     try:
@@ -98,83 +124,252 @@ def _write_claude_env(base_url: str, api_key: str, session_id: str) -> Path:
     return env_path
 
 
+# ── gateway lifecycle helpers (used by `claude` and `init`) ────────────────────
+def _gateway_running(base_url: str, *, timeout: float = 2.0) -> bool:
+    import httpx
+    try:
+        return httpx.get(f"{base_url}/health", timeout=timeout).status_code == 200
+    except Exception:
+        return False
+
+
+def _find_gateway_launcher() -> Optional[list[str]]:
+    """Locate a way to start the gateway: $DECOMPUTE_GATEWAY_CMD, a bundled binary, or run_gateway.sh."""
+    env_cmd = os.getenv("DECOMPUTE_GATEWAY_CMD")
+    if env_cmd:
+        import shlex
+        return shlex.split(env_cmd)
+    binary = shutil.which("decompute-gateway")
+    if binary:
+        return [binary]
+    # Dev: walk up from CWD looking for scripts/run_gateway.sh.
+    for base in (Path.cwd(), *Path.cwd().parents):
+        cand = base / "scripts" / "run_gateway.sh"
+        if cand.exists():
+            return ["bash", str(cand)]
+    return None
+
+
+def _start_gateway(base_url: str, *, wait_s: float = 25.0) -> bool:
+    """Best-effort: start the gateway detached and poll /health until it is up."""
+    launcher = _find_gateway_launcher()
+    if not launcher:
+        print("[yellow]⚠[/yellow] Could not find a way to start the gateway.")
+        print("  Set [bold]DECOMPUTE_GATEWAY_CMD[/bold], or start it yourself (e.g. [bold]scripts/run_gateway.sh[/bold]).")
+        return False
+    log_path = CONFIG_DIR / "gateway.log"
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"[dim]Starting gateway: {' '.join(launcher)}  (logs → {log_path})[/dim]")
+    try:
+        with open(log_path, "ab") as logf:
+            subprocess.Popen(launcher, stdout=logf, stderr=logf, stdin=subprocess.DEVNULL, start_new_session=True)
+    except Exception as exc:
+        print(f"[red]✗[/red] failed to launch the gateway: {exc}")
+        return False
+    deadline = time.monotonic() + wait_s
+    while time.monotonic() < deadline:
+        if _gateway_running(base_url):
+            return True
+        time.sleep(0.5)
+    print(f"[yellow]⚠[/yellow] gateway didn't answer /health within {wait_s:.0f}s — check {log_path}.")
+    return False
+
+
+_PII_MODES = {1: ("tokenize", "redact"), 2: ("redact", "redact"), 3: ("passthrough", "redact")}
+
+
 @app.command()
 def init(
-    base_url: str = typer.Option(DEFAULT_BASE_URL, "--base-url", help="Gateway URL"),
-    api_key: str = typer.Option(DEFAULT_API_KEY, "--api-key", help="Decompute API key (dc_...)"),
-    yes: bool = typer.Option(False, "--yes", "-y", help="non-interactive (accept defaults)"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="non-interactive — accept all defaults (recommended)."),
+    claude_key: Optional[str] = typer.Option(None, "--claude-key", envvar="DECOMPUTE_CLAUDE_KEY", help="Your Anthropic/Claude key (sk-ant-…); stored as a secret."),
+    base_url: str = typer.Option(DEFAULT_BASE_URL, "--base-url", help="Decompute gateway URL."),
 ):
-    """Initialize local config (~/.decompute/config.json) and verify the gateway."""
-    if not yes:
-        print("This is your [bold]Decompute[/bold] gateway URL and key — [dim]not[/dim] your Anthropic key.")
-        print("Get your key at [bold]https://decompute.ai[/bold] after signup, or use [bold]dc_dev_local[/bold] for local dev.\n")
-        base_url = typer.prompt("Gateway URL", default=base_url)
-        api_key  = typer.prompt("Decompute API key  (starts with dc_)", default=api_key)
-    base_url = base_url.rstrip("/")
-    if not base_url.startswith(("http://", "https://")):
-        print(f"[red]✗[/red] Gateway URL must start with http:// or https://  (got: {base_url!r})")
-        raise typer.Exit(1)
-    if not api_key.startswith("dc_"):
-        print("[yellow]⚠[/yellow] Decompute keys start with 'dc_' — you may have entered your Anthropic key by mistake.")
-        if not typer.confirm("Continue anyway?", default=False):
-            raise typer.Exit(1)
-    save_config({"base_url": base_url, "api_key": api_key})
-    print(f"[green]✓[/green] saved {CONFIG_PATH}")
-    reachable = False
-    try:
-        h = Decompute(api_key=api_key, base_url=base_url).get("/health")
-        reachable = True
-        print(f"[green]✓ gateway reachable[/green] — env={h.get('environment')} mock={h.get('mock_anthropic')}")
-        caps = h.get("capabilities") or {}
-        active = [k for k, v in caps.items() if isinstance(v, dict) and v.get("active")]
-        if active:
-            print(f"  capabilities: [cyan]{', '.join(active)}[/cyan]")
-    except DecomputeError as exc:
-        print(f"[yellow]Config saved, but the gateway isn't reachable yet:[/yellow] {exc}")
-        print("Start it (scripts/run_gateway.sh), then re-run [bold]decompute init[/bold] or [bold]decompute doctor[/bold].")
-    # Finish the job: leave Claude Code ready to route through the gateway.
-    wire = yes or typer.confirm("Configure Claude Code to route through the gateway now?", default=True)
-    if wire:
-        sid = _new_session_id()
-        env_path = _write_claude_env(base_url, api_key, sid)
-        save_config({"last_session_id": sid})
-        print(f"[green]✓[/green] Claude Code env written: {env_path}")
-        print(f"  Session id: [cyan]{sid}[/cyan]")
-        print(f"  Activate: [bold]source {env_path}[/bold]   then run [bold]claude[/bold]")
-        print(f"  Permanent: [bold]decompute claude --write-profile[/bold]   (or [bold]decompute vscode .[/bold] for VS Code)")
-    else:
-        print("Next: [bold]decompute claude[/bold] (or [bold]decompute vscode .[/bold]) when you're ready.")
+    """Set up Decompute — BYOK (bring your own Claude key).
 
-
-@app.command()
-def claude(
-    write_profile: bool = typer.Option(False, "--write-profile", help="append the source line to your shell rc"),
-    session_id: Optional[str] = typer.Option(None, "--session-id", help="reuse a specific session id (default: mint a fresh one)"),
-):
-    """Configure Claude Code to route through the Decompute gateway (writes a sourceable env file).
-
-    Each run mints a fresh x-decompute-session-id (via ANTHROPIC_CUSTOM_HEADERS) so the
-    working session can be scoped in a support bundle; reuse one with --session-id.
+    Writes non-secret settings to ~/.decompute/config.toml and your Claude key to
+    ~/.decompute/claude.key (chmod 600). Decompute issues no key of its own.
     """
-    base_url, api_key = _conn()
-    sid = session_id or _new_session_id()
-    env_path = _write_claude_env(base_url, api_key, sid)
-    save_config({"last_session_id": sid})
-    print(f"[green]✓[/green] wrote {env_path}")
-    print(f"  Session id: [cyan]{sid}[/cyan]   (support: [bold]decompute support bundle[/bold])")
-    print("Activate it for Claude Code:")
-    print(f"  [bold]source {env_path}[/bold]   # then run `claude` as usual")
-    if write_profile:
-        rc = Path.home() / (".zshrc" if str(os.getenv("SHELL", "")).endswith("zsh") else ".bashrc")
-        line = f"source {env_path}"
-        existing = rc.read_text(encoding="utf-8") if rc.exists() else ""
-        if line in existing:
-            print(f"[green]✓[/green] already in {rc}")
+    print("[bold]Decompute setup[/bold] — your Claude key stays on this machine; we never see it.\n")
+
+    # 1. Upstream Claude mode.
+    mode = "anthropic_api"
+    upstream_base_url = ""
+    if not yes:
+        print("Upstream Claude mode:")
+        print("  [1] Anthropic API key   [dim](bring your own — recommended)[/dim]")
+        print("  [2] Enterprise Claude gateway URL")
+        if typer.prompt("Choose", default="1").strip() == "2":
+            mode = "enterprise_gateway"
+
+    # 2. The key (BYOK) or the enterprise base URL.
+    if mode == "anthropic_api":
+        key = claude_key or os.getenv("ANTHROPIC_API_KEY")
+        if not key and not yes:
+            key = typer.prompt("Anthropic API key (sk-ant-…)", hide_input=True, default="").strip()
+        if key:
+            if not key.startswith("sk-ant-"):
+                print("[yellow]⚠[/yellow] Anthropic keys usually start with 'sk-ant-'. Saving it anyway.")
+            save_claude_key(key)
+            print(f"[green]✓[/green] Claude key saved (chmod 600) → {CONFIG_DIR / 'claude.key'}")
         else:
-            rc.write_text(existing + ("" if existing.endswith("\n") or not existing else "\n") + line + "\n", encoding="utf-8")
-            print(f"[green]✓[/green] appended to {rc} — restart your shell")
+            print("[dim]No key yet — fine for local/mock mode. Add one later: [bold]decompute claude --set-key[/bold].[/dim]")
     else:
-        print(f"  make it permanent: [bold]echo 'source {env_path}' >> ~/.zshrc[/bold]")
+        upstream_base_url = (typer.prompt("Enterprise Claude gateway URL") if not yes else "").strip().rstrip("/")
+        ekey = claude_key or (typer.prompt("Enterprise key (optional, blank to skip)", hide_input=True, default="").strip() if not yes else "")
+        if ekey:
+            save_claude_key(ekey)
+
+    # 3. Privacy mode.
+    pii_mode, secret_mode = "tokenize", "redact"
+    if not yes:
+        print("\nPrivacy mode:")
+        print("  [1] tokenize PII + redact secrets   [dim](recommended)[/dim]")
+        print("  [2] redact PII + redact secrets")
+        print("  [3] pass PII through + redact secrets")
+        choice = typer.prompt("Choose", default="1").strip()
+        pii_mode, secret_mode = _PII_MODES.get(int(choice) if choice.isdigit() else 1, _PII_MODES[1])
+
+    # 4. CCR.
+    ccr_enabled = True
+    if not yes:
+        print("\nCCR (Compressed Context Reuse):")
+        print("  [1] encrypted local CCR   [dim](recommended)[/dim]")
+        print("  [2] disabled")
+        ccr_enabled = typer.prompt("Choose", default="1").strip() != "2"
+
+    base_url = base_url.rstrip("/")
+    claude_section: dict = {"mode": mode}
+    if upstream_base_url:
+        claude_section["upstream_base_url"] = upstream_base_url
+    save_config({
+        "gateway": {"base_url": base_url, "auto_start": True},
+        "privacy": {"pii_mode": pii_mode, "secret_mode": secret_mode},
+        "ccr": {"enabled": ccr_enabled, "retention_days": 7},
+        "claude": claude_section,
+    })
+    print(f"\n[green]✓[/green] saved {CONFIG_PATH}")
+    print(f"  upstream: [cyan]{mode}[/cyan] · privacy: [cyan]{pii_mode}+{secret_mode}[/cyan] · CCR: [cyan]{'on' if ccr_enabled else 'off'}[/cyan]")
+
+    # 5. Start gateway after setup?
+    start = yes or typer.confirm("\nStart gateway after setup?", default=True)
+    if start:
+        if _gateway_running(base_url):
+            print("[green]✓ gateway already running[/green]")
+        elif _start_gateway(base_url):
+            print("[green]✓ gateway started[/green]")
+
+    # 6. Configure Claude Code wrapper?
+    wire = yes or typer.confirm("Configure Claude Code wrapper?", default=True)
+    if wire:
+        print("Launch Claude Code through Decompute any time with [bold]decompute claude[/bold].")
+        print("For a VS Code project: [bold]decompute vscode .[/bold]")
+    else:
+        print("Next: [bold]decompute claude[/bold] when you're ready.")
+
+
+def _verify_engine(base_url: str, *, verified_mode: bool) -> bool:
+    """Steps 3-5: minimum doctor checks, YSCompress engine, and fallback-disabled-in-verified-mode.
+
+    Returns True if it is safe to launch. In --verified mode a silent compression fallback
+    (rust core not engaged) is a hard stop — the user is paying for compression they wouldn't get.
+    Otherwise it warns and lets the launch proceed.
+    """
+    import httpx
+    # 3. minimum doctor checks — the gateway must be ready (db + an upstream credential path).
+    try:
+        httpx.get(f"{base_url}/readyz", timeout=5.0).raise_for_status()
+        print("  [green]✓[/green] gateway ready (db + upstream configured)")
+    except Exception as exc:
+        print(f"  [red]✗[/red] readiness check failed: {exc}")
+        return False
+    # 4 + 5. YSCompress engine + fallback guard.
+    try:
+        caps = (httpx.get(f"{base_url}/health", timeout=5.0).json().get("capabilities") or {})
+    except Exception as exc:
+        print(f"  [yellow]⚠[/yellow] could not read capabilities: {exc}")
+        return not verified_mode
+    rust = caps.get("rust_core") or {}
+    engine_active = bool(rust.get("active"))
+    if engine_active:
+        print(f"  [green]✓[/green] YSCompress engine engaged — {rust.get('detail', '')}")
+    else:
+        msg = rust.get("detail") or "rust core not importable"
+        if verified_mode:
+            print(f"  [red]✗[/red] verified mode: compression would silently fall back ({msg}). Refusing to launch.")
+            print("    Re-run without [bold]--verified[/bold] to launch anyway on the local fallback.")
+            return False
+        print(f"  [yellow]⚠[/yellow] YSCompress engine not engaged — local fallback in use ({msg}).")
+    ml = caps.get("kompress_ml") or {}
+    print(f"  [dim]ML text compression: {'on' if ml.get('active') else 'off (rust-core only)'}[/dim]")
+    return True
+
+
+@app.command(context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
+def claude(
+    ctx: typer.Context,
+    session_id: Optional[str] = typer.Option(None, "--session-id", help="reuse a specific session id (default: mint a fresh one)"),
+    no_start: bool = typer.Option(False, "--no-start", help="don't auto-start the gateway if it's down"),
+    verified: bool = typer.Option(False, "--verified", help="hard-fail if compression would silently fall back to the local engine"),
+    print_env: bool = typer.Option(False, "--print-env", help="print the export lines instead of launching Claude Code"),
+    set_key: bool = typer.Option(False, "--set-key", help="prompt for and store your Claude key, then continue"),
+):
+    """Launch Claude Code through the Decompute gateway (BYOK).
+
+    Runs the launch sequence — load config → start gateway → readiness + engine checks →
+    set ANTHROPIC_BASE_URL + your Claude key in the child env → exec `claude`. Any extra args
+    are forwarded (e.g. `decompute claude --resume`). Each run mints a fresh
+    x-decompute-session-id so the session can be scoped in a support bundle.
+    """
+    # 1. Load config.
+    base_url = cfg_base_url()
+    cfg = load_config()
+    if set_key:
+        key = typer.prompt("Anthropic API key (sk-ant-…)", hide_input=True).strip()
+        if key:
+            save_claude_key(key)
+            print("[green]✓[/green] Claude key saved.")
+    claude_key = load_claude_key() or ""
+
+    # 2. Start gateway if not running.
+    if not _gateway_running(base_url):
+        auto = cfg.get("gateway", {}).get("auto_start", True)
+        if no_start or not auto:
+            print(f"[red]✗[/red] gateway not running at {base_url} and auto-start is off.")
+            raise typer.Exit(1)
+        print("Gateway not running — starting it…")
+        if not _start_gateway(base_url):
+            raise typer.Exit(1)
+    else:
+        print(f"[green]✓[/green] gateway up at {base_url}")
+
+    # 3-5. Readiness + engine + fallback checks.
+    if not _verify_engine(base_url, verified_mode=verified):
+        raise typer.Exit(1)
+
+    # 6 + 7. Build the child env: route to the gateway and hand it the BYOK key safely.
+    sid = session_id or _new_session_id()
+    set_session_id(sid)
+    if not claude_key and cfg.get("claude", {}).get("mode") == "anthropic_api":
+        print("[yellow]⚠[/yellow] no Claude key stored — set one with [bold]decompute claude --set-key[/bold].")
+        print("  (continuing; this only works if the gateway is in mock/local mode.)")
+    env_lines = _claude_env_lines(base_url, claude_key, sid)
+    print(f"[green]✓[/green] routing Claude Code → {base_url}  ·  session [cyan]{sid}[/cyan]")
+
+    if print_env:
+        for k, v in env_lines.items():
+            shown = (v[:12] + "…") if k == "ANTHROPIC_API_KEY" else v
+            print(f'export {k}="{shown}"')
+        return
+
+    # 8. Exec `claude`, replacing this process. The key lives only in the child env — never on disk here.
+    claude_bin = shutil.which("claude")
+    if not claude_bin:
+        print("[red]✗[/red] Claude Code (`claude`) isn't on your PATH.")
+        print("  Install it from https://claude.com/claude-code, then re-run [bold]decompute claude[/bold].")
+        raise typer.Exit(127)
+    child_env = {**os.environ, **env_lines}
+    print("[dim]launching `claude`…[/dim]\n")
+    os.execve(claude_bin, [claude_bin, *ctx.args], child_env)
 
 
 @app.command()
@@ -182,8 +377,13 @@ def vscode(
     path: Path = typer.Argument(Path("."), help="project directory to configure (default: .)"),
     session_id: Optional[str] = typer.Option(None, "--session-id", help="reuse a specific session id (default: mint a fresh one)"),
 ):
-    """Configure a VS Code project so Claude Code in its terminal routes through the gateway."""
-    base_url, api_key = _conn()
+    """Configure a VS Code project so Claude Code in its terminal routes through the gateway.
+
+    Writes only NON-SECRET routing (base URL + session header) into .vscode/settings.json —
+    never your Claude key, which could leak if the file is committed. The key is read from
+    your environment / ~/.decompute/claude.key at launch (e.g. via `decompute claude`).
+    """
+    base_url, claude_key = _conn()
     sid = session_id or _new_session_id()
     vsdir = path / ".vscode"
     vsdir.mkdir(parents=True, exist_ok=True)
@@ -194,7 +394,7 @@ def vscode(
             settings = {}
     except Exception:
         settings = {}
-    env_block = _claude_env_lines(base_url, api_key, sid)
+    env_block = _claude_env_lines(base_url, claude_key, sid, include_key=False)  # never the key in a project file
     for key in ("terminal.integrated.env.osx", "terminal.integrated.env.linux", "terminal.integrated.env.windows"):
         block = settings.get(key)
         if not isinstance(block, dict):
@@ -202,34 +402,111 @@ def vscode(
         block.update(env_block)
         settings[key] = block
     settings_path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
-    save_config({"last_session_id": sid})
-    print(f"[green]✓[/green] configured {settings_path}")
+    set_session_id(sid)
+    print(f"[green]✓[/green] configured {settings_path}  [dim](routing only — no key written)[/dim]")
     print(f"  Session id: [cyan]{sid}[/cyan]")
-    print("Reopen the VS Code integrated terminal; `claude` there now routes through the gateway.")
+    print("In the VS Code integrated terminal, launch with [bold]decompute claude[/bold] so your key is injected safely,")
+    print("or export [bold]ANTHROPIC_API_KEY[/bold] in your shell. Then `claude` routes through the gateway.")
+
+
+def _stop_gateway(base_url: str) -> bool:
+    """Best-effort stop: SIGTERM whatever is listening on the gateway port, then the uvicorn app."""
+    import signal
+    from urllib.parse import urlparse
+
+    port = urlparse(base_url).port or 8080
+    killed = False
+    try:
+        out = subprocess.run(["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
+                             capture_output=True, text=True, timeout=5).stdout
+        for pid in (p for p in out.split() if p.strip().isdigit()):
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+                killed = True
+            except Exception:
+                pass
+    except Exception:
+        pass
+    if not killed:  # fallback: match the uvicorn target
+        try:
+            subprocess.run(["pkill", "-f", "decompute_gateway.main:app"], timeout=5)
+            killed = True
+        except Exception:
+            pass
+    return killed
+
+
+def _ask(prompt: str, *, default: bool, noninteractive: bool) -> bool:
+    """Confirm a step. When non-interactive (--yes/--purge), resolve to `default` without prompting."""
+    return default if noninteractive else typer.confirm(prompt, default=default)
 
 
 @app.command()
 def uninstall(
-    yes: bool = typer.Option(False, "--yes", "-y", help="skip the confirmation prompt"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="non-interactive: accept the SAFE defaults (stop gateway + remove binary; keep config/data/key)."),
+    purge: bool = typer.Option(False, "--purge", help="non-interactive: also remove config, local usage/CCR data, and the stored Claude key."),
 ):
-    """Remove local Decompute config + credentials (~/.decompute) and the CLI shim."""
-    removed = []
-    if CONFIG_DIR.exists():
-        if not yes and not typer.confirm(f"Remove {CONFIG_DIR} (config, credentials, env files, venv)?"):
-            raise typer.Exit(code=1)
-        shutil.rmtree(CONFIG_DIR, ignore_errors=True)
-        removed.append(str(CONFIG_DIR))
-    shim = Path.home() / ".local" / "bin" / "decompute"
-    if shim.exists() or shim.is_symlink():
-        shim.unlink(missing_ok=True)
-        removed.append(str(shim))
+    """Uninstall Decompute. Confirms each step; never removes your config, data, or Claude key by default."""
+    base_url = cfg_base_url()
+    noninteractive = yes or purge
+    removed: list[str] = []
+
+    # 1. Stop gateway service?  [Y/n]
+    if _ask("Stop the Decompute gateway service?", default=True, noninteractive=noninteractive):
+        if _stop_gateway(base_url):
+            print("[green]✓[/green] gateway stopped")
+        else:
+            print("[dim]No running gateway found (or it wasn't started by us).[/dim]")
+
+    # 2. Remove CLI binary/symlink?  [Y/n]
+    if _ask("Remove the CLI binary/symlink?", default=True, noninteractive=noninteractive):
+        for shim in (Path.home() / ".local" / "bin" / "decompute", *( [Path(p)] if (p := shutil.which("decompute")) else [] )):
+            try:
+                if shim.is_symlink() or shim.exists():
+                    shim.unlink(missing_ok=True)
+                    removed.append(str(shim))
+            except Exception:
+                pass
+        print("[dim]If you installed via pip/pipx, also run: pip uninstall decompute-ai[/dim]")
+
+    # 3. Remove config?  [y/N]  (default NO — purge forces yes)
+    if purge or _ask("Remove config (config.toml)?", default=False, noninteractive=noninteractive):
+        for f in (CONFIG_TOML, CONFIG_DIR / "claude.env", LEGACY_JSON):
+            if f.exists():
+                f.unlink(missing_ok=True)
+                removed.append(str(f))
+
+    # 4. Remove local usage/CCR data?  [y/N]  (default NO — purge forces yes)
+    if purge or _ask("Remove local usage/CCR data?", default=False, noninteractive=noninteractive):
+        for p in (CONFIG_DIR / "data", CONFIG_DIR / "ccr"):
+            if p.exists():
+                shutil.rmtree(p, ignore_errors=True)
+                removed.append(str(p))
+        for f in [*CONFIG_DIR.glob("*.db"), *CONFIG_DIR.glob("*.sqlite*"), CONFIG_DIR / "gateway.log"]:
+            if f.exists():
+                f.unlink(missing_ok=True)
+                removed.append(str(f))
+
+    # 5. Remove stored Claude key?  [y/N]  (default NO — purge forces yes)
+    if purge or _ask("Remove the stored Claude key?", default=False, noninteractive=noninteractive):
+        if KEY_FILE.exists():
+            clear_claude_key()
+            removed.append(str(KEY_FILE))
+
+    # Tidy: drop ~/.decompute only if we emptied it.
+    try:
+        if CONFIG_DIR.exists() and not any(CONFIG_DIR.iterdir()):
+            CONFIG_DIR.rmdir()
+            removed.append(str(CONFIG_DIR))
+    except Exception:
+        pass
+
     if removed:
-        print("[green]✓ removed[/green] " + ", ".join(removed))
+        print("[green]✓ removed[/green]\n  " + "\n  ".join(removed))
     else:
-        print("Nothing to remove — Decompute is not installed in the usual locations.")
-    print("If you ran `decompute claude --write-profile` or `decompute vscode`, remove the "
-          "`source ~/.decompute/claude.env` line from your shell rc and the env block from "
-          ".vscode/settings.json manually.")
+        print("Nothing removed — your config, data, and Claude key are intact.")
+    print("\nIf you ran [bold]decompute vscode[/bold], remove the env block from .vscode/settings.json, "
+          "and any [bold]source ~/.decompute/claude.env[/bold] line from your shell rc, manually.")
 
 
 @app.command()
@@ -242,7 +519,7 @@ def doctor(json_output: bool = typer.Option(False, "--json", help="Emit machine-
         checks.append({"check": name, "ok": bool(ok), "detail": detail})
 
     add("base_url", True, client.base_url)
-    add("api_key", bool(client.api_key), (client.api_key[:10] + "…") if client.api_key else "missing")
+    add("claude key (BYOK)", True, (client.api_key[:10] + "…") if client.api_key else "not set — local/mock only")
 
     try:
         h = client.get("/health")
@@ -280,16 +557,17 @@ def doctor(json_output: bool = typer.Option(False, "--json", help="Emit machine-
 @app.command()
 def status():
     """One-glance health: config, routing, gateway, and your savings so far."""
-    base_url, api_key = _conn()
+    base_url, claude_key = _conn()
     cfg = load_config()
     routed = os.environ.get("ANTHROPIC_BASE_URL", "").rstrip("/") == base_url.rstrip("/")
     t = Table(title="decompute status", show_header=False)
     t.add_column("k", style="bold"); t.add_column("v")
     t.add_row("gateway", base_url)
-    t.add_row("api key", (api_key[:10] + "…") if api_key else "[red]missing[/red]")
-    t.add_row("session id", cfg.get("last_session_id") or "[dim]none — run `decompute claude`[/dim]")
+    t.add_row("upstream mode", cfg.get("claude", {}).get("mode", "anthropic_api"))
+    t.add_row("claude key (BYOK)", (claude_key[:10] + "…") if claude_key else "[yellow]not set — `decompute claude --set-key`[/yellow]")
+    t.add_row("session id", get_session_id() or "[dim]none — run `decompute claude`[/dim]")
     t.add_row("Claude Code routed (this shell)",
-              "[green]yes[/green]" if routed else "[yellow]no — `source ~/.decompute/claude.env`[/yellow]")
+              "[green]yes[/green]" if routed else "[yellow]no — run `decompute claude`[/yellow]")
     client = _client()
     try:
         h = client.get("/health")
@@ -418,55 +696,30 @@ def billing(portal: bool = typer.Option(False, "--portal", help="open the Stripe
         print("Upgrade with [bold]decompute upgrade[/bold].")
 
 
-keys_app = typer.Typer(help="Manage your API keys.")
-app.add_typer(keys_app, name="keys")
-
-
-@keys_app.command("list")
-def keys_list():
-    """List your project's API keys (revoked ones included)."""
-    rows = _client().api_keys.list()
-    if not rows:
-        print("No API keys yet — create one with [bold]decompute api-key-create[/bold].")
-        return
-    t = Table(title="api keys")
-    for c in ("id", "name", "key_prefix", "scopes", "created", "revoked"):
-        t.add_column(c)
-    for r in rows:
-        t.add_row(str(r.get("id", "")), str(r.get("name", "")), str(r.get("key_prefix", "")),
-                  ",".join(r.get("scopes") or []), str(r.get("created_at", ""))[:10],
-                  "[red]revoked[/red]" if r.get("revoked_at") else "active")
-    print(t)
-
-
-@keys_app.command("revoke")
-def keys_revoke(
-    key_id: str = typer.Argument(..., help="key id from `decompute keys list`"),
-    yes: bool = typer.Option(False, "--yes", "-y", help="skip the confirmation prompt"),
-):
-    """Revoke an API key (irreversible). Use this immediately if a key leaks."""
-    if not yes and not typer.confirm(f"Revoke key {key_id}? This cannot be undone."):
-        raise typer.Exit(1)
-    try:
-        _client().api_keys.revoke(key_id)
-    except DecomputeError as exc:
-        print(f"[red]revoke failed:[/red] {exc}")
-        raise typer.Exit(1)
-    print(f"[green]✓[/green] revoked {key_id}")
-
+# NOTE: Decompute issues no API keys (BYOK). There is no `keys` sub-app or `api-key-create`
+# command — you bring your own Claude key, stored locally via `decompute init` / `decompute claude`.
 
 support_app = typer.Typer(help="Support / debugging utilities.")
 app.add_typer(support_app, name="support")
 
 
+def _auth_headers(extra: dict | None = None) -> dict:
+    """Auth header for gateway calls: BYOK x-api-key when set, else none (local_noauth)."""
+    h = dict(extra or {})
+    _, claude_key = _conn()
+    if claude_key:
+        h["x-api-key"] = claude_key
+    return h
+
+
 def _upload_support_bundle(zip_path: Path) -> dict:
     """POST the bundle zip to the gateway's support inbox; returns the server's response."""
     import httpx
-    base_url, api_key = _conn()
+    base_url, _ = _conn()
     resp = httpx.post(
         f"{base_url}/v1/support/upload",
         content=zip_path.read_bytes(),
-        headers={"x-decompute-api-key": api_key, "content-type": "application/zip"},
+        headers=_auth_headers({"content-type": "application/zip"}),
         timeout=60.0,
     )
     if resp.status_code != 200:
@@ -486,12 +739,12 @@ def _make_support_bundle(*, session, all_sessions, since, until, output_dir, dat
 
     # Resolve session scope.
     if not all_sessions and not session:
-        session = load_config().get("last_session_id")
+        session = get_session_id()
         if session:
             print(f"[dim]Scoping to your last session {session} — use --session to override, --all for everything.[/dim]")
 
-    base_url, api_key = _conn()
-    headers = {"x-decompute-api-key": api_key}
+    base_url, _ = _conn()
+    headers = _auth_headers()
 
     if dry_run:
         print("[bold]Dry run[/bold] — previewing what the bundle would contain (nothing saved or sent)…")
@@ -644,11 +897,6 @@ def usage(
         return
     out = client.usage.export(format="csv" if format == "csv" else "json", start=from_, end=to)
     print(out if format == "csv" else json.dumps(out, indent=2, ensure_ascii=False))
-
-
-@app.command("api-key-create")
-def api_key_create(name: str = "default"):
-    print_json(_client().api_keys.create(name=name))
 
 
 def print_json(value):
