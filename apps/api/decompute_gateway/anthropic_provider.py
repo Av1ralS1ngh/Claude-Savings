@@ -73,9 +73,19 @@ def upstream_headers(settings: Settings, upstream_api_key: str | None, incoming_
     incoming_headers = incoming_headers or {}
     beta = incoming_headers.get("anthropic-beta")
     if beta:
-        allowed = [b.strip() for b in beta.split(",") if b.strip() in settings.allowed_anthropic_beta_headers]
-        if allowed:
-            headers["anthropic-beta"] = ",".join(allowed)
+        # Transparent-proxy default: forward the client's anthropic-beta header verbatim.
+        # These betas enable request fields the client also sends (context_management, 1M
+        # context, fine-grained tool streaming, interleaved thinking, prompt-caching); if we
+        # drop the header, Anthropic rejects the body it gates (e.g. 400 "context_management:
+        # Extra inputs are not permitted"). Set DECOMPUTE_ALLOWED_ANTHROPIC_BETAS to an explicit
+        # allowlist to RESTRICT which betas pass through; empty (the default) = allow all.
+        allowlist = settings.allowed_anthropic_beta_headers
+        if allowlist:
+            allowed = [b.strip() for b in beta.split(",") if b.strip() in allowlist]
+            if allowed:
+                headers["anthropic-beta"] = ",".join(allowed)
+        else:
+            headers["anthropic-beta"] = beta
     return headers
 
 
