@@ -162,6 +162,53 @@ class UsageEvent(Base):
     )
 
 
+class License(Base):
+    """A device-bound Pro license backed by a Stripe subscription (the BYOK/self-hosted axis).
+
+    Issued ONCE per paid Checkout Session (stripe_checkout_session_id is UNIQUE), the raw key is
+    shown to the user once and only its HMAC is stored. The license is bound to a single device
+    (bound_device_hash) and stays Pro while the subscription is active (current_period_end +
+    grace). Revoked on subscription deletion. This is the ONLY authority for device Pro access.
+    """
+    __tablename__ = "licenses"
+    id: Mapped[str] = mapped_column(String(48), primary_key=True)  # lic_*
+    license_key_hash: Mapped[str] = mapped_column(String(128), nullable=False, unique=True, index=True)
+    tier: Mapped[str] = mapped_column(String(32), default="pro", nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="active", nullable=False)  # active|revoked
+    stripe_customer_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    stripe_subscription_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    # UNIQUE -> exactly one license per paid checkout session (single-redeem guarantee).
+    stripe_checkout_session_id: Mapped[str | None] = mapped_column(String(96), unique=True, index=True)
+    # The device this license currently entitles; rebindable (device migration). NULL until activated.
+    bound_device_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    current_period_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    __table_args__ = (Index("ix_licenses_device_status", "bound_device_hash", "status"),)
+
+
+class DeviceQuota(Base):
+    """Per-device FREE-tier compression counter (the free unit). Keyed by the server-derived
+    device-hash (HMAC of the client fingerprint), reset per window (daily). The client never
+    supplies or echoes the count — it lives here authoritatively, so it cannot be rolled back."""
+    __tablename__ = "device_quotas"
+    id: Mapped[str] = mapped_column(String(48), primary_key=True)  # devq_*
+    device_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    compressions_used: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    window_date: Mapped[str] = mapped_column(String(10), default="", nullable=False)  # 'YYYY-MM-DD' (daily) or 'lifetime'
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class StripeEvent(Base):
+    """Webhook idempotency: a redelivered event (same Stripe event id) is processed once."""
+    __tablename__ = "stripe_events"
+    event_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    event_type: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
 class AuditLog(Base):
     __tablename__ = "audit_logs"
     id: Mapped[str] = mapped_column(String(48), primary_key=True)

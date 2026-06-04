@@ -16,7 +16,7 @@ from sqlalchemy.pool import StaticPool
 
 from .config import Settings
 from .crypto import CCRCrypto
-from .models import ApiKey, AuditLog, Base, CCRItem, Deployment, Device, Membership, Org, Project, UsageEvent, User, utcnow
+from .models import ApiKey, AuditLog, Base, CCRItem, Deployment, Device, DeviceQuota, License, Membership, Org, Project, StripeEvent, UsageEvent, User, utcnow
 from .secret_scanner import SecretScanner
 
 log = logging.getLogger("decompute.gateway.db")
@@ -319,6 +319,217 @@ class Store:
                 p.stripe_subscription_id = stripe_subscription_id
             p.subscription_current_period_end = current_period_end
             return True
+
+    # ── Device licensing (BYOK/self-hosted axis) ──────────────────────────────
+    def hash_device_fingerprint(self, raw_fp: str) -> str:
+        """HMAC the client-supplied device fingerprint with a DEDICATED pepper. The raw
+        fingerprint is never stored; only this digest is used as the device identity."""
+        return hmac.new(self.settings.device_fingerprint_salt.encode(), raw_fp.encode(), hashlib.sha256).hexdigest()
+
+    def hash_license_key(self, raw_key: str) -> str:
+        return hmac.new(self.settings.license_key_hash_salt.encode(), raw_key.encode(), hashlib.sha256).hexdigest()
+
+    @staticmethod
+    def _aware(dt: datetime | None) -> datetime | None:
+        if dt is not None and dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt
+
+    def _license_live(self, lic: License, grace_days: int) -> bool:
+        """Active status AND the paid period hasn't lapsed beyond grace (self-heal backstop)."""
+        if lic.status != "active":
+            return False
+        pend = self._aware(lic.current_period_end)
+        if pend is not None and utcnow() > pend + timedelta(days=max(0, grace_days)):
+            return False
+        return True
+
+    @staticmethod
+    def license_to_dict(lic: License) -> dict[str, Any]:
+        return {
+            "id": lic.id, "tier": lic.tier, "status": lic.status,
+            "stripe_customer_id": lic.stripe_customer_id,
+            "stripe_subscription_id": lic.stripe_subscription_id,
+            "bound_device_hash": lic.bound_device_hash,
+            "current_period_end": lic.current_period_end.isoformat() if lic.current_period_end else None,
+            "issued_at": lic.issued_at.isoformat() if lic.issued_at else None,
+        }
+
+    def _grace(self) -> int:
+        return int(getattr(self.settings, "billing_grace_days", 3))
+
+    def get_active_license_for_device(self, device_hash: str | None) -> dict[str, Any] | None:
+        if not device_hash:
+            return None
+        with self.session() as s:
+            lic = s.execute(
+                select(License).where(License.bound_device_hash == device_hash, License.status == "active")
+                .order_by(License.issued_at.desc())
+            ).scalars().first()
+            if not lic or not self._license_live(lic, self._grace()):
+                return None
+            return self.license_to_dict(lic)
+
+    def issue_license(self, *, stripe_checkout_session_id: str | None, stripe_customer_id: str | None,
+                      stripe_subscription_id: str | None, tier: str = "pro",
+                      current_period_end: datetime | None = None, device_hash: str | None = None) -> dict[str, Any]:
+        """Mint a Pro license for a paid checkout session, EXACTLY once per session (the
+        UNIQUE stripe_checkout_session_id is the single-redeem guarantee). On replay, returns
+        the already-issued license (license_key=None) and optionally (re)binds the device.
+        The raw key is returned only on first issue and never stored (only its HMAC)."""
+        def _existing(sid: str) -> dict[str, Any] | None:
+            with self.session() as s:
+                lic = s.execute(select(License).where(License.stripe_checkout_session_id == sid)).scalar_one_or_none()
+                if not lic:
+                    return None
+                if device_hash and lic.status == "active" and lic.bound_device_hash != device_hash:
+                    lic.bound_device_hash = device_hash
+                return {**self.license_to_dict(lic), "license_key": None, "already_issued": True}
+
+        if stripe_checkout_session_id:
+            prior = _existing(stripe_checkout_session_id)
+            if prior:
+                return prior
+        raw = "DCMP-" + secrets.token_urlsafe(32).replace("-", "").replace("_", "")[:32]
+        lic_id = self._id("lic")
+        try:
+            with self.session() as s:
+                lic = License(
+                    id=lic_id, license_key_hash=self.hash_license_key(raw), tier=tier, status="active",
+                    stripe_customer_id=stripe_customer_id, stripe_subscription_id=stripe_subscription_id,
+                    stripe_checkout_session_id=stripe_checkout_session_id, bound_device_hash=device_hash,
+                    current_period_end=current_period_end,
+                )
+                s.add(lic)
+                s.add(AuditLog(id=self._id("aud"), project_id=None, actor_key_prefix=None,
+                               action="license.issue", target_type="license", target_id=lic_id,
+                               metadata_json={"tier": tier, "device_bound": bool(device_hash)}))
+        except IntegrityError:
+            # Concurrent redeem of the same session minted it first — return theirs, not a new key.
+            if stripe_checkout_session_id:
+                prior = _existing(stripe_checkout_session_id)
+                if prior:
+                    return prior
+            raise
+        return {"id": lic_id, "tier": tier, "status": "active", "license_key": raw,
+                "current_period_end": current_period_end.isoformat() if current_period_end else None,
+                "bound_device_hash": device_hash, "already_issued": False}
+
+    def activate_device_binding(self, *, raw_key: str, device_hash: str) -> dict[str, Any]:
+        """Bind (or rebind/migrate) an active license to this device. A license entitles exactly
+        one device at a time, so rebinding implicitly releases the previous device."""
+        key_hash = self.hash_license_key(raw_key)
+        with self.session() as s:
+            lic = s.execute(select(License).where(License.license_key_hash == key_hash)).scalar_one_or_none()
+            if not lic:
+                return {"ok": False, "reason": "invalid_key"}
+            if lic.status != "active":
+                return {"ok": False, "reason": "revoked"}
+            if not self._license_live(lic, self._grace()):
+                return {"ok": False, "reason": "expired"}
+            lic.bound_device_hash = device_hash
+            s.add(AuditLog(id=self._id("aud"), project_id=None, actor_key_prefix=None,
+                           action="license.activate", target_type="license", target_id=lic.id,
+                           metadata_json={"device_hash_prefix": device_hash[:12]}))
+            return {"ok": True, "tier": lic.tier, "current_period_end": lic.current_period_end.isoformat() if lic.current_period_end else None, "license_id": lic.id}
+
+    def release_device_binding(self, *, device_hash: str) -> int:
+        with self.session() as s:
+            rows = s.execute(select(License).where(License.bound_device_hash == device_hash, License.status == "active")).scalars().all()
+            for lic in rows:
+                lic.bound_device_hash = None
+            return len(rows)
+
+    def revoke_licenses_for_subscription(self, subscription_id: str | None) -> int:
+        if not subscription_id:
+            return 0
+        with self.session() as s:
+            rows = s.execute(select(License).where(License.stripe_subscription_id == subscription_id, License.status == "active")).scalars().all()
+            for lic in rows:
+                lic.status = "revoked"
+                lic.revoked_at = utc_ts()
+                lic.bound_device_hash = None
+            return len(rows)
+
+    def sync_licenses_for_subscription(self, *, subscription_id: str | None, status: str | None, current_period_end: datetime | None) -> int:
+        """Sync period/status for a subscription's licenses (customer.subscription.updated)."""
+        if not subscription_id:
+            return 0
+        with self.session() as s:
+            rows = s.execute(select(License).where(License.stripe_subscription_id == subscription_id)).scalars().all()
+            for lic in rows:
+                lic.current_period_end = current_period_end
+                if status in {"canceled", "unpaid", "incomplete_expired"}:
+                    lic.status = "revoked"
+                    lic.revoked_at = utc_ts()
+                    lic.bound_device_hash = None
+            return len(rows)
+
+    def _quota_window(self, now: datetime | None = None) -> str:
+        if getattr(self.settings, "free_quota_window", "daily") == "lifetime":
+            return "lifetime"
+        return (now or utcnow()).strftime("%Y-%m-%d")
+
+    def try_consume_free_quota(self, device_hash: str, *, limit: int | None = None, now: datetime | None = None) -> dict[str, Any]:
+        """Atomically consume one free-tier compression for this device in the current window.
+        Returns {consumed, used, limit, remaining}. The count is server-authoritative and resets
+        per window (daily). consumed=False means the quota is spent -> caller degrades to mode=off."""
+        limit = int(self.settings.free_compression_quota) if limit is None else int(limit)
+        wk = self._quota_window(now)
+        for _attempt in range(2):  # one retry for the first-insert race
+            try:
+                with self.session() as s:
+                    row = s.execute(select(DeviceQuota).where(DeviceQuota.device_hash == device_hash)).scalar_one_or_none()
+                    if row is None:
+                        row = DeviceQuota(id=self._id("devq"), device_hash=device_hash, compressions_used=0, window_date=wk)
+                        s.add(row)
+                        s.flush()
+                    if row.window_date != wk:  # window rolled over -> reset
+                        row.window_date = wk
+                        row.compressions_used = 0
+                    if row.compressions_used < limit:
+                        row.compressions_used += 1
+                        row.updated_at = utc_ts()
+                        used = row.compressions_used
+                        return {"consumed": True, "used": used, "limit": limit, "remaining": max(0, limit - used)}
+                    return {"consumed": False, "used": row.compressions_used, "limit": limit, "remaining": 0}
+            except IntegrityError:
+                continue  # another request inserted the row first; retry reads it
+        return {"consumed": False, "used": limit, "limit": limit, "remaining": 0}
+
+    def get_device_quota(self, device_hash: str, *, limit: int | None = None, now: datetime | None = None) -> dict[str, Any]:
+        limit = int(self.settings.free_compression_quota) if limit is None else int(limit)
+        wk = self._quota_window(now)
+        with self.session() as s:
+            row = s.execute(select(DeviceQuota).where(DeviceQuota.device_hash == device_hash)).scalar_one_or_none()
+            used = row.compressions_used if (row and row.window_date == wk) else 0
+            return {"used": used, "limit": limit, "remaining": max(0, limit - used)}
+
+    def get_device_license_status(self, device_hash: str | None) -> dict[str, Any]:
+        """Combined device-scoped status for GET /v1/licenses/status (no quota consumption)."""
+        if not device_hash:
+            return {"tier": "free", "license_status": "none", "metered": False, **self.get_device_quota("")}
+        lic = self.get_active_license_for_device(device_hash)
+        if lic:
+            return {"tier": lic["tier"], "license_status": "active", "current_period_end": lic.get("current_period_end"),
+                    "quota_used": None, "quota_remaining": None, "free_quota_limit": None}
+        q = self.get_device_quota(device_hash)
+        return {"tier": "free", "license_status": "none", "current_period_end": None,
+                "quota_used": q["used"], "quota_remaining": q["remaining"], "free_quota_limit": q["limit"]}
+
+    def mark_stripe_event(self, event_id: str | None, event_type: str | None = None) -> bool:
+        """Record a webhook event id once. Returns True if newly recorded (process it), False if
+        already seen (skip) — prevents a redelivered event from double-issuing a license."""
+        if not event_id:
+            return True
+        try:
+            with self.session() as s:
+                if s.get(StripeEvent, event_id):
+                    return False
+                s.add(StripeEvent(event_id=event_id, event_type=event_type))
+        except IntegrityError:
+            return False
+        return True
 
     def create_api_key(self, *, project_id: str, name: str, scopes: list[str]) -> dict[str, Any]:
         if not scopes:

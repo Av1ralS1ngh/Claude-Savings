@@ -119,6 +119,22 @@ class Settings:
     billing_cancel_url: str = os.getenv("DECOMPUTE_BILLING_CANCEL_URL", "https://decompute.ai/billing/cancel")
     billing_portal_return_url: str = os.getenv("DECOMPUTE_BILLING_PORTAL_RETURN_URL", "https://decompute.ai/account")
 
+    # ── Device licensing (BYOK/self-hosted axis) ──────────────────────────────
+    # Monetizes the compression itself for self-hosted BYOK users (who are otherwise
+    # unmetered). A device presents an HMAC'd fingerprint; an active Pro license keeps
+    # compression on, otherwise a per-device daily free quota applies and degrades to
+    # mode='off' (still forwards to Claude) once spent. Orthogonal to the project tiers.
+    device_licensing_enabled: bool = _bool("DECOMPUTE_DEVICE_LICENSING_ENABLED", True)
+    # Dedicated HMAC pepper for device fingerprints — NEVER reuse api_key_hash_salt, and
+    # never the dev default in production (see validate_for_startup).
+    device_fingerprint_salt: str = os.getenv("DECOMPUTE_DEVICE_FINGERPRINT_SALT", "local-dev-device-salt-change-me")
+    # Pepper for at-rest hashing of issued license keys (only the hash is stored).
+    license_key_hash_salt: str = os.getenv("DECOMPUTE_LICENSE_KEY_HASH_SALT", "local-dev-license-salt-change-me")
+    # Free tier: N compressed requests per device per window before degrading to no-compression.
+    free_compression_quota: int = _int("DECOMPUTE_FREE_COMPRESSION_QUOTA", 100)
+    free_quota_window: str = os.getenv("DECOMPUTE_FREE_QUOTA_WINDOW", "daily")  # daily | lifetime
+    device_license_tier: str = os.getenv("DECOMPUTE_DEVICE_LICENSE_TIER", "pro")
+
     @property
     def billing_enabled(self) -> bool:
         return bool(self.stripe_secret_key)
@@ -183,6 +199,16 @@ class Settings:
                 errors.append("DECOMPUTE_DASHBOARD_AUTH_REQUIRED must be true in production")
             if self.local_student_training_enabled:
                 errors.append("Local student continuous training is not a V0 production feature")
+            # Secret hygiene: hashing/signing peppers must never ship as the dev default in prod,
+            # or device-hashes/license-hashes become forgeable and low-entropy fingerprints
+            # become brute-forceable from a DB leak.
+            for name, value, default in (
+                ("DECOMPUTE_API_KEY_HASH_SALT", self.api_key_hash_salt, "local-dev-salt-change-me"),
+                ("DECOMPUTE_DEVICE_FINGERPRINT_SALT", self.device_fingerprint_salt, "local-dev-device-salt-change-me"),
+                ("DECOMPUTE_LICENSE_KEY_HASH_SALT", self.license_key_hash_salt, "local-dev-license-salt-change-me"),
+            ):
+                if not value or value == default:
+                    errors.append(f"{name} must be set to a non-default secret in production")
         if errors:
             joined = "\n - ".join(errors)
             raise RuntimeError(f"Invalid Decompute production configuration:\n - {joined}")

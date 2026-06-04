@@ -22,6 +22,7 @@ from .capabilities import capabilities_dict
 from .config import get_settings
 from .crypto import CCRCrypto
 from .db import Store
+from .licensing import DEVICE_HEADER, LicenseService
 from .observability import BodySizeLimitMiddleware, RequestContextMiddleware, SecurityHeadersMiddleware, configure_logging, current_request_id, metrics_response, project_id_var
 from .pricing import cost_usd, savings_usd
 from .billing import BillingError, BillingService
@@ -52,6 +53,7 @@ scanner = SecretScanner(mode=settings.pii_mode)
 yscompress = YSCompressClient(settings, store, crypto, scanner)
 rate_limits = RateLimitManager(settings, store=store)  # store-backed: per-project quota follows the licensed tier
 billing = BillingService(settings, store)
+licensing = LicenseService(settings, store)  # device axis: per-device Pro license + free compression quota
 
 app = FastAPI(
     title="Decompute Claude Optimization Gateway",
@@ -67,8 +69,8 @@ app.add_middleware(
     allow_origins=settings.cors_origins,
     allow_credentials=settings.cors_allow_credentials,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["authorization", "content-type", "x-api-key", "x-decompute-api-key", "x-decompute-key", "x-decompute-csrf", "x-decompute-request-id", "x-decompute-session-id", "anthropic-beta", "x-yscompress-bypass", "x-headroom-bypass"],
-    expose_headers=["x-decompute-request-id", "x-decompute-tokens-before", "x-decompute-tokens-after", "x-decompute-route", "request-id"],
+    allow_headers=["authorization", "content-type", "x-api-key", "x-decompute-api-key", "x-decompute-key", "x-decompute-csrf", "x-decompute-request-id", "x-decompute-session-id", "x-decompute-device", "anthropic-beta", "x-yscompress-bypass", "x-headroom-bypass"],
+    expose_headers=["x-decompute-request-id", "x-decompute-tokens-before", "x-decompute-tokens-after", "x-decompute-route", "request-id", "x-decompute-tier", "x-decompute-license-status", "x-decompute-quota-remaining"],
 )
 
 
@@ -174,6 +176,17 @@ def _response_headers(*, request_id: str, comp: Any | None = None, plan: Any | N
         headers["x-decompute-route"] = plan.route
         headers["x-decompute-yellowstone-final-tokens"] = str(plan.yellowstone_final_input_tokens)
     return headers
+
+
+def _apply_license_headers(headers: dict[str, str], license_meta: dict[str, Any] | None) -> None:
+    """Stamp the device-license decision onto the response so the CLI can surface tier/quota.
+    Invisible to Claude Code, but read by `decompute status`/`license`."""
+    if not license_meta:
+        return
+    headers["x-decompute-tier"] = str(license_meta.get("tier", "free"))
+    headers["x-decompute-license-status"] = str(license_meta.get("license_status", "none"))
+    if license_meta.get("quota_remaining") is not None:
+        headers["x-decompute-quota-remaining"] = str(license_meta.get("quota_remaining"))
 
 
 async def _resolve_ccr_retrievals(result: ProviderResult, compressed_body: dict[str, Any], *, principal: AuthPrincipal, upstream_key: str | None, prompt_cache_mode: str, request: Request, max_rounds: int = 3) -> tuple[ProviderResult, int, int]:
@@ -855,6 +868,13 @@ def get_limits(request: Request) -> dict[str, Any]:
 
 
 # ── Billing / licensing ───────────────────────────────────────────────────────
+def _device_hash(request: Request) -> str | None:
+    """Server-derived device id: HMAC of the client-supplied fingerprint header. The raw
+    fingerprint is never stored or trusted as an identity — only this digest is used."""
+    fp = request.headers.get(DEVICE_HEADER)
+    return store.hash_device_fingerprint(fp) if fp else None
+
+
 @app.get("/v1/billing/status")
 def billing_status(request: Request) -> dict[str, Any]:
     principal = _auth(request, "usage:read")
@@ -862,12 +882,23 @@ def billing_status(request: Request) -> dict[str, Any]:
     info["billing_enabled"] = billing.enabled
     info["metered"] = rate_limits._metered(principal)
     info["limits"] = rate_limits.limits_for(principal)
+    # Merge device-license info when the caller presents a fingerprint (BYOK axis). Best-effort:
+    # never let the licensing subsystem break billing status (e.g. migration not yet applied).
+    dh = _device_hash(request)
+    if dh:
+        try:
+            info["device_license"] = store.get_device_license_status(dh)
+        except Exception:
+            pass
     return info
 
 
 @app.post("/v1/billing/checkout")
 async def billing_checkout(request: Request) -> JSONResponse:
-    """Start a subscription checkout for the caller's project; returns the Stripe Checkout URL."""
+    """Start a subscription checkout; returns the Stripe Checkout URL.
+
+    If the caller presents a device fingerprint (BYOK/self-hosted), the issued license binds to
+    that device; otherwise it's a hosted project-tier subscription."""
     principal = _auth(request, "messages:write")
     assert_csrf_for_browser_mutation(request)
     body = {}
@@ -876,10 +907,77 @@ async def billing_checkout(request: Request) -> JSONResponse:
     except Exception:
         pass
     try:
-        result = billing.create_checkout_session(project_id=principal.project_id, customer_email=(body or {}).get("email"))
+        result = billing.create_checkout_session(
+            project_id=principal.project_id, customer_email=(body or {}).get("email"),
+            device_hash=_device_hash(request),
+        )
     except BillingError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     return JSONResponse({"checkout_url": result["url"], "session_id": result["id"]})
+
+
+# ── Device licensing (BYOK axis) ──────────────────────────────────────────────
+@app.post("/v1/billing/redeem-checkout")
+async def billing_redeem_checkout(request: Request) -> JSONResponse:
+    """Verify a PAID Checkout Session and issue a device Pro license (once). Body: {session_id}.
+    If a device fingerprint is present, the license is activated for this device immediately."""
+    principal = _auth(request, "messages:write")
+    assert_csrf_for_browser_mutation(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    session_id = (body or {}).get("session_id")
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id is required")
+    try:
+        result = billing.redeem_checkout(session_id=session_id, device_hash=_device_hash(request))
+    except BillingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(result)
+
+
+@app.post("/v1/licenses/activate")
+async def licenses_activate(request: Request) -> JSONResponse:
+    """Bind an existing license key to THIS device. Body: {license_key}; device via header."""
+    _auth(request, "messages:write")
+    assert_csrf_for_browser_mutation(request)
+    dh = _device_hash(request)
+    if not dh:
+        raise HTTPException(status_code=400, detail=f"a device fingerprint ({DEVICE_HEADER}) is required to activate")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    key = (body or {}).get("license_key")
+    if not key:
+        raise HTTPException(status_code=400, detail="license_key is required")
+    res = store.activate_device_binding(raw_key=key, device_hash=dh)
+    if not res.get("ok"):
+        raise HTTPException(status_code=400, detail=f"could not activate license: {res.get('reason')}")
+    return JSONResponse({"activated": True, "tier": res["tier"], "current_period_end": res.get("current_period_end"), "device_hash_prefix": dh[:12]})
+
+
+@app.get("/v1/licenses/status")
+def licenses_status(request: Request) -> dict[str, Any]:
+    """Device-scoped license + free-quota status (no quota consumption). Powers `decompute license`."""
+    _auth(request, "usage:read")
+    dh = _device_hash(request)
+    if not dh:
+        return {"tier": "free", "license_status": "none", "device": False}
+    return {**store.get_device_license_status(dh), "device": True}
+
+
+@app.post("/v1/licenses/deactivate")
+async def licenses_deactivate(request: Request) -> JSONResponse:
+    """Release this device's license binding so the seat can move to another device."""
+    _auth(request, "messages:write")
+    assert_csrf_for_browser_mutation(request)
+    dh = _device_hash(request)
+    if not dh:
+        raise HTTPException(status_code=400, detail=f"a device fingerprint ({DEVICE_HEADER}) is required")
+    n = store.release_device_binding(device_hash=dh)
+    return JSONResponse({"released": n})
 
 
 @app.post("/v1/billing/portal")
@@ -895,11 +993,12 @@ async def billing_portal(request: Request) -> JSONResponse:
 
 
 @app.post("/v1/billing/webhook")
+@app.post("/v1/billing/stripe-webhook")  # boss-spec name; same handler, signature-verified
 async def billing_webhook(request: Request) -> JSONResponse:
-    """Stripe webhook — the ONLY path that grants/revokes a license. No auth; signature-verified.
+    """Stripe webhook — the ONLY path that grants/revokes a license/tier. No auth; signature-verified.
 
-    Tier changes never come from a client request; they come from a signature-verified Stripe
-    event keyed back to the project via client_reference_id / stored customer id.
+    Tier/license changes never come from a client request; they come from a signature-verified
+    Stripe event keyed back to the project (client_reference_id) or device (metadata.device_hash).
     """
     payload = await request.body()
     sig = request.headers.get("stripe-signature")
@@ -996,6 +1095,15 @@ async def anthropic_messages_proxy(request: Request, payload: MessagesRequest) -
     mode = ys_cfg.get("mode", settings.yscompress_default_mode)
     if request.headers.get("x-yscompress-bypass", "false").lower() == "true" or request.headers.get("x-headroom-bypass", "false").lower() == "true":
         mode = "off"
+    # Device licensing (BYOK/self-hosted axis): only for NON-metered callers — hosted dc_ tenants
+    # keep their project-tier path untouched. A device's active Pro license keeps compression on;
+    # a free device spends one daily quota unit, and once exhausted compression degrades to
+    # mode='off' (the request still reaches Claude, just uncompressed).
+    license_meta = None
+    if not rate_limits._metered(principal):
+        license_meta = licensing.resolve(request.headers.get(DEVICE_HEADER))
+        if license_meta and not license_meta["compress"]:
+            mode = "off"
     raw_estimate = estimate_tokens(body.get("messages")) + estimate_tokens(body.get("system")) + estimate_tokens(body.get("tools"))
     rate_limits.check_body_size(request.headers.get("content-length"))
     rate_limits.check_preflight(principal=principal, estimated_input_tokens=raw_estimate, estimated_output_tokens=int(body.get("max_tokens", 1024)), store=store)
@@ -1015,6 +1123,7 @@ async def anthropic_messages_proxy(request: Request, payload: MessagesRequest) -
     plan = planner.plan(model=model, traffic=TrafficProfile(comp.tokens_before, comp.tokens_after, comp.tokens_after, p95_output_tokens=body.get("max_tokens", 1024), workload_class=decompute_cfg.get("workload_class", "interactive")), compression_mode=mode, prompt_cache_mode=prompt_cache_mode)
     upstream_key = upstream_anthropic_key(request, settings)
     headers = _response_headers(request_id=request_id, comp=comp, plan=plan)
+    _apply_license_headers(headers, license_meta)
     if bool(body.get("stream")):
         # Streaming with client-disconnect cleanup. proxy_sse_stream polls the
         # downstream client; on disconnect/cancel it closes the upstream Anthropic
@@ -1121,6 +1230,11 @@ async def openai_chat_proxy(request: Request) -> JSONResponse:
     raw_estimate = estimate_tokens(anthropic_messages) + estimate_tokens(system_parts)
     rate_limits.check_preflight(principal=principal, estimated_input_tokens=raw_estimate, estimated_output_tokens=int(body.get("max_tokens", 1024)), store=store)
     mode = ((body.get("decompute") or {}).get("yscompress") or {}).get("mode", settings.yscompress_default_mode)
+    # Device-licensing gate (BYOK axis) — mirrors /v1/messages; non-metered callers only.
+    if not rate_limits._metered(principal):
+        lm = licensing.resolve(request.headers.get(DEVICE_HEADER))
+        if lm and not lm["compress"]:
+            mode = "off"
     comp = await yscompress.compress_messages(anthropic_messages, project_id=principal.project_id, mode=mode, ccr=settings.ccr_enabled)
     workload = classify_workload(anthropic_messages)
     planner = YellowstonePlanner(scan_local_devices(), planner_version=settings.yellowstone_planner_version, policy_version=settings.yellowstone_policy_version)

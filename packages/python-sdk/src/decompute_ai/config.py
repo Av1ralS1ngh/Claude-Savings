@@ -3,16 +3,23 @@ from __future__ import annotations
 import json
 import os
 import tomllib
+import uuid
 from pathlib import Path
 from typing import Any
 
 # Local config store.
-#  - config.toml : NON-SECRET settings (gateway URL, privacy modes, CCR, claude mode).
+#  - config.toml : NON-SECRET settings (gateway URL, privacy modes, CCR, claude mode, license cache).
 #  - claude.key  : the user's own Anthropic/Claude key (BYOK), owner-only (chmod 600).
+#  - device.id   : a stable, locally-generated device id (NO hardware identifiers) — the
+#                  licensing unit. Sent (raw) as the x-decompute-device header; the gateway
+#                  HMAC-hashes it server-side.
+#  - license.key : the device's Pro license key (secret, chmod 600), if activated.
 # Decompute issues no API key of its own — you bring your Claude key.
 CONFIG_DIR = Path(os.getenv("DECOMPUTE_CONFIG_DIR", str(Path.home() / ".decompute")))
 CONFIG_TOML = CONFIG_DIR / "config.toml"
 KEY_FILE = CONFIG_DIR / "claude.key"
+DEVICE_ID_FILE = CONFIG_DIR / "device.id"
+LICENSE_FILE = CONFIG_DIR / "license.key"
 LEGACY_JSON = CONFIG_DIR / "config.json"
 CONFIG_PATH = CONFIG_TOML  # back-compat alias for callers that print the path
 
@@ -64,7 +71,7 @@ def load_config() -> dict:
 
 def _render_toml(cfg: dict) -> str:
     lines: list[str] = []
-    for section in ("gateway", "privacy", "ccr", "claude"):
+    for section in ("gateway", "privacy", "ccr", "claude", "license"):
         sec = cfg.get(section) or {}
         if not sec:
             continue
@@ -127,5 +134,56 @@ def save_claude_key(key: str) -> Path:
 def clear_claude_key() -> None:
     try:
         KEY_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+# ── device identity + license (BYOK device-licensing axis) ────────────────────
+def load_device_id() -> str:
+    """Stable per-device id, minted once and persisted. Privacy-respecting: a random UUID,
+    NOT a hardware identifier — it leaks nothing about the host. Sent raw as x-decompute-device;
+    the gateway HMAC-hashes it. Env override (DECOMPUTE_DEVICE_ID) is honored for CI/containers."""
+    env = os.getenv("DECOMPUTE_DEVICE_ID")
+    if env:
+        return env.strip()
+    try:
+        existing = DEVICE_ID_FILE.read_text(encoding="utf-8").strip()
+        if existing:
+            return existing
+    except Exception:
+        pass
+    device_id = "dev-" + uuid.uuid4().hex
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        DEVICE_ID_FILE.write_text(device_id + "\n", encoding="utf-8")
+        DEVICE_ID_FILE.chmod(0o600)
+    except Exception:
+        pass
+    return device_id
+
+
+def load_license_key() -> str | None:
+    env = os.getenv("DECOMPUTE_LICENSE_KEY")
+    if env:
+        return env.strip()
+    try:
+        return (LICENSE_FILE.read_text(encoding="utf-8").strip() or None)
+    except Exception:
+        return None
+
+
+def save_license_key(key: str) -> Path:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    LICENSE_FILE.write_text(key.strip() + "\n", encoding="utf-8")
+    try:
+        LICENSE_FILE.chmod(0o600)  # secret — owner-only, like claude.key
+    except Exception:
+        pass
+    return LICENSE_FILE
+
+
+def clear_license_key() -> None:
+    try:
+        LICENSE_FILE.unlink(missing_ok=True)
     except Exception:
         pass

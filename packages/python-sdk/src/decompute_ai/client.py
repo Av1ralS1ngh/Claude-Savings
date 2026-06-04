@@ -5,7 +5,7 @@ from typing import Any
 
 import httpx
 
-from .config import base_url as cfg_base_url, load_claude_key
+from .config import base_url as cfg_base_url, load_claude_key, load_device_id
 from .errors import DecomputeError, error_for_status
 
 __all__ = ["Decompute", "DecomputeError"]
@@ -78,6 +78,21 @@ class Models(_Resource):
         return self._client.get("/v1/models")
 
 
+class Licenses(_Resource):
+    """Device-licensing (BYOK axis): redeem a paid checkout, activate a key, read status."""
+    def redeem(self, session_id: str) -> dict[str, Any]:
+        return self._client.post("/v1/billing/redeem-checkout", {"session_id": session_id})
+
+    def activate(self, license_key: str) -> dict[str, Any]:
+        return self._client.post("/v1/licenses/activate", {"license_key": license_key})
+
+    def status(self) -> dict[str, Any]:
+        return self._client.get("/v1/licenses/status")
+
+    def deactivate(self) -> dict[str, Any]:
+        return self._client.post("/v1/licenses/deactivate")
+
+
 class Usage(_Resource):
     def summary(self) -> dict[str, Any]:
         return self._client.get("/v1/usage")
@@ -114,6 +129,7 @@ class Decompute:
     ):
         # BYOK: the credential is the user's own Claude/Anthropic key (sent as x-api-key).
         self.api_key = api_key or load_claude_key() or ""
+        self.device_id = load_device_id()
         self.base_url = (base_url or os.getenv("DECOMPUTE_BASE_URL") or cfg_base_url()).rstrip("/")
         self.timeout = timeout
         self.max_retries = max(0, max_retries)
@@ -127,6 +143,7 @@ class Decompute:
         self.api_keys = ApiKeys(self)
         self.models = Models(self)
         self.usage = Usage(self)
+        self.licenses = Licenses(self)
 
     def headers(self) -> dict[str, str]:
         # BYOK: forward the user's own Claude key as x-api-key. When none is set we send
@@ -134,6 +151,9 @@ class Decompute:
         h = {"content-type": "application/json"}
         if self.api_key:
             h["x-api-key"] = self.api_key
+        # Device-licensing identity: the gateway HMAC-hashes this to look up Pro/quota.
+        if self.device_id:
+            h["x-decompute-device"] = self.device_id
         return h
 
     def _new_client(self) -> httpx.Client:

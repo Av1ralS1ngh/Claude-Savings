@@ -19,15 +19,21 @@ from .config import (
     CONFIG_PATH,
     CONFIG_TOML,
     DEFAULT_BASE_URL,
+    DEVICE_ID_FILE,
     KEY_FILE,
     LEGACY_JSON,
+    LICENSE_FILE,
     base_url as cfg_base_url,
     clear_claude_key,
+    clear_license_key,
     get_session_id,
     load_claude_key,
     load_config,
+    load_device_id,
+    load_license_key,
     save_claude_key,
     save_config,
+    save_license_key,
     set_session_id,
 )
 from .errors import DecomputeError
@@ -94,15 +100,17 @@ def _new_session_id() -> str:
 def _claude_env_lines(base_url: str, claude_key: str, session_id: str, *, include_key: bool = True) -> dict[str, str]:
     """The env Claude Code needs: gateway routing, the BYOK Claude key, and the session header.
 
-    ANTHROPIC_CUSTOM_HEADERS makes Claude Code stamp x-decompute-session-id on every upstream
-    request (main model + background + token-count), which the gateway stores so support
-    bundles can be scoped to one session. Format is `Name: Value` (Claude Code env reference).
+    ANTHROPIC_CUSTOM_HEADERS makes Claude Code stamp these on every upstream request (main model +
+    background + token-count): x-decompute-session-id (groups a run for support bundles) and
+    x-decompute-device (the licensing identity the gateway HMAC-hashes for Pro/quota). Multiple
+    headers are newline-separated per Claude Code's env reference.
     ANTHROPIC_API_KEY is the user's own Claude key — the gateway forwards it upstream (BYOK).
     Set include_key=False when writing to a file that might be committed (e.g. .vscode/settings.json).
     """
+    custom_headers = f"x-decompute-session-id: {session_id}\nx-decompute-device: {load_device_id()}"
     env = {
         "ANTHROPIC_BASE_URL": base_url,
-        "ANTHROPIC_CUSTOM_HEADERS": f"x-decompute-session-id: {session_id}",
+        "ANTHROPIC_CUSTOM_HEADERS": custom_headers,
     }
     if include_key and claude_key:
         env["ANTHROPIC_API_KEY"] = claude_key
@@ -487,11 +495,17 @@ def uninstall(
                 f.unlink(missing_ok=True)
                 removed.append(str(f))
 
-    # 5. Remove stored Claude key?  [y/N]  (default NO — purge forces yes)
-    if purge or _ask("Remove the stored Claude key?", default=False, noninteractive=noninteractive):
+    # 5. Remove stored Claude key + device license?  [y/N]  (default NO — purge forces yes)
+    if purge or _ask("Remove the stored Claude key + device license?", default=False, noninteractive=noninteractive):
         if KEY_FILE.exists():
             clear_claude_key()
             removed.append(str(KEY_FILE))
+        if LICENSE_FILE.exists():
+            clear_license_key()
+            removed.append(str(LICENSE_FILE))
+        if DEVICE_ID_FILE.exists():
+            DEVICE_ID_FILE.unlink(missing_ok=True)
+            removed.append(str(DEVICE_ID_FILE))
 
     # Tidy: drop ~/.decompute only if we emptied it.
     try:
@@ -578,6 +592,16 @@ def status():
     except DecomputeError as exc:
         t.add_row("gateway", f"[red]unreachable[/red] — {exc}")
     try:
+        lic = client.licenses.status()
+        if lic.get("license_status") == "active":
+            t.add_row("license", f"[green]Pro[/green] (device) · renews {str(lic.get('current_period_end') or '')[:10] or '—'}")
+        else:
+            rem, lim = lic.get("quota_remaining"), lic.get("free_quota_limit")
+            if rem is not None:
+                t.add_row("license", f"Free · compression quota {rem}/{lim} left today · [dim]decompute upgrade[/dim]")
+    except DecomputeError:
+        pass
+    try:
         u = client.usage.summary()
         t.add_row("usage", f"{u.get('requests', 0)} requests · {u.get('tokens_saved', 0):,} tokens saved · "
                            f"${u.get('estimated_savings_usd', 0.0):.4f} saved")
@@ -652,7 +676,7 @@ def _open(url: str) -> None:
 
 @app.command()
 def upgrade():
-    """Subscribe to a paid plan — opens Stripe Checkout in your browser."""
+    """Subscribe to Pro for THIS device — opens Stripe Checkout, then activate."""
     client = _client()
     try:
         status = client.get("/v1/billing/status")
@@ -662,18 +686,82 @@ def upgrade():
     if not status.get("billing_enabled"):
         print("[yellow]Billing isn't configured on this gateway (local/dev).[/yellow]")
         raise typer.Exit(1)
-    if status.get("tier", "free") != "free":
-        print(f"You're already on the [bold]{status['tier']}[/bold] plan. Manage it with [bold]decompute billing --portal[/bold].")
+    dl = status.get("device_license") or {}
+    if dl.get("license_status") == "active":
+        print("This device is already on [bold]Pro[/bold]. Manage it with [bold]decompute billing --portal[/bold].")
         raise typer.Exit(0)
     try:
         r = client.post("/v1/billing/checkout")
     except DecomputeError as exc:
         print(f"[red]checkout failed:[/red] {exc}")
         raise typer.Exit(1)
-    url = r.get("checkout_url")
+    url, session_id = r.get("checkout_url"), r.get("session_id")
     print("Complete your subscription in the browser:")
-    print(f"  [bold]{url}[/bold]")
+    print(f"  [bold]{url}[/bold]\n")
+    print("After paying, activate Pro on this device:")
+    print(f"  [bold]decompute activate --session {session_id}[/bold]")
+    print("[dim](If the gateway is reachable by Stripe, the webhook activates it automatically.)[/dim]")
     _open(url)
+
+
+@app.command()
+def activate(
+    license_key: Optional[str] = typer.Argument(None, help="a Pro license key (DCMP-…) to bind to THIS device"),
+    session: Optional[str] = typer.Option(None, "--session", help="redeem a PAID Stripe checkout session id (cs_…) and activate"),
+):
+    """Activate Pro on this device — redeem a paid checkout (--session) or bind a license key."""
+    client = _client()
+    if session:
+        try:
+            r = client.licenses.redeem(session)
+        except DecomputeError as exc:
+            print(f"[red]could not redeem checkout:[/red] {exc}")
+            raise typer.Exit(1)
+        key = r.get("license_key")
+        if key:
+            save_license_key(key)
+            print(f"[green]✓ Pro activated on this device[/green] — license key saved to {LICENSE_FILE}.")
+        else:
+            print("[green]✓ this device is activated[/green] (license already issued for that checkout).")
+        save_config({"license": {"tier": r.get("tier", "pro"), "device_activated": True, "last_checkout_session": session}})
+        return
+    if license_key:
+        try:
+            r = client.licenses.activate(license_key)
+        except DecomputeError as exc:
+            print(f"[red]could not activate:[/red] {exc}")
+            raise typer.Exit(1)
+        save_license_key(license_key)
+        save_config({"license": {"tier": r.get("tier", "pro"), "device_activated": True}})
+        renews = str(r.get("current_period_end") or "")[:10]
+        print(f"[green]✓ Pro activated on this device[/green]" + (f" — renews {renews}." if renews else "."))
+        return
+    print("Provide a license key, or [bold]--session <cs_…>[/bold] from your checkout. Start with [bold]decompute upgrade[/bold].")
+    raise typer.Exit(1)
+
+
+@app.command("license")
+def license_status():
+    """Show this device's Pro license / free compression quota."""
+    client = _client()
+    try:
+        s = client.licenses.status()
+    except DecomputeError as exc:
+        print(f"[red]could not fetch license status:[/red] {exc}")
+        raise typer.Exit(1)
+    t = Table(title="device license")
+    t.add_column("field"); t.add_column("value")
+    t.add_row("device id", load_device_id())
+    if s.get("license_status") == "active":
+        t.add_row("tier", "[green]Pro[/green]")
+        t.add_row("renews / ends", str(s.get("current_period_end") or "—")[:10])
+    else:
+        t.add_row("tier", "Free")
+        rem, lim = s.get("quota_remaining"), s.get("free_quota_limit")
+        if rem is not None:
+            t.add_row("compression quota", f"{rem}/{lim} left this window")
+        t.add_row("upgrade", "decompute upgrade")
+    print(t)
 
 
 @app.command()

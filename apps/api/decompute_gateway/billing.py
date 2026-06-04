@@ -33,11 +33,12 @@ class BillingError(Exception):
 
 
 class BillingService:
-    def __init__(self, settings: Any, store: Any, subscription_fetcher=None):
+    def __init__(self, settings: Any, store: Any, subscription_fetcher=None, checkout_session_fetcher=None):
         self.settings = settings
         self.store = store
-        # Re-fetches the AUTHORITATIVE subscription from Stripe per event. Injectable for tests.
+        # Re-fetches the AUTHORITATIVE subscription/session from Stripe. Injectable for tests.
         self._fetch_subscription = subscription_fetcher or self._stripe_fetch_subscription
+        self._fetch_checkout_session = checkout_session_fetcher or self._stripe_fetch_checkout_session
 
     @property
     def enabled(self) -> bool:
@@ -55,6 +56,11 @@ class BillingService:
         self._require_enabled()
         sub = stripe.Subscription.retrieve(subscription_id, expand=["items.data.price"])
         return sub if isinstance(sub, dict) else sub.to_dict()
+
+    def _stripe_fetch_checkout_session(self, session_id: str) -> dict[str, Any]:
+        self._require_enabled()
+        sess = stripe.checkout.Session.retrieve(session_id, expand=["subscription", "subscription.items.data.price"])
+        return sess if isinstance(sess, dict) else sess.to_dict()
 
     def _sub_has_configured_price(self, sub: dict[str, Any]) -> bool:
         """True only if the subscription actually carries the price/product we sell.
@@ -102,21 +108,30 @@ class BillingService:
         return {"tier": tier, "status": status}
 
     # ── outbound Stripe calls ────────────────────────────────────────────────
-    def create_checkout_session(self, *, project_id: str, customer_email: str | None = None) -> dict[str, Any]:
-        """Create a subscription Checkout Session for this project; returns {url, id}."""
+    def create_checkout_session(self, *, project_id: str, customer_email: str | None = None,
+                                device_hash: str | None = None) -> dict[str, Any]:
+        """Create a subscription Checkout Session; returns {url, id}.
+
+        Two flavors share this: a hosted PROJECT-tier purchase (client_reference_id=project_id),
+        and a self-hosted DEVICE-license purchase (device_hash in metadata) so the webhook/redeem
+        can bind the issued license to the device. Both can be set; the handlers branch on which.
+        """
         self._require_enabled()
         if not self.settings.stripe_price_id:
             raise BillingError("no Stripe price configured")
         billing = self.store.get_project_billing(project_id) or {}
+        meta = {"project_id": project_id}
+        if device_hash:
+            meta["device_hash"] = device_hash
         kwargs: dict[str, Any] = {
             "mode": "subscription",
             "line_items": [{"price": self.settings.stripe_price_id, "quantity": 1}],
             "success_url": self.settings.billing_success_url,
             "cancel_url": self.settings.billing_cancel_url,
-            # The link back to our project — the webhook reads this to know who paid.
+            # The link back — the webhook reads this to know who paid.
             "client_reference_id": project_id,
-            "metadata": {"project_id": project_id},
-            "subscription_data": {"metadata": {"project_id": project_id}},
+            "metadata": dict(meta),
+            "subscription_data": {"metadata": dict(meta)},
         }
         if billing.get("stripe_customer_id"):
             kwargs["customer"] = billing["stripe_customer_id"]
@@ -127,6 +142,44 @@ class BillingService:
         except Exception as exc:  # stripe.error.StripeError and friends
             raise BillingError(f"Stripe checkout failed: {exc}")
         return {"url": session.url, "id": session.id}
+
+    # ── device-license redemption ─────────────────────────────────────────────
+    def redeem_checkout(self, *, session_id: str, device_hash: str | None = None) -> dict[str, Any]:
+        """Verify a PAID Checkout Session server-side and issue a device Pro license exactly once.
+
+        Re-fetches the authoritative Session + Subscription from Stripe (never trusts the client's
+        session id beyond addressing), requires payment_status=='paid' AND the configured price,
+        then mints a license (idempotent on session_id) and, if a device fingerprint is present,
+        binds it. Returns {license_key (once), tier, device_activated, already_issued}."""
+        self._require_enabled()
+        try:
+            session = self._fetch_checkout_session(session_id)
+        except Exception as exc:
+            raise BillingError(f"could not retrieve checkout session: {exc}")
+        if session.get("payment_status") != "paid":
+            raise BillingError("checkout session is not paid")
+        sub = session.get("subscription")
+        if isinstance(sub, str):
+            sub = self._fetch_subscription(sub)
+        if not isinstance(sub, dict):
+            raise BillingError("checkout session has no subscription")
+        tier, status, period_end = self._tier_for(sub)
+        if tier == "free":
+            # Wrong SKU / inactive — never issue a Pro license for an unconfigured price.
+            raise BillingError("subscription does not carry the configured Pro price")
+        customer = session.get("customer") if isinstance(session.get("customer"), str) else sub.get("customer")
+        res = self.store.issue_license(
+            stripe_checkout_session_id=session_id,
+            stripe_customer_id=customer if isinstance(customer, str) else None,
+            stripe_subscription_id=sub.get("id"), tier=tier,
+            current_period_end=period_end, device_hash=device_hash,
+        )
+        return {
+            "license_key": res.get("license_key"), "tier": res.get("tier", tier),
+            "already_issued": res.get("already_issued", False),
+            "device_activated": bool(device_hash),  # issue binds on create and rebinds on replay
+            "current_period_end": period_end.isoformat() if period_end else None,
+        }
 
     def create_portal_session(self, *, project_id: str) -> dict[str, Any]:
         """Create a Billing Portal session so the user can manage/cancel; returns {url}."""
@@ -162,6 +215,9 @@ class BillingService:
         revoked here and ONLY here, never from a client request.
         """
         etype = event.get("type", "")
+        # Idempotency: a redelivered event (same id) must not double-issue a license.
+        if not self.store.mark_stripe_event(event.get("id"), etype):
+            return {"handled": True, "type": etype, "deduped": True}
         obj = (event.get("data") or {}).get("object") or {}
         handler = {
             "checkout.session.completed": self._on_checkout_completed,
@@ -172,6 +228,10 @@ class BillingService:
         if not handler:
             return {"handled": False, "type": etype}
         return handler(obj) | {"handled": True, "type": etype}
+
+    @staticmethod
+    def _device_hash_from(obj: dict[str, Any]) -> str | None:
+        return (obj.get("metadata") or {}).get("device_hash")
 
     def _project_id_from(self, obj: dict[str, Any]) -> str | None:
         # Prefer the explicit reference set at checkout; fall back to metadata, then customer lookup.
@@ -184,8 +244,26 @@ class BillingService:
         return None
 
     def _on_checkout_completed(self, session: dict[str, Any]) -> dict[str, Any]:
-        # Checkout completion only LINKS the customer/subscription; the tier is granted from the
-        # authoritative subscription (so an unpaid/async checkout never grants paid access).
+        # A device-license purchase (device_hash in metadata) issues a DEVICE license and never
+        # touches the project tier. Otherwise it's a hosted PROJECT-tier purchase (existing path).
+        device_hash = self._device_hash_from(session)
+        if device_hash:
+            customer = session.get("customer") if isinstance(session.get("customer"), str) else None
+            sub_id = session.get("subscription") if isinstance(session.get("subscription"), str) else None
+            if not sub_id:
+                return {"action": "linked", "device": True}
+            try:
+                sub = self._fetch_subscription(sub_id)
+            except Exception as exc:
+                return {"action": "linked", "device": True, "reason": f"fetch_failed: {exc}"}
+            tier, _status, period_end = self._tier_for(sub)
+            if tier == "free":
+                return {"action": "linked", "device": True}  # wrong SKU/inactive -> no license
+            res = self.store.issue_license(
+                stripe_checkout_session_id=session.get("id"), stripe_customer_id=customer,
+                stripe_subscription_id=sub_id, tier=tier, current_period_end=period_end, device_hash=device_hash,
+            )
+            return {"action": "granted" if not res.get("already_issued") else "linked", "device": True, "tier": tier}
         project_id = self._project_id_from(session)
         if not project_id:
             return {"action": "skipped", "reason": "no project_id"}
@@ -204,9 +282,6 @@ class BillingService:
         return {"action": "granted" if res["tier"] != "free" else "linked", "project_id": project_id, **res}
 
     def _on_subscription_change(self, sub_obj: dict[str, Any]) -> dict[str, Any]:
-        project_id = self._project_id_from(sub_obj)
-        if not project_id:
-            return {"action": "skipped", "reason": "no project_id"}
         sub_id = sub_obj.get("id")
         # Re-fetch the authoritative subscription: makes the grant independent of event ORDER
         # (a stale 'active' redelivered after cancel re-fetches and sees the real 'canceled')
@@ -216,13 +291,24 @@ class BillingService:
             try:
                 sub = self._fetch_subscription(sub_id)
             except Exception as exc:
-                return {"action": "deferred", "project_id": project_id, "reason": f"fetch_failed: {exc}"}
+                return {"action": "deferred", "reason": f"fetch_failed: {exc}"}
+        # Device subscription -> sync device licenses (period/status), never the project tier.
+        if self._device_hash_from(sub) or self._device_hash_from(sub_obj):
+            _tier, status, period_end = self._tier_for(sub)
+            n = self.store.sync_licenses_for_subscription(subscription_id=sub_id, status=sub.get("status"), current_period_end=period_end)
+            return {"action": "synced", "device": True, "licenses": n}
+        project_id = self._project_id_from(sub_obj)
+        if not project_id:
+            return {"action": "skipped", "reason": "no project_id"}
         customer = sub.get("customer") if isinstance(sub.get("customer"), str) else None
         res = self._apply_subscription_obj(project_id, sub, customer)
         return {"action": "synced", "project_id": project_id, **res}
 
     def _on_subscription_deleted(self, sub: dict[str, Any]) -> dict[str, Any]:
         # Deletion is terminal and unambiguous — revoke directly without a re-fetch.
+        if self._device_hash_from(sub):
+            n = self.store.revoke_licenses_for_subscription(sub.get("id"))
+            return {"action": "revoked", "device": True, "licenses": n}
         project_id = self._project_id_from(sub)
         if not project_id:
             return {"action": "skipped", "reason": "no project_id"}
