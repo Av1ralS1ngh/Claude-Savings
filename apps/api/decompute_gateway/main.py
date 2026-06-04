@@ -22,7 +22,7 @@ from .capabilities import capabilities_dict
 from .config import get_settings
 from .crypto import CCRCrypto
 from .db import Store
-from .licensing import DEVICE_HEADER, LicenseService
+from .licensing import DEVICE_HEADER, LicenseService, device_fingerprint_from_request
 from .observability import BodySizeLimitMiddleware, RequestContextMiddleware, SecurityHeadersMiddleware, configure_logging, current_request_id, metrics_response, project_id_var
 from .pricing import cost_usd, savings_usd
 from .billing import BillingError, BillingService
@@ -179,14 +179,15 @@ def _response_headers(*, request_id: str, comp: Any | None = None, plan: Any | N
 
 
 def _apply_license_headers(headers: dict[str, str], license_meta: dict[str, Any] | None) -> None:
-    """Stamp the device-license decision onto the response so the CLI can surface tier/quota.
-    Invisible to Claude Code, but read by `decompute status`/`license`."""
+    """Stamp the device-license decision onto the response. Invisible to Claude Code, but read by
+    `decompute status`/`license` and the desktop upgrade modal (full x-decompute-* contract)."""
     if not license_meta:
         return
+    # Legacy convenience headers (our CLI) + the full license contract (desktop modal).
     headers["x-decompute-tier"] = str(license_meta.get("tier", "free"))
-    headers["x-decompute-license-status"] = str(license_meta.get("license_status", "none"))
     if license_meta.get("quota_remaining") is not None:
         headers["x-decompute-quota-remaining"] = str(license_meta.get("quota_remaining"))
+    headers.update(LicenseService.decision_headers(license_meta))
 
 
 async def _resolve_ccr_retrievals(result: ProviderResult, compressed_body: dict[str, Any], *, principal: AuthPrincipal, upstream_key: str | None, prompt_cache_mode: str, request: Request, max_rounds: int = 3) -> tuple[ProviderResult, int, int]:
@@ -868,10 +869,10 @@ def get_limits(request: Request) -> dict[str, Any]:
 
 
 # ── Billing / licensing ───────────────────────────────────────────────────────
-def _device_hash(request: Request) -> str | None:
-    """Server-derived device id: HMAC of the client-supplied fingerprint header. The raw
+def _device_hash(request: Request, body: dict[str, Any] | None = None) -> str | None:
+    """Server-derived device id: HMAC of the client-supplied fingerprint (header or body). The raw
     fingerprint is never stored or trusted as an identity — only this digest is used."""
-    fp = request.headers.get(DEVICE_HEADER)
+    fp = device_fingerprint_from_request(request.headers, body)
     return store.hash_device_fingerprint(fp) if fp else None
 
 
@@ -978,6 +979,85 @@ async def licenses_deactivate(request: Request) -> JSONResponse:
         raise HTTPException(status_code=400, detail=f"a device fingerprint ({DEVICE_HEADER}) is required")
     n = store.release_device_binding(device_hash=dh)
     return JSONResponse({"released": n})
+
+
+# ── Desktop-app license contract (boss spec): rich status + modal actions ─────
+@app.get("/v1/license/status")
+def license_status_v1(request: Request) -> dict[str, Any]:
+    """Device-scoped license + free-quota decision in the full UI contract (no consumption).
+    Powers the desktop upgrade modal. Falls back to a free/no-fingerprint shape."""
+    _auth(request, "usage:read")
+    fp = device_fingerprint_from_request(request.headers, {})
+    meta = licensing.resolve(fp, consume=False) if fp else None
+    if not meta:
+        return {"plan": "free", "license_status": "none", "device": False,
+                "ui": {"show_modal": False, "actions": []}}
+    out = LicenseService.ui_metadata(meta)
+    out["device"] = True
+    out["headers"] = LicenseService.decision_headers(meta)
+    return out
+
+
+@app.post("/v1/license/continue_without_pro")
+async def license_continue_without_pro(request: Request) -> JSONResponse:
+    """User dismissed the upgrade modal — acknowledge and keep compression paused until reset.
+    (In the per-request degrade model the quota is already spent; this just returns the state.)"""
+    _auth(request, "usage:read")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    fp = device_fingerprint_from_request(request.headers, body)
+    meta = licensing.resolve(fp, consume=False) if fp else None
+    return JSONResponse({"ok": True, "status": LicenseService.ui_metadata(meta) if meta else {}})
+
+
+@app.post("/v1/license/activate")
+async def license_activate_v1(request: Request) -> JSONResponse:
+    """Boss-spec activation path: bind a license key to this device (header or body fingerprint)."""
+    _auth(request, "messages:write")
+    assert_csrf_for_browser_mutation(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    dh = _device_hash(request, body)
+    if not dh:
+        raise HTTPException(status_code=400, detail="a device fingerprint is required to activate")
+    key = (body or {}).get("license_key")
+    if not key:
+        raise HTTPException(status_code=400, detail="license_key is required")
+    res = store.activate_device_binding(raw_key=key, device_hash=dh)
+    if not res.get("ok"):
+        raise HTTPException(status_code=400, detail=f"could not activate license: {res.get('reason')}")
+    return JSONResponse({"ok": True, "tier": res["tier"], "current_period_end": res.get("current_period_end"),
+                         "device_hash_prefix": dh[:12]})
+
+
+@app.post("/v1/admin/licenses/issue")
+async def admin_issue_license(request: Request) -> JSONResponse:
+    """Admin/dev: mint a Pro license WITHOUT Stripe (manual grant / demo / website-redeem backend).
+    Requires an admin scope (local dev is admin-by-default). The raw key is returned once."""
+    _auth(request, "keys:admin")
+    assert_csrf_for_browser_mutation(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    res = store.issue_license(
+        stripe_checkout_session_id=None, stripe_customer_id=None, stripe_subscription_id=None,
+        tier=(body or {}).get("plan") or "pro", current_period_end=None,
+        device_hash=_device_hash(request, body),  # bind immediately if a fingerprint is present
+    )
+    return JSONResponse({"ok": True, "license_key": res.get("license_key"), "license_id": res.get("id"),
+                         "tier": res.get("tier", "pro")})
+
+
+@app.get("/v1/admin/licenses")
+def admin_list_licenses(request: Request) -> dict[str, Any]:
+    """Admin: list issued licenses (hashes/prefixes only — no raw keys)."""
+    _auth(request, "keys:admin")
+    return {"licenses": store.list_licenses()}
 
 
 @app.post("/v1/billing/portal")
@@ -1101,7 +1181,7 @@ async def anthropic_messages_proxy(request: Request, payload: MessagesRequest) -
     # mode='off' (the request still reaches Claude, just uncompressed).
     license_meta = None
     if not rate_limits._metered(principal):
-        license_meta = licensing.resolve(request.headers.get(DEVICE_HEADER))
+        license_meta = licensing.resolve(device_fingerprint_from_request(request.headers, body))
         if license_meta and not license_meta["compress"]:
             mode = "off"
     raw_estimate = estimate_tokens(body.get("messages")) + estimate_tokens(body.get("system")) + estimate_tokens(body.get("tools"))
@@ -1198,6 +1278,8 @@ async def anthropic_messages_proxy(request: Request, payload: MessagesRequest) -
     if (settings.return_proxy_metadata or request.headers.get("x-decompute-metadata", "false").lower() == "true") and isinstance(body_out, dict):
         body_out = dict(body_out)
         body_out["decompute"] = {"yscompress": comp.to_dict(), "yellowstone": plan.to_dict(), "request_id": request_id, "upstream_request_id": result.upstream_request_id}
+        if license_meta:
+            body_out["decompute"]["license"] = LicenseService.ui_metadata(license_meta)
     headers.update(_response_headers(request_id=request_id, comp=comp, plan=plan, upstream_request_id=result.upstream_request_id))
     # Re-apply the CCR-adjusted token counts AFTER _response_headers (which regenerates
     # them from the pre-retrieval plan) so the header matches what was actually sent.

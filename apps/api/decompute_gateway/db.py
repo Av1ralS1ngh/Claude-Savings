@@ -517,6 +517,18 @@ class Store:
         return {"tier": "free", "license_status": "none", "current_period_end": None,
                 "quota_used": q["used"], "quota_remaining": q["remaining"], "free_quota_limit": q["limit"]}
 
+    def list_licenses(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        """Admin listing — never exposes the raw key (only the stored HMAC + metadata)."""
+        with self.session() as s:
+            rows = s.execute(select(License).order_by(License.issued_at.desc()).limit(limit)).scalars().all()
+            out = []
+            for lic in rows:
+                d = self.license_to_dict(lic)
+                d["bound_device_hash"] = (lic.bound_device_hash[:12] + "…") if lic.bound_device_hash else None
+                d["stripe_checkout_session_id"] = lic.stripe_checkout_session_id
+                out.append(d)
+            return out
+
     def mark_stripe_event(self, event_id: str | None, event_type: str | None = None) -> bool:
         """Record a webhook event id once. Returns True if newly recorded (process it), False if
         already seen (skip) — prevents a redelivered event from double-issuing a license."""

@@ -14,7 +14,7 @@ import datetime as dt
 from decompute_gateway.billing import BillingError, BillingService
 from decompute_gateway.config import Settings
 from decompute_gateway.db import Store
-from decompute_gateway.licensing import LicenseService
+from decompute_gateway.licensing import LicenseService, device_fingerprint_from_request
 import pytest
 
 
@@ -221,6 +221,71 @@ def test_device_purchase_does_not_change_project_tier(tmp_path):
                       "data": {"object": {"id": "cs_iso", "customer": "cus_1", "subscription": "sub_1",
                                           "metadata": {"project_id": "proj_default", "device_hash": dh}}}})
     assert st.get_project_tier("proj_default") == "free"  # project tier untouched
+
+
+# ── desktop-app license contract (headers + modal) ──────────────────────────
+
+class _Hdr(dict):
+    def get(self, k, d=None):
+        return dict.get(self, k, d)
+
+
+def test_device_fingerprint_multi_source():
+    assert device_fingerprint_from_request(_Hdr({"x-decompute-device-fingerprint": "a"})) == "a"
+    assert device_fingerprint_from_request(_Hdr({"x-decompute-device": "b"})) == "b"
+    assert device_fingerprint_from_request(_Hdr({"x-decompute-machine-id": "c"})) == "c"
+    assert device_fingerprint_from_request(_Hdr({}), {"decompute": {"device_fingerprint": "d"}}) == "d"
+    assert device_fingerprint_from_request(_Hdr({})) is None
+
+
+def test_contract_headers_and_modal(tmp_path):
+    st = _store(_settings(tmp_path, free_compression_quota=2))
+    lic = LicenseService(st.settings, st)
+    # under quota -> compression allowed, no modal, upgrade url present
+    m1 = lic.resolve("dev-c")
+    h1 = LicenseService.decision_headers(m1)
+    assert h1["x-decompute-license-plan"] == "free"
+    assert h1["x-decompute-compression-allowed"] == "true"
+    assert h1["x-decompute-quota-free-remaining"] == "1"
+    assert h1["x-decompute-upgrade-url"].startswith("https://decompute.ai/pro")
+    assert LicenseService.ui_metadata(m1)["ui"]["show_modal"] is False
+    # exhaust -> paused, modal with both actions
+    lic.resolve("dev-c")
+    m3 = lic.resolve("dev-c")
+    h3 = LicenseService.decision_headers(m3)
+    assert h3["x-decompute-compression-paused"] == "true"
+    assert h3["x-decompute-license-reason"] == "free_quota_exhausted"
+    assert h3["x-decompute-compression-paused-until"]  # non-empty reset time
+    ui = LicenseService.ui_metadata(m3)["ui"]
+    assert ui["show_modal"] is True
+    assert {a["id"] for a in ui["actions"]} == {"continue_without_pro", "continue_with_pro"}
+
+
+def test_admin_issue_then_activate(tmp_path):
+    """No-Stripe admin grant: issue a key, activate it on a device, device becomes Pro."""
+    st = _store(_settings(tmp_path))
+    lic = LicenseService(st.settings, st)
+    issued = st.issue_license(stripe_checkout_session_id=None, stripe_customer_id=None,
+                              stripe_subscription_id=None, tier="pro", current_period_end=None)
+    key = issued["license_key"]
+    assert key and key.startswith("DCMP-")
+    dh = st.hash_device_fingerprint("dev-admin")
+    assert st.activate_device_binding(raw_key=key, device_hash=dh)["ok"]
+    assert lic.resolve("dev-admin")["plan"] == "pro"
+    assert lic.resolve("dev-admin")["compression_allowed"] is True
+
+
+def test_pro_decision_has_no_modal(tmp_path):
+    st = _store(_settings(tmp_path, free_compression_quota=1))
+    lic = LicenseService(st.settings, st)
+    dh = st.hash_device_fingerprint("dev-prom")
+    import datetime as _d
+    st.issue_license(stripe_checkout_session_id="cs_pm", stripe_customer_id="c", stripe_subscription_id="s",
+                     current_period_end=_d.datetime.now(_d.timezone.utc) + _d.timedelta(days=30), device_hash=dh)
+    m = lic.resolve("dev-prom")
+    assert m["plan"] == "pro"
+    assert LicenseService.decision_headers(m)["x-decompute-license-status"] == "active"
+    assert LicenseService.ui_metadata(m)["ui"]["show_modal"] is False
 
 
 # ── end-to-end request path (the load-bearing hook) ──────────────────────────

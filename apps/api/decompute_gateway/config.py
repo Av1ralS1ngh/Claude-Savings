@@ -134,6 +134,10 @@ class Settings:
     free_compression_quota: int = _int("DECOMPUTE_FREE_COMPRESSION_QUOTA", 100)
     free_quota_window: str = os.getenv("DECOMPUTE_FREE_QUOTA_WINDOW", "daily")  # daily | lifetime
     device_license_tier: str = os.getenv("DECOMPUTE_DEVICE_LICENSE_TIER", "pro")
+    # Purchase site the upgrade modal/CLI sends the user to, and the app deep-link to return to.
+    pro_upgrade_url: str = os.getenv("DECOMPUTE_PRO_UPGRADE_URL", "https://decompute.ai/pro")
+    pro_upgrade_return_to: str | None = os.getenv("DECOMPUTE_PRO_UPGRADE_RETURN_TO", "decompute://license/activate")
+    license_max_devices: int = _int("DECOMPUTE_LICENSE_MAX_DEVICES", 1)
 
     @property
     def billing_enabled(self) -> bool:
