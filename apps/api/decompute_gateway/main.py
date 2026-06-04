@@ -1037,7 +1037,10 @@ async def license_activate_v1(request: Request) -> JSONResponse:
 @app.post("/v1/admin/licenses/issue")
 async def admin_issue_license(request: Request) -> JSONResponse:
     """Admin/dev: mint a Pro license WITHOUT Stripe (manual grant / demo / website-redeem backend).
-    Requires an admin scope (local dev is admin-by-default). The raw key is returned once."""
+    OFF by default (DECOMPUTE_ENABLE_ADMIN_LICENSE_ISSUE) so it can't be a free-Pro bypass on a
+    self-hosted/local_noauth gateway; also requires an admin scope. The raw key is returned once."""
+    if not settings.enable_admin_license_issue:
+        raise HTTPException(status_code=403, detail="admin license issuance is disabled (set DECOMPUTE_ENABLE_ADMIN_LICENSE_ISSUE=true to enable)")
     _auth(request, "keys:admin")
     assert_csrf_for_browser_mutation(request)
     try:

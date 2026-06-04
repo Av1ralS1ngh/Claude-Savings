@@ -138,6 +138,10 @@ class Settings:
     pro_upgrade_url: str = os.getenv("DECOMPUTE_PRO_UPGRADE_URL", "https://decompute.ai/pro")
     pro_upgrade_return_to: str | None = os.getenv("DECOMPUTE_PRO_UPGRADE_RETURN_TO", "decompute://license/activate")
     license_max_devices: int = _int("DECOMPUTE_LICENSE_MAX_DEVICES", 1)
+    # Admin/dev license minting (no-Stripe grant) is OFF by default: on a self-hosted gateway the
+    # default principal is local_noauth/admin, so an open endpoint would be a free-Pro button.
+    # Enable only for manual ops / demos behind real admin auth.
+    enable_admin_license_issue: bool = _bool("DECOMPUTE_ENABLE_ADMIN_LICENSE_ISSUE", False)
 
     @property
     def billing_enabled(self) -> bool:

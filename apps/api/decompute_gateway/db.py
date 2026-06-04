@@ -473,29 +473,40 @@ class Store:
     def try_consume_free_quota(self, device_hash: str, *, limit: int | None = None, now: datetime | None = None) -> dict[str, Any]:
         """Atomically consume one free-tier compression for this device in the current window.
         Returns {consumed, used, limit, remaining}. The count is server-authoritative and resets
-        per window (daily). consumed=False means the quota is spent -> caller degrades to mode=off."""
+        per window (daily). consumed=False means the quota is spent -> caller degrades to mode=off.
+
+        Concurrency-safe: a read-modify-write would lose updates under Postgres READ COMMITTED
+        (parallel requests all read used<limit and all grant), so the increment is a single
+        conditional UPDATE whose rowcount is the authoritative grant signal. The row lock means
+        two parallel requests cannot both satisfy `compressions_used < limit`.
+        """
         limit = int(self.settings.free_compression_quota) if limit is None else int(limit)
         wk = self._quota_window(now)
-        for _attempt in range(2):  # one retry for the first-insert race
-            try:
-                with self.session() as s:
-                    row = s.execute(select(DeviceQuota).where(DeviceQuota.device_hash == device_hash)).scalar_one_or_none()
-                    if row is None:
-                        row = DeviceQuota(id=self._id("devq"), device_hash=device_hash, compressions_used=0, window_date=wk)
-                        s.add(row)
-                        s.flush()
-                    if row.window_date != wk:  # window rolled over -> reset
-                        row.window_date = wk
-                        row.compressions_used = 0
-                    if row.compressions_used < limit:
-                        row.compressions_used += 1
-                        row.updated_at = utc_ts()
-                        used = row.compressions_used
-                        return {"consumed": True, "used": used, "limit": limit, "remaining": max(0, limit - used)}
-                    return {"consumed": False, "used": row.compressions_used, "limit": limit, "remaining": 0}
-            except IntegrityError:
-                continue  # another request inserted the row first; retry reads it
-        return {"consumed": False, "used": limit, "limit": limit, "remaining": 0}
+        # 1. Ensure the device's quota row exists (best-effort; tolerate the concurrent-insert race).
+        try:
+            with self.session() as s:
+                if not s.execute(select(DeviceQuota.id).where(DeviceQuota.device_hash == device_hash)).first():
+                    s.add(DeviceQuota(id=self._id("devq"), device_hash=device_hash, compressions_used=0, window_date=wk))
+        except IntegrityError:
+            pass  # another request created it first
+        # 2. Reset a rolled-over window, then ATOMICALLY increment iff still under the limit.
+        with self.session() as s:
+            s.execute(
+                update(DeviceQuota)
+                .where(DeviceQuota.device_hash == device_hash, DeviceQuota.window_date != wk)
+                .values(window_date=wk, compressions_used=0, updated_at=utc_ts())
+            )
+            res = s.execute(
+                update(DeviceQuota)
+                .where(DeviceQuota.device_hash == device_hash,
+                       DeviceQuota.window_date == wk,
+                       DeviceQuota.compressions_used < limit)
+                .values(compressions_used=DeviceQuota.compressions_used + 1, updated_at=utc_ts())
+            )
+            consumed = (res.rowcount == 1)
+            used = s.execute(select(DeviceQuota.compressions_used).where(DeviceQuota.device_hash == device_hash)).scalar_one_or_none() or 0
+        used = int(used)
+        return {"consumed": consumed, "used": used, "limit": limit, "remaining": max(0, limit - used)}
 
     def get_device_quota(self, device_hash: str, *, limit: int | None = None, now: datetime | None = None) -> dict[str, Any]:
         limit = int(self.settings.free_compression_quota) if limit is None else int(limit)
