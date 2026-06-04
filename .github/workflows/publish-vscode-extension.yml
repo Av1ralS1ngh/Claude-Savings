@@ -1,0 +1,41 @@
+name: Publish VS Code extension
+
+# Publishes the Decompute extension to the VS Code Marketplace and Open VSX (for
+# Cursor/VSCodium) when a tag like vscode-v0.1.0 is pushed, or on manual dispatch.
+# Requires repo secrets: VSCE_PAT (Marketplace) and OVSX_PAT (Open VSX).
+on:
+  push:
+    tags: ["vscode-v*"]
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: apps/vscode-extension
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm ci || npm install
+      - run: npm run typecheck
+      - run: npm run build:min
+      - name: Package
+        run: npx --yes @vscode/vsce@latest package --no-dependencies -o decompute.vsix
+      - uses: actions/upload-artifact@v4
+        with:
+          name: decompute-vsix
+          path: apps/vscode-extension/decompute.vsix
+      - name: Publish to VS Code Marketplace
+        if: env.VSCE_PAT != ''
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: npx --yes @vscode/vsce@latest publish --no-dependencies --packagePath decompute.vsix
+      - name: Publish to Open VSX
+        if: env.OVSX_PAT != ''
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+        run: npx --yes ovsx publish decompute.vsix -p "$OVSX_PAT"

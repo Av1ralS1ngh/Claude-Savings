@@ -1,0 +1,60 @@
+{
+  "name": "decompute",
+  "displayName": "Decompute — Claude optimizer",
+  "description": "Route Claude Code through the Decompute gateway: compress context, cut tokens, BYOK. Free 100 compressions/day; Pro for unlimited fair-use.",
+  "version": "0.1.0",
+  "publisher": "decompute",
+  "license": "SEE LICENSE IN LICENSE",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["AI", "Machine Learning", "Other"],
+  "keywords": ["claude", "anthropic", "claude code", "tokens", "compression"],
+  "repository": { "type": "git", "url": "https://github.com/Decompute-AI/Claude-Coder" },
+  "activationEvents": ["onStartupFinished"],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      { "command": "decompute.activate", "title": "Decompute: Activate Pro License" },
+      { "command": "decompute.upgrade", "title": "Decompute: Upgrade to Pro" },
+      { "command": "decompute.status", "title": "Decompute: Show Status" },
+      { "command": "decompute.setKey", "title": "Decompute: Set Claude (Anthropic) Key" },
+      { "command": "decompute.rewire", "title": "Decompute: Re-wire Terminal Routing" },
+      { "command": "decompute.openDashboard", "title": "Decompute: Open Dashboard" }
+    ],
+    "configuration": {
+      "title": "Decompute",
+      "properties": {
+        "decompute.gatewayUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:8080",
+          "description": "Decompute gateway base URL."
+        },
+        "decompute.autoWireTerminal": {
+          "type": "boolean",
+          "default": true,
+          "description": "Inject ANTHROPIC_BASE_URL + Decompute session/device headers into integrated terminals so Claude Code routes through the gateway. The Claude key is never written here."
+        },
+        "decompute.pollSeconds": {
+          "type": "number",
+          "default": 60,
+          "description": "How often (seconds) to refresh license/quota status in the status bar."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "esbuild src/extension.ts --bundle --platform=node --target=node18 --external:vscode --outfile=dist/extension.js",
+    "build:min": "npm run build -- --minify",
+    "watch": "npm run build -- --sourcemap --watch",
+    "typecheck": "tsc --noEmit",
+    "package": "vsce package --no-dependencies",
+    "publish": "vsce publish --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.0.0",
+    "esbuild": "^0.21.5",
+    "typescript": "^5.4.5"
+  }
+}
