@@ -7,9 +7,15 @@ Claude keeps working, just uncompressed. **Pro** removes the limit.
 
 ## What it does
 
-- **Auto-wires routing.** Sets `ANTHROPIC_BASE_URL` + Decompute session/device headers on your
-  integrated terminals (via VS Code's environment API — your Claude key is *never* written to
-  `settings.json`). Open a terminal, run `claude`, and you're routed.
+- **Auto-wires routing — terminal *and* the Claude Code panel.** Sets `ANTHROPIC_BASE_URL` +
+  Decompute device header so traffic flows through the gateway:
+  - the **Claude Code CLI** in integrated terminals (via VS Code's environment API), and
+  - the **Claude Code VS Code extension** (panel) via an `env` block merged into
+    `~/.claude/settings.json` (your other Claude Code settings are preserved; the routing is
+    removed automatically when this extension is disabled, so Claude Code never gets stranded on
+    a stopped gateway). Toggle with `decompute.routeClaudeCodePanel`.
+
+  Your Claude key is *never* written into either — it's read from `~/.decompute/claude.key`.
 - **Status bar.** Shows `Decompute Pro` or `Decompute 45/100` (compressions left today). Click for actions.
 - **Upgrade modal.** When the free quota is spent, prompts: *Upgrade to Pro* / *Activate Key* /
   *Continue without Pro*. Reads the gateway's license contract (`/v1/license/status`).

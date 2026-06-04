@@ -9,6 +9,11 @@ import { randomUUID } from "crypto";
 const CONFIG_DIR = path.join(os.homedir(), ".decompute");
 const DEVICE_ID_FILE = path.join(CONFIG_DIR, "device.id");
 const KEY_FILE = path.join(CONFIG_DIR, "claude.key");
+// Claude Code reads an `env` block from ~/.claude/settings.json and applies it to EVERY session —
+// both the terminal CLI and the Claude Code VS Code extension panel. Writing the routing env here
+// is what makes "Claude Code in VS Code" go through the gateway, not just terminals.
+const CLAUDE_SETTINGS = path.join(os.homedir(), ".claude", "settings.json");
+const MANAGED_ENV_KEYS = ["ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS"] as const;
 
 function cfg<T>(key: string, dflt: T): T {
   return vscode.workspace.getConfiguration("decompute").get<T>(key, dflt);
@@ -60,6 +65,7 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(statusBar);
 
   wireTerminal(context);
+  wireClaudeSettings();   // route the Claude Code panel + CLI through the gateway
 
   context.subscriptions.push(
     vscode.commands.registerCommand("decompute.activate", () => activateLicense()),
@@ -68,7 +74,13 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("decompute.setKey", () => setKey(context)),
     vscode.commands.registerCommand("decompute.rewire", () => {
       wireTerminal(context);
-      vscode.window.showInformationMessage("Decompute: terminal routing re-wired. Open a new terminal.");
+      wireClaudeSettings();
+      vscode.window.showInformationMessage("Decompute: Claude Code routing re-wired. Reload the Claude Code panel / open a new terminal.");
+    }),
+    vscode.commands.registerCommand("decompute.disableRouting", () => {
+      context.environmentVariableCollection.clear();
+      unwireClaudeSettings();
+      vscode.window.showInformationMessage("Decompute: routing disabled — Claude Code goes directly to Anthropic again.");
     }),
     vscode.commands.registerCommand("decompute.openDashboard", () =>
       vscode.env.openExternal(vscode.Uri.parse(gatewayUrl() + "/dashboard"))
@@ -104,6 +116,9 @@ export function activate(context: vscode.ExtensionContext): void {
 
 export function deactivate(): void {
   if (timer) clearInterval(timer);
+  // Revert the Claude Code settings env so a disabled/removed extension never leaves Claude Code
+  // pointed at a (possibly stopped) gateway. The terminal collection is auto-cleaned by VS Code.
+  unwireClaudeSettings();
 }
 
 function wireTerminal(context: vscode.ExtensionContext): void {
@@ -118,6 +133,36 @@ function wireTerminal(context: vscode.ExtensionContext): void {
   // The BYOK Claude key is intentionally NOT written here. It is read from
   // ~/.decompute/claude.key by the shell at launch, or injected per-session by "Set Claude Key".
   col.description = "Routes Claude Code through the Decompute gateway (base URL + session/device headers).";
+}
+
+function readJson(p: string): any {
+  try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return {}; }
+}
+
+// Route the Claude Code VS Code extension (and CLI) through the gateway by adding an `env` block
+// to ~/.claude/settings.json. Idempotent + preserves the user's other settings (theme/effort/etc).
+function wireClaudeSettings(): void {
+  if (!cfg("routeClaudeCodePanel", true)) return;
+  const s = readJson(CLAUDE_SETTINGS);
+  if (typeof s !== "object" || s === null) return;
+  const env = (s.env && typeof s.env === "object") ? s.env : {};
+  const headers = `x-decompute-device: ${loadDeviceId()}`;
+  if (env.ANTHROPIC_BASE_URL === gatewayUrl() && env.ANTHROPIC_CUSTOM_HEADERS === headers) return; // already wired
+  s.env = { ...env, ANTHROPIC_BASE_URL: gatewayUrl(), ANTHROPIC_CUSTOM_HEADERS: headers };
+  try {
+    fs.mkdirSync(path.dirname(CLAUDE_SETTINGS), { recursive: true });
+    fs.writeFileSync(CLAUDE_SETTINGS, JSON.stringify(s, null, 2) + "\n");
+  } catch { /* best effort */ }
+}
+
+// Remove only the keys we manage, so disabling/uninstalling reverts Claude Code to direct routing
+// (otherwise a stale base URL to a stopped gateway would break Claude Code).
+function unwireClaudeSettings(): void {
+  const s = readJson(CLAUDE_SETTINGS);
+  if (!s || typeof s.env !== "object") return;
+  for (const k of MANAGED_ENV_KEYS) delete s.env[k];
+  if (Object.keys(s.env).length === 0) delete s.env;
+  try { fs.writeFileSync(CLAUDE_SETTINGS, JSON.stringify(s, null, 2) + "\n"); } catch { /* best effort */ }
 }
 
 async function refresh(): Promise<void> {

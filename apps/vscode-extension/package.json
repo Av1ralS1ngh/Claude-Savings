@@ -17,7 +17,8 @@
       { "command": "decompute.upgrade", "title": "Decompute: Upgrade to Pro" },
       { "command": "decompute.status", "title": "Decompute: Show Status" },
       { "command": "decompute.setKey", "title": "Decompute: Set Claude (Anthropic) Key" },
-      { "command": "decompute.rewire", "title": "Decompute: Re-wire Terminal Routing" },
+      { "command": "decompute.rewire", "title": "Decompute: Re-wire Claude Code Routing" },
+      { "command": "decompute.disableRouting", "title": "Decompute: Disable Routing (go direct)" },
       { "command": "decompute.openDashboard", "title": "Decompute: Open Dashboard" }
     ],
     "configuration": {
@@ -31,7 +32,12 @@
         "decompute.autoWireTerminal": {
           "type": "boolean",
           "default": true,
-          "description": "Inject ANTHROPIC_BASE_URL + Decompute session/device headers into integrated terminals so Claude Code routes through the gateway. The Claude key is never written here."
+          "description": "Inject ANTHROPIC_BASE_URL + Decompute session/device headers into integrated terminals so the Claude Code CLI routes through the gateway. The Claude key is never written here."
+        },
+        "decompute.routeClaudeCodePanel": {
+          "type": "boolean",
+          "default": true,
+          "description": "Add a routing env block to ~/.claude/settings.json so the Claude Code VS Code extension (and CLI) route through the gateway. Reverted automatically when the extension is disabled. Turn off to leave Claude Code's settings untouched."
         },
         "decompute.pollSeconds": {
           "type": "number",
