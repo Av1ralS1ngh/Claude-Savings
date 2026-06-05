@@ -47,10 +47,34 @@ def json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+def _request_has_cache_control(body: dict[str, Any]) -> bool:
+    """True if the client already manages prompt caching anywhere (top-level, system blocks,
+    tools, or message content blocks). Claude Code sets cache_control (incl. ttl='1h') itself."""
+    if "cache_control" in body:
+        return True
+    sysv = body.get("system")
+    if isinstance(sysv, list) and any(isinstance(b, dict) and b.get("cache_control") for b in sysv):
+        return True
+    for t in (body.get("tools") or []):
+        if isinstance(t, dict) and t.get("cache_control"):
+            return True
+    for m in (body.get("messages") or []):
+        c = m.get("content") if isinstance(m, dict) else None
+        if isinstance(c, list) and any(isinstance(b, dict) and b.get("cache_control") for b in c):
+            return True
+    return False
+
+
 def maybe_apply_prompt_cache(body: dict[str, Any], mode: str) -> dict[str, Any]:
     if mode == "off":
         return body
-    if mode == "passthrough" and "cache_control" not in body:
+    # Never override the client's caching. Claude Code marks blocks with cache_control (e.g.
+    # ttl='1h'); adding a top-level cache_control (ttl 5m) makes Anthropic 400 with
+    # "ttl='5m' but the target block already has cache_control with ttl='1h'". When the client
+    # already manages caching anywhere, pass through untouched.
+    if _request_has_cache_control(body):
+        return body
+    if mode == "passthrough":
         return body
     out = copy.deepcopy(body)
     out.setdefault("cache_control", {"type": "ephemeral"})
