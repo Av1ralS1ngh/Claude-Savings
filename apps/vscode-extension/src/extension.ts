@@ -64,20 +64,26 @@ export function activate(context: vscode.ExtensionContext): void {
   statusBar.command = "decompute.status";
   context.subscriptions.push(statusBar);
 
-  wireTerminal(context);
-  wireClaudeSettings();   // route the Claude Code panel + CLI through the gateway
+  // SAFE BY DEFAULT: never redirect Claude Code unless the user explicitly opted in. This also
+  // self-heals — if a prior version left a routing block, an "off" config cleans it up here.
+  wireTerminal(context); // no-ops (clears the collection) when autoWireTerminal is off
+  if (cfg("routeClaudeCodePanel", false)) wireClaudeSettings(); else unwireClaudeSettings();
 
   context.subscriptions.push(
     vscode.commands.registerCommand("decompute.activate", () => activateLicense()),
     vscode.commands.registerCommand("decompute.upgrade", () => upgrade()),
     vscode.commands.registerCommand("decompute.status", () => showStatus()),
     vscode.commands.registerCommand("decompute.setKey", () => setKey(context)),
+    vscode.commands.registerCommand("decompute.enableRouting", () => enableRouting(context)),
     vscode.commands.registerCommand("decompute.rewire", () => {
       wireTerminal(context);
-      wireClaudeSettings();
+      if (cfg("routeClaudeCodePanel", false)) wireClaudeSettings();
       vscode.window.showInformationMessage("Decompute: Claude Code routing re-wired. Reload the Claude Code panel / open a new terminal.");
     }),
-    vscode.commands.registerCommand("decompute.disableRouting", () => {
+    vscode.commands.registerCommand("decompute.disableRouting", async () => {
+      const conf = vscode.workspace.getConfiguration("decompute");
+      await conf.update("autoWireTerminal", false, vscode.ConfigurationTarget.Global);
+      await conf.update("routeClaudeCodePanel", false, vscode.ConfigurationTarget.Global);
       context.environmentVariableCollection.clear();
       unwireClaudeSettings();
       vscode.window.showInformationMessage("Decompute: routing disabled — Claude Code goes directly to Anthropic again.");
@@ -86,6 +92,8 @@ export function activate(context: vscode.ExtensionContext): void {
       vscode.env.openExternal(vscode.Uri.parse(gatewayUrl() + "/dashboard"))
     ),
   );
+
+  maybeWelcome(context);
 
   // Deep-link activation from the purchase success page or desktop app:
   //   vscode://decompute.decompute/activate?key=DCMP-...
@@ -119,6 +127,37 @@ export function deactivate(): void {
   // Revert the Claude Code settings env so a disabled/removed extension never leaves Claude Code
   // pointed at a (possibly stopped) gateway. The terminal collection is auto-cleaned by VS Code.
   unwireClaudeSettings();
+}
+
+function maybeWelcome(context: vscode.ExtensionContext): void {
+  if (context.globalState.get("decompute.welcomed")) return;
+  void context.globalState.update("decompute.welcomed", true);
+  void vscode.window
+    .showInformationMessage(
+      "Decompute installed. Claude Code routing is OFF by default. Enable it to compress through the gateway — note: routing needs a funded Anthropic API key (BYOK), not a claude.ai subscription.",
+      "Enable Routing",
+      "Not now"
+    )
+    .then((pick) => {
+      if (pick === "Enable Routing") void enableRouting(context);
+    });
+}
+
+async function enableRouting(context: vscode.ExtensionContext): Promise<void> {
+  const ok = await vscode.window.showWarningMessage(
+    "Route Claude Code through the Decompute gateway?\n\nThis requires a funded Anthropic API key (BYOK). If you use a claude.ai subscription, routing switches billing to the API key and will FAIL if it has no credits.",
+    { modal: true },
+    "Enable Routing"
+  );
+  if (ok !== "Enable Routing") return;
+  const conf = vscode.workspace.getConfiguration("decompute");
+  await conf.update("autoWireTerminal", true, vscode.ConfigurationTarget.Global);
+  await conf.update("routeClaudeCodePanel", true, vscode.ConfigurationTarget.Global);
+  wireTerminal(context);
+  wireClaudeSettings();
+  void vscode.window.showInformationMessage(
+    "Decompute routing enabled. Reload the Claude Code panel / open a new terminal. Disable anytime via 'Decompute: Disable Routing'."
+  );
 }
 
 function wireTerminal(context: vscode.ExtensionContext): void {

@@ -1,25 +1,67 @@
 {
   "name": "decompute",
-  "displayName": "Decompute — Claude optimizer",
+  "displayName": "Decompute \u2014 Claude optimizer",
   "description": "Route Claude Code through the Decompute gateway: compress context, cut tokens, BYOK. Free 100 compressions/day; Pro for unlimited fair-use.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "decompute",
   "license": "SEE LICENSE IN LICENSE",
-  "engines": { "vscode": "^1.85.0" },
-  "categories": ["AI", "Machine Learning", "Other"],
-  "keywords": ["claude", "anthropic", "claude code", "tokens", "compression"],
-  "repository": { "type": "git", "url": "https://github.com/Decompute-AI/Claude-Coder" },
-  "activationEvents": ["onStartupFinished"],
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "AI",
+    "Machine Learning",
+    "Other"
+  ],
+  "keywords": [
+    "claude",
+    "anthropic",
+    "claude code",
+    "tokens",
+    "compression"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Decompute-AI/Claude-Coder"
+  },
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
-      { "command": "decompute.activate", "title": "Decompute: Activate Pro License" },
-      { "command": "decompute.upgrade", "title": "Decompute: Upgrade to Pro" },
-      { "command": "decompute.status", "title": "Decompute: Show Status" },
-      { "command": "decompute.setKey", "title": "Decompute: Set Claude (Anthropic) Key" },
-      { "command": "decompute.rewire", "title": "Decompute: Re-wire Claude Code Routing" },
-      { "command": "decompute.disableRouting", "title": "Decompute: Disable Routing (go direct)" },
-      { "command": "decompute.openDashboard", "title": "Decompute: Open Dashboard" }
+      {
+        "command": "decompute.activate",
+        "title": "Decompute: Activate Pro License"
+      },
+      {
+        "command": "decompute.upgrade",
+        "title": "Decompute: Upgrade to Pro"
+      },
+      {
+        "command": "decompute.status",
+        "title": "Decompute: Show Status"
+      },
+      {
+        "command": "decompute.setKey",
+        "title": "Decompute: Set Claude (Anthropic) Key"
+      },
+      {
+        "command": "decompute.enableRouting",
+        "title": "Decompute: Enable Routing (compress via gateway)"
+      },
+      {
+        "command": "decompute.rewire",
+        "title": "Decompute: Re-wire Claude Code Routing"
+      },
+      {
+        "command": "decompute.disableRouting",
+        "title": "Decompute: Disable Routing (go direct)"
+      },
+      {
+        "command": "decompute.openDashboard",
+        "title": "Decompute: Open Dashboard"
+      }
     ],
     "configuration": {
       "title": "Decompute",
@@ -31,13 +73,13 @@
         },
         "decompute.autoWireTerminal": {
           "type": "boolean",
-          "default": true,
-          "description": "Inject ANTHROPIC_BASE_URL + Decompute session/device headers into integrated terminals so the Claude Code CLI routes through the gateway. The Claude key is never written here."
+          "default": false,
+          "description": "Route the Claude Code CLI in integrated terminals through the gateway (ANTHROPIC_BASE_URL + Decompute headers). OFF by default \u2014 routing requires a funded Anthropic API key (BYOK); enable via 'Decompute: Enable Routing'. The Claude key is never written here."
         },
         "decompute.routeClaudeCodePanel": {
           "type": "boolean",
-          "default": true,
-          "description": "Add a routing env block to ~/.claude/settings.json so the Claude Code VS Code extension (and CLI) route through the gateway. Reverted automatically when the extension is disabled. Turn off to leave Claude Code's settings untouched."
+          "default": false,
+          "description": "Route the Claude Code VS Code panel (and CLI) through the gateway via an env block in ~/.claude/settings.json. OFF by default. WARNING: if you use a claude.ai subscription, routing switches billing to an API key and will fail if it has no credits. Reverted automatically when disabled."
         },
         "decompute.pollSeconds": {
           "type": "number",
