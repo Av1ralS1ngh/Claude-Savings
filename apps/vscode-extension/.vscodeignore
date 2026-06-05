@@ -6,3 +6,7 @@ tsconfig.json
 **/*.map
 **/*.ts
 .github/**
+test/**
+dist/settings.mjs
+PRODUCTION_REVIEW.md
+package-lock.json

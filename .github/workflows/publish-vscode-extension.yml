@@ -22,6 +22,7 @@ jobs:
           node-version: "20"
       - run: npm ci || npm install
       - run: npm run typecheck
+      - run: npm test          # gate release on the settings-safety suite (planWire/planUnwire data-loss guards)
       - run: npm run build:min
       - name: Package
         run: npx --yes @vscode/vsce@latest package --no-dependencies -o decompute.vsix

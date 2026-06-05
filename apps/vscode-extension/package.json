@@ -2,9 +2,9 @@
   "name": "decompute",
   "displayName": "Decompute \u2014 Claude optimizer",
   "description": "Route Claude Code through the Decompute gateway: compress context, cut tokens, BYOK. Free 100 compressions/day; Pro for unlimited fair-use.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "publisher": "decompute",
-  "license": "SEE LICENSE IN LICENSE",
+  "license": "MIT",
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -95,6 +95,7 @@
     "build:min": "npm run build -- --minify",
     "watch": "npm run build -- --sourcemap --watch",
     "typecheck": "tsc --noEmit",
+    "test": "esbuild src/settings.ts --bundle --format=esm --platform=node --outfile=dist/settings.mjs && node --test test/settings.test.mjs",
     "package": "vsce package --no-dependencies",
     "publish": "vsce publish --no-dependencies"
   },
