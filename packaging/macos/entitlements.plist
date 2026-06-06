@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    Hardened-runtime entitlements required for a PyInstaller one-file binary to pass
+    notarization. PyInstaller extracts the embedded CPython + libs to a temp dir at
+    launch and dlopen()s them, so the bundled-but-Developer-ID-signed runtime needs:
+      - disable-library-validation: load our own (not team-matched) bundled .so/.dylibs
+      - allow-unsigned-executable-memory / allow-jit: CPython's interpreter loop
+      - allow-dyld-environment-variables: the bootloader sets DYLD_* for the temp dir
+    Keep this minimal; do not add network/file entitlements (a CLI needs none).
+  -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+  <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+  <true/>
+</dict>
+</plist>

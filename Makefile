@@ -1,4 +1,4 @@
-.PHONY: setup dev smoke test docker-build docker-run sdk-obfuscate clean
+.PHONY: setup dev smoke test docker-build docker-run sdk-obfuscate macos-pkg clean
 
 setup:
 	python3 -m venv .venv
@@ -22,6 +22,11 @@ docker-run:
 
 sdk-obfuscate:
 	bash scripts/build_obfuscated_sdk.sh
+
+# Standalone macOS .pkg installer for the `decompute` CLI. Unsigned dry-run by default;
+# set OBFUSCATE=1 SIGN=1 + Developer ID / NOTARY_PROFILE for a shippable, notarized installer.
+macos-pkg:
+	bash scripts/build_macos_pkg.sh
 
 clean:
 	rm -rf .venv .decompute build dist *.egg-info packages/python-sdk/build packages/python-sdk/dist
