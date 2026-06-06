@@ -203,6 +203,10 @@ class Settings:
                 errors.append("Wildcard CORS with credentials is forbidden")
             if self.ccr_enabled and not self.ccr_encryption_key:
                 errors.append("DECOMPUTE_CCR_ENCRYPTION_KEY is required when CCR is enabled in production")
+            if self.billing_enabled and not self.stripe_webhook_secret:
+                # Without it the webhook 400s every event, so paid checkouts never grant a tier —
+                # customers pay and get nothing. Fail closed rather than ship a silent dead paywall.
+                errors.append("DECOMPUTE_STRIPE_WEBHOOK_SECRET must be set when billing is enabled in production")
             if not self.dashboard_auth_required:
                 errors.append("DECOMPUTE_DASHBOARD_AUTH_REQUIRED must be true in production")
             if self.local_student_training_enabled:
