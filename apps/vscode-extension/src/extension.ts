@@ -343,8 +343,11 @@ async function refresh(): Promise<void> {
     } else if (pro) {
       statusBar.text = "$(zap) Decompute Pro";
       statusBar.tooltip = "Routing ON · Pro — unlimited fair-use compression on this device.";
+    } else if (s.license_status === "paused" || s.compression_allowed === false) {
+      statusBar.text = "$(debug-pause) Decompute Paused";
+      statusBar.tooltip = "Routing ON · Free quota used up — compression is paused until reset. Claude still works (uncompressed). Click to upgrade or activate Pro.";
     } else {
-      statusBar.text = `$(zap) Decompute ${q.remaining ?? "–"}/${q.limit ?? "–"}`;
+      statusBar.text = `$(zap) Decompute Free ${q.remaining ?? "–"}/${q.limit ?? "–"}`;
       statusBar.tooltip = `Routing ON · Free tier: ${q.remaining ?? "?"} of ${q.limit ?? "?"} compressions left this window. Click for options.`;
     }
     statusBar.show();
@@ -432,9 +435,12 @@ async function showStatus(): Promise<void> {
     const pro = s.plan === "pro" || s.license_status === "active";
     const q = s.quota || {};
     const routeLine = routed ? "Routing: ON (→ gateway)" : "Routing: OFF (direct to Anthropic)";
+    const paused = !pro && (s.license_status === "paused" || s.compression_allowed === false);
     const planLine = pro
       ? "Plan: Pro (unlimited fair-use)"
-      : `Plan: Free — ${q.remaining ?? "?"}/${q.limit ?? "?"} compressions left this window`;
+      : paused
+        ? `Plan: Free — PAUSED (quota used up; resets next window). Claude still works, uncompressed.`
+        : `Plan: Free — ${q.remaining ?? "?"}/${q.limit ?? "?"} compressions left this window`;
     const actions = [
       routed ? "Disable Routing" : "Enable Routing",
       ...(pro ? [] : ["Upgrade to Pro", "Activate Key"]),

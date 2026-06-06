@@ -9,7 +9,8 @@
   no longer unwires); the terminal env-collection is non-persistent and rebuilt from settings on
   activate; **Disable Routing** clears only the keys we manage (never your `ANTHROPIC_API_KEY`),
   warns that already-running sessions keep routing until restarted, and reports if it couldn't
-  revert settings.json. The status bar now shows routing **ON/OFF** (and warns if on-but-gateway-down).
+  revert settings.json. The status bar now shows routing **ON/OFF** and the license state
+  (**Pro / Free N/limit / Paused**), and warns if routing is on but the gateway is unreachable.
   Enable/Disable Routing now offer a one-click **Reload Window** so the change applies to the
   already-open Claude Code panel immediately (it captures routing at session start, so a live
   session can't be re-routed without a reload).
