@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.3
+- **First-run onboarding:** the welcome and the "gateway not reachable" status now guide new users
+  with a **Get Started** action (and a `Decompute: Get Started` command) instead of dead-ending —
+  making clear the extension is a client to a Decompute gateway you need running.
+- **Marketplace listing:** added an extension icon and a top-of-README **Quick start** (get the
+  gateway → set your BYOK key → enable routing).
+
 ## 0.1.2
 - **Data-safety:** `~/.claude/settings.json` is never overwritten when it isn't valid JSON
   (comments/corrupt) — it's left untouched with a warning instead of being wiped. Writes are now

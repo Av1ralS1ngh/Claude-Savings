@@ -22,6 +22,14 @@ function gatewayUrl(): string {
   return cfg("gatewayUrl", "http://127.0.0.1:8080").replace(/\/+$/, "");
 }
 
+// Where "Get Started" points a first-time user who doesn't have the gateway running yet.
+// The extension is a CLIENT to a Decompute gateway; without one reachable, Claude Code just goes
+// straight to Anthropic (no compression) — so onboarding must explain how to get the gateway up.
+const SETUP_URL = "https://decompute.ai";
+function openSetup(): void {
+  void vscode.env.openExternal(vscode.Uri.parse(SETUP_URL));
+}
+
 // Cache the device id for the lifetime of the extension host. If the on-disk write fails
 // (e.g. ~/.decompute not writable) we must NOT mint a fresh id on every call — that would make
 // the device identity (and thus its license/quota) unstable. Cache the first value we resolve.
@@ -148,6 +156,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("decompute.openDashboard", () =>
       vscode.env.openExternal(vscode.Uri.parse(gatewayUrl() + "/dashboard"))
     ),
+    vscode.commands.registerCommand("decompute.getStarted", () => openSetup()),
   );
 
   maybeWelcome(context);
@@ -208,12 +217,15 @@ function maybeWelcome(context: vscode.ExtensionContext): void {
   void context.globalState.update("decompute.welcomed", true);
   void vscode.window
     .showInformationMessage(
-      "Decompute installed. Claude Code routing is OFF by default. Enable it to compress through the gateway — note: routing needs a funded Anthropic API key (BYOK), not a claude.ai subscription.",
+      "Decompute installed. It compresses Claude Code's context through a local Decompute gateway. " +
+        "You need the gateway running + a funded Anthropic key (BYOK) — routing stays OFF until you enable it. New here? Start with Get Started.",
+      "Get Started",
       "Enable Routing",
       "Not now"
     )
     .then((pick) => {
-      if (pick === "Enable Routing") void enableRouting(context);
+      if (pick === "Get Started") openSetup();
+      else if (pick === "Enable Routing") void enableRouting(context);
     });
 }
 
@@ -453,6 +465,17 @@ async function showStatus(): Promise<void> {
     else if (pick === "Activate Key") await activateLicense();
     else if (pick === "Open Dashboard") await vscode.env.openExternal(vscode.Uri.parse(gatewayUrl() + "/dashboard"));
   } catch {
-    vscode.window.showErrorMessage(`Decompute gateway not reachable at ${gatewayUrl()}.`);
+    // First-time / no-gateway path: don't dead-end on an error — guide the user to set it up.
+    const pick = await vscode.window.showWarningMessage(
+      `Decompute gateway not reachable at ${gatewayUrl()}. Start the Decompute gateway, then it works. ` +
+        `(Routing is currently ${routed ? "ON" : "OFF"}.)`,
+      "Get Started",
+      "Set Gateway URL",
+      routed ? "Disable Routing" : "Enable Routing"
+    );
+    if (pick === "Get Started") openSetup();
+    else if (pick === "Set Gateway URL") await vscode.commands.executeCommand("workbench.action.openSettings", "decompute.gatewayUrl");
+    else if (pick === "Enable Routing") await vscode.commands.executeCommand("decompute.enableRouting");
+    else if (pick === "Disable Routing") await vscode.commands.executeCommand("decompute.disableRouting");
   }
 }

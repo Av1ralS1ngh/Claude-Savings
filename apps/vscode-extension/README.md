@@ -5,6 +5,18 @@ Route **Claude Code** (and any Anthropic-API tool) in your VS Code terminal thro
 Claude, on your own key (BYOK). Free tier: **100 compressions/day per device**; over the limit
 Claude keeps working, just uncompressed. **Pro** removes the limit.
 
+## Quick start
+
+1. **Get the gateway running** — it does the compression; this extension is its VS Code client:
+   ```bash
+   pip install decompute-ai     # or the provided wheel
+   decompute init               # BYOK setup; starts the local gateway at 127.0.0.1:8080
+   ```
+2. In VS Code, run **Decompute: Set Claude (Anthropic) Key** (BYOK — stored at `~/.decompute/claude.key`, chmod 600).
+3. Run **Decompute: Enable Routing**. The status bar shows your tier (e.g. `Decompute Free 100/100`), and Claude Code now flows through the gateway and compresses.
+
+> **No gateway yet?** The status bar shows *Decompute off / not reachable* and Claude Code keeps working normally (uncompressed) — nothing breaks. Click the status bar → **Get Started**. Routing is **off until you enable it**, and it needs a funded Anthropic key (BYOK), not a claude.ai subscription.
+
 ## What it does
 
 - **Routes Claude Code through the gateway — terminal *and* the Claude Code panel.** **OFF by

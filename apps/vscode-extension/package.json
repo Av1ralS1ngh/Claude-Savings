@@ -2,7 +2,7 @@
   "name": "decompute",
   "displayName": "Decompute \u2014 Claude optimizer",
   "description": "Route Claude Code through the Decompute gateway: compress context, cut tokens, BYOK. Free 100 compressions/day; Pro for unlimited fair-use.",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "publisher": "decompute",
   "license": "MIT",
   "icon": "icon.png",
@@ -31,6 +31,10 @@
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
+      {
+        "command": "decompute.getStarted",
+        "title": "Decompute: Get Started"
+      },
       {
         "command": "decompute.activate",
         "title": "Decompute: Activate Pro License"
