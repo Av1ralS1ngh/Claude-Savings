@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import tempfile
 import tomllib
 import uuid
 from pathlib import Path
@@ -24,6 +26,62 @@ LEGACY_JSON = CONFIG_DIR / "config.json"
 CONFIG_PATH = CONFIG_TOML  # back-compat alias for callers that print the path
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8080"
+
+# Secret hygiene. The gateway is the authority on entitlements (it HMAC-hashes the device and
+# grants tier only from a signature-verified Stripe webhook), so these files are credential
+# CACHES, not a security boundary — the goal is owner-only, never-half-written, never-leaked.
+_DIR_MODE = 0o700     # owner-only dir: secret *filenames* aren't even world-listable
+_SECRET_MODE = 0o600  # owner-only files
+
+
+def _ensure_config_dir() -> Path:
+    """Create ~/.decompute owner-only, tightening perms even if it pre-existed looser."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        CONFIG_DIR.chmod(_DIR_MODE)
+    except Exception:
+        pass
+    return CONFIG_DIR
+
+
+def _write_secret(path: Path, value: str) -> Path:
+    """Atomically write a secret owner-only. mkstemp creates the temp file 0600 from the first
+    byte (no world-readable window the old write-then-chmod left), fsync + os.replace swap it in
+    so a crash never leaves a partial or default-perm secret on disk."""
+    _ensure_config_dir()
+    data = (value.strip() + "\n").encode("utf-8")
+    fd, tmp = tempfile.mkstemp(dir=str(CONFIG_DIR), prefix=path.name + ".", suffix=".tmp")
+    try:
+        os.fchmod(fd, _SECRET_MODE)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.close(fd)  # no-op (already closed by fdopen) on most paths; safe if fchmod failed
+        except OSError:
+            pass
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def _valid_secret(value: str | None) -> bool:
+    """Reject input that is obviously NOT a credential (empty, internal whitespace, control
+    chars, absurd length) — e.g. a pasted error message. The gateway validates real validity;
+    this only stops a malformed value from being persisted/sent. Deliberately lenient so a
+    well-formed server-issued key is never rejected."""
+    k = (value or "").strip()
+    if not (1 <= len(k) <= 256):
+        return False
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in k):
+        return False
+    return not any(c.isspace() for c in k)
 
 DEFAULTS: dict[str, Any] = {
     "gateway": {"base_url": DEFAULT_BASE_URL, "auto_start": True},
@@ -92,7 +150,7 @@ def _render_toml(cfg: dict) -> str:
 
 def save_config(updates: dict) -> Path:
     """Deep-merge nested updates into config.toml. NEVER write the Claude key here."""
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    _ensure_config_dir()  # owner-only dir, even if it pre-existed looser
     CONFIG_TOML.write_text(_render_toml(_deep_merge(load_config(), updates or {})), encoding="utf-8")
     return CONFIG_TOML
 
@@ -122,13 +180,9 @@ def load_claude_key() -> str | None:
 
 
 def save_claude_key(key: str) -> Path:
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    KEY_FILE.write_text(key.strip() + "\n", encoding="utf-8")
-    try:
-        KEY_FILE.chmod(0o600)  # the only real secret on disk — owner-only
-    except Exception:
-        pass
-    return KEY_FILE
+    if not _valid_secret(key):
+        raise ValueError("refusing to save a malformed Claude key")
+    return _write_secret(KEY_FILE, key)  # atomic, owner-only (0600), no world-readable window
 
 
 def clear_claude_key() -> None:
@@ -154,9 +208,7 @@ def load_device_id() -> str:
         pass
     device_id = "dev-" + uuid.uuid4().hex
     try:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        DEVICE_ID_FILE.write_text(device_id + "\n", encoding="utf-8")
-        DEVICE_ID_FILE.chmod(0o600)
+        _write_secret(DEVICE_ID_FILE, device_id)  # atomic, owner-only — the licensing unit
     except Exception:
         pass
     return device_id
@@ -173,13 +225,9 @@ def load_license_key() -> str | None:
 
 
 def save_license_key(key: str) -> Path:
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    LICENSE_FILE.write_text(key.strip() + "\n", encoding="utf-8")
-    try:
-        LICENSE_FILE.chmod(0o600)  # secret — owner-only, like claude.key
-    except Exception:
-        pass
-    return LICENSE_FILE
+    if not _valid_secret(key):
+        raise ValueError("refusing to save a malformed license key")
+    return _write_secret(LICENSE_FILE, key)  # atomic, owner-only (0600)
 
 
 def clear_license_key() -> None:
