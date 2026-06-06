@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import asyncio
 import csv
 import html
 import io
@@ -21,7 +22,7 @@ from .anthropic_provider import ProviderResult, call_anthropic_messages, count_t
 from .capabilities import capabilities_dict
 from .config import get_settings
 from .crypto import CCRCrypto
-from .db import Store
+from .db import ROLLING_MEDIAN_WINDOW, Store
 from .licensing import DEVICE_HEADER, LicenseService, device_fingerprint_from_request
 from .observability import BodySizeLimitMiddleware, RequestContextMiddleware, SecurityHeadersMiddleware, configure_logging, current_request_id, metrics_response, project_id_var
 from .pricing import cost_usd, savings_usd
@@ -234,6 +235,30 @@ def _usage_from_result(result: ProviderResult) -> dict[str, int]:
     }
 
 
+async def _real_token_baseline(model: str | None, body: dict[str, Any], *, upstream_key: str | None) -> int | None:
+    """Anthropic's real-tokenizer count of the UNCOMPRESSED prompt — the honest savings
+    denominator. The compressor's len/4 estimate undercounts ~5x vs Anthropic's tokenizer,
+    so comparing billed (real) compressed tokens against an estimated raw baseline mixes
+    rulers and floors genuine savings to 0%. count_tokens puts both sides on the same ruler.
+
+    Returns None on any failure (caller keeps the estimate). In mock mode count_tokens falls
+    back to the same estimator, so this is a consistent no-op there. Caller runs it CONCURRENTLY
+    with the generation call (it is far cheaper than generation) so it adds ~0 wall-time."""
+    try:
+        ct_body: dict[str, Any] = {"model": model, "messages": body.get("messages") or []}
+        if body.get("system"):
+            ct_body["system"] = body["system"]
+        if body.get("tools"):
+            ct_body["tools"] = body["tools"]
+        res = await count_tokens(ct_body, settings=settings, upstream_api_key=upstream_key)
+        if res.status_code < 400 and isinstance(res.body, dict):
+            n = int(res.body.get("input_tokens") or 0)
+            return n if n > 0 else None
+    except Exception as exc:
+        log.warning("count_tokens baseline failed; keeping estimate", extra={"extra": {"error": str(exc)}})
+    return None
+
+
 _SESSION_ID_ALLOWED = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
 
 
@@ -250,11 +275,20 @@ def _clean_session_id(raw: str | None) -> str | None:
     return cleaned or None
 
 
-def _record_usage(*, principal: AuthPrincipal, endpoint: str, model: str | None, raw_input_tokens: int, yscompress_input_tokens: int, yellowstone_final_input_tokens: int, output_tokens: int, cache_creation_input_tokens: int, cache_read_input_tokens: int, prompt_cache_mode: str, plan: Any, request_id: str, upstream_request_id: str | None, status_code: int, start_time: float, workload_class: str | None = None, optimization_steps: list[dict[str, Any]] | None = None, stream_status: str | None = None, stream_cancelled: bool = False, stream_cancel_reason: str | None = None, stream_json: dict[str, Any] | None = None, session_id: str | None = None) -> None:
+def _record_usage(*, principal: AuthPrincipal, endpoint: str, model: str | None, raw_input_tokens: int, yscompress_input_tokens: int, yellowstone_final_input_tokens: int, output_tokens: int, cache_creation_input_tokens: int, cache_read_input_tokens: int, prompt_cache_mode: str, plan: Any, request_id: str, upstream_request_id: str | None, status_code: int, start_time: float, workload_class: str | None = None, optimization_steps: list[dict[str, Any]] | None = None, stream_status: str | None = None, stream_cancelled: bool = False, stream_cancel_reason: str | None = None, stream_json: dict[str, Any] | None = None, session_id: str | None = None, billed_input_tokens: int | None = None, real_raw_input_tokens: int | None = None) -> None:
     elapsed_ms = int((time.perf_counter() - start_time) * 1000)
-    billable_equiv = max(0, yellowstone_final_input_tokens - cache_creation_input_tokens - cache_read_input_tokens) + cache_creation_input_tokens + cache_read_input_tokens
-    cost = cost_usd(model=model, input_tokens=yellowstone_final_input_tokens, output_tokens=output_tokens, cache_creation_input_tokens=cache_creation_input_tokens, cache_read_input_tokens=cache_read_input_tokens)
-    saved = savings_usd(model=model, raw_input_tokens=raw_input_tokens, final_input_tokens=yellowstone_final_input_tokens, output_tokens=output_tokens, cache_creation_input_tokens=cache_creation_input_tokens, cache_read_input_tokens=cache_read_input_tokens)
+    # Honest savings: measure BOTH sides on Anthropic's real tokenizer. real_raw_input_tokens
+    # is count_tokens() of the uncompressed prompt; billed_input_tokens is what Anthropic actually
+    # charged for the compressed request (cache-EXCLUSIVE — gross it back with the cache fields so
+    # cost_usd's internal cache subtraction nets to the billed uncached figure). When either is
+    # missing (mock, error, cancelled stream, CCR) we fall back to the compressor's len/4 estimate
+    # so the row is never zeroed. raw stays the denominator; we do not replace one ruler with two.
+    eff_raw = real_raw_input_tokens if real_raw_input_tokens is not None else raw_input_tokens
+    eff_final = (billed_input_tokens + cache_creation_input_tokens + cache_read_input_tokens
+                 if billed_input_tokens is not None else yellowstone_final_input_tokens)
+    billable_equiv = eff_final
+    cost = cost_usd(model=model, input_tokens=eff_final, output_tokens=output_tokens, cache_creation_input_tokens=cache_creation_input_tokens, cache_read_input_tokens=cache_read_input_tokens)
+    saved = savings_usd(model=model, raw_input_tokens=eff_raw, final_input_tokens=eff_final, output_tokens=output_tokens, cache_creation_input_tokens=cache_creation_input_tokens, cache_read_input_tokens=cache_read_input_tokens)
     try:
         store.record_usage(
             {
@@ -265,17 +299,17 @@ def _record_usage(*, principal: AuthPrincipal, endpoint: str, model: str | None,
                 "session_id": session_id,
                 "status_code": status_code,
                 "latency_ms": elapsed_ms,
-                "raw_input_tokens": raw_input_tokens,
+                "raw_input_tokens": eff_raw,
                 "yscompress_input_tokens": yscompress_input_tokens,
-                "yellowstone_final_input_tokens": yellowstone_final_input_tokens,
+                "yellowstone_final_input_tokens": eff_final,
                 "output_tokens": output_tokens,
                 "cache_creation_input_tokens": cache_creation_input_tokens,
                 "cache_read_input_tokens": cache_read_input_tokens,
-                "tokens_saved": max(0, raw_input_tokens - yellowstone_final_input_tokens),
+                "tokens_saved": max(0, eff_raw - eff_final),
                 "billable_input_equivalent_tokens": billable_equiv,
                 "estimated_cost_usd": cost,
                 "estimated_savings_usd": saved,
-                "compression_ratio": min(1.0, yellowstone_final_input_tokens / max(raw_input_tokens, 1)),
+                "compression_ratio": min(1.0, eff_final / max(eff_raw, 1)),
                 "workload_class": workload_class,
                 "cache_mode": prompt_cache_mode,
                 "route": plan.to_dict() if plan else None,
@@ -445,17 +479,9 @@ def _dashboard_request_rows(recent: list[dict[str, Any]]) -> str:
     return "".join(rows)
 
 
-def _ago_compact(iso: str | None) -> str:
-    """Short relative age for chart axis ticks: now / 5m / 2h / 3d / 2w."""
-    if not iso:
-        return ""
-    try:
-        t = datetime.fromisoformat(iso)
-        if t.tzinfo is None:
-            t = t.replace(tzinfo=timezone.utc)
-        s = int((datetime.now(timezone.utc) - t).total_seconds())
-    except Exception:
-        return ""
+def _dur_compact(seconds: float) -> str:
+    """Compact elapsed-time label for chart axis ticks: now / 15m / 2h / 3d / 2w."""
+    s = int(max(0.0, seconds))
     if s < 60:
         return "now"
     if s < 3600:
@@ -467,41 +493,53 @@ def _ago_compact(iso: str | None) -> str:
     return f"{s // 604800}w"
 
 
-# x of the 5 axis ticks in the SVG (must match the <text> positions in the template)
+# Time-slices the performance chart is bucketed into across the selected window.
+_CHART_BUCKETS = 48
+# x of the 5 axis ticks in the SVG (must match the <text> positions in the template),
+# and the time fractions across the window [t_start .. now] they label (rightmost = now).
 _CHART_TICKS = (40, 220, 400, 580, 730)
+_CHART_TICK_FRACS = (0.0, 0.25, 0.5, 0.75, 1.0)
 
 
-def _dashboard_chart(recent: list[dict[str, Any]]) -> dict[str, Any]:
-    """Return SVG path 'd' strings + end-dot coords + x-axis tick labels for the
-    performance chart. Same shape is used for the initial server render and the JS
-    range-swap. Points are spaced by index; each axis tick is labelled with the real
-    age of the request plotted there, so the axis reflects the selected window."""
-    pts = list(reversed(recent))  # newest-first -> chronological left->right
-    if not pts:
-        return {"savedAreaD": "", "savedLineD": "", "sentAreaD": "", "sentLineD": "",
-                "dotX": -10, "dotY": -10, "xLabels": ["", "", "", "", ""], "hasData": False}
-    n = len(pts)
+def _dashboard_chart(series: dict[str, Any], now: datetime) -> dict[str, Any]:
+    """SVG path 'd' strings + end-dot coords + time-axis labels for the performance
+    chart, built from a savings series bucketed across the SELECTED window (see
+    Store.usage_savings_timeseries). Each point sits at its real time position across
+    the window, so the x-axis is a true timeline: 'all' spans the whole history, '1h'
+    spans the last hour. Empty buckets stay gaps instead of being zero-filled. Same
+    shape is used for the initial server render and the JS range-swap."""
+    empty = {"savedAreaD": "", "savedLineD": "", "sentAreaD": "", "sentLineD": "",
+             "dotX": -10, "dotY": -10, "xLabels": ["", "", "", "", ""], "hasData": False}
+    buckets = series.get("buckets") or []
+    t_start, t_end = series.get("t_start"), series.get("t_end")
+    pts = [(i, b) for i, b in enumerate(buckets) if b]  # non-empty slices only
+    if not pts or t_start is None or t_end is None:
+        return empty
+    nb = len(buckets)
     x0, x1 = 40.0, 760.0
 
     def xf(i: int) -> float:
-        return x0 if n == 1 else x0 + (x1 - x0) * i / (n - 1)
+        # center of bucket i across the full plot width == its real time position
+        return x0 + (x1 - x0) * ((i + 0.5) / nb)
 
     def yf(pct: float) -> float:
         return 220.0 - (max(0.0, min(100.0, pct)) / 100.0) * 200.0
 
-    saved_xy = [(xf(i), yf(_row_saved_pct(r))) for i, r in enumerate(pts)]
-    sent_xy = [(xf(i), yf(100.0 - _row_saved_pct(r))) for i, r in enumerate(pts)]
+    saved_xy = [(xf(i), yf(b["saved_pct"])) for i, b in pts]
+    sent_xy = [(xf(i), yf(100.0 - b["saved_pct"])) for i, b in pts]
 
     def line(xy):
         return "M" + " L".join(f"{x:.1f},{y:.1f}" for x, y in xy)
 
     def area(xy):
-        b = yf(0.0)  # fill down to the 0% baseline, not past it
-        return f'{line(xy)} L{xy[-1][0]:.1f},{b:.1f} L{xy[0][0]:.1f},{b:.1f} Z'
+        base = yf(0.0)  # fill down to the 0% baseline, not past it
+        return f'{line(xy)} L{xy[-1][0]:.1f},{base:.1f} L{xy[0][0]:.1f},{base:.1f} Z'
 
-    def axis_label(x: int) -> str:
-        idx = 0 if n == 1 else max(0, min(n - 1, round((x - x0) / (x1 - x0) * (n - 1))))
-        return _ago_compact(pts[idx].get("created_at"))
+    span = (t_end - t_start).total_seconds()
+    x_labels = [
+        _dur_compact((now - (t_start + timedelta(seconds=f * span))).total_seconds())
+        for f in _CHART_TICK_FRACS
+    ]
 
     return {
         "savedAreaD": area(saved_xy),
@@ -510,7 +548,7 @@ def _dashboard_chart(recent: list[dict[str, Any]]) -> dict[str, Any]:
         "sentLineD": line(sent_xy),
         "dotX": round(saved_xy[-1][0], 1),
         "dotY": round(saved_xy[-1][1], 1),
-        "xLabels": [axis_label(x) for x in _CHART_TICKS],
+        "xLabels": x_labels,
         "hasData": True,
     }
 
@@ -552,9 +590,20 @@ _RANGE_LABELS = {
 }
 
 
-def _range_payload(usage: dict[str, Any], recent: list[dict[str, Any]], name: str = "24h") -> dict[str, Any]:
+def _range_payload(
+    usage: dict[str, Any],
+    recent: list[dict[str, Any]],
+    lifetime: dict[str, Any],
+    chart: dict[str, Any],
+    name: str = "24h",
+) -> dict[str, Any]:
     """All display strings + HTML fragments for one time range. Used both to render
-    the default range server-side and (as JSON) to swap ranges client-side."""
+    the default range server-side and (as JSON) to swap ranges client-side.
+
+    Range-scoped (changes with the tab): latest request, rolling median, workloads,
+    request feed, and the performance `chart`. Constant across tabs: the two Lifetime
+    cards ($ saved / cost), which always read from `lifetime` (all-time) — switching
+    the range must not move a "Lifetime" number."""
     range_label, range_label_long = _RANGE_LABELS.get(name, ("last 24h", "last 24 hours"))
     latest = usage["latest_savings_percent"]
     median = usage["median_savings_percent"]
@@ -565,27 +614,35 @@ def _range_payload(usage: dict[str, Any], recent: list[dict[str, Any]], name: st
     else:
         d_latest = (f"&#8593; {d:.1f} pts vs median" if d >= 0 else f"&#8595; {abs(d):.1f} pts vs median")
     plural = "s" if reqs != 1 else ""
+    # The headline median is a ROLLING median over the latest ROLLING_MEDIAN_WINDOW (50)
+    # requests, so its subtitle counter must reflect that window — it climbs 1..50 as
+    # history accumulates and then holds at 50, never the (unbounded) lifetime total.
+    median_n = min(reqs, ROLLING_MEDIAN_WINDOW)
+    median_plural = "s" if median_n != 1 else ""
+    # Lifetime cards: always all-time, never range-scoped.
+    life_reqs = lifetime["requests"]
+    life_plural = "s" if life_reqs != 1 else ""
     return {
         "latest": f"{latest:.1f}%",
         "median": f"{median:.1f}%",
-        "saved": f"${usage['estimated_savings_usd']:.4f}",
-        "cost": f"${usage['estimated_cost_usd']:.4f}",
+        "saved": f"${lifetime['estimated_savings_usd']:.4f}",
+        "cost": f"${lifetime['estimated_cost_usd']:.4f}",
         "dLatest": d_latest,
-        "dMedian": f"across {reqs} request{plural}",
-        "dSaved": f"{usage['tokens_saved']:,} tokens compressed",
-        "dCost": f"{reqs} request{plural}",
+        "dMedian": f"rolling &#183; latest {median_n} request{median_plural}",
+        "dSaved": f"{lifetime['tokens_saved']:,} tokens compressed",
+        "dCost": f"{life_reqs} request{life_plural}",
         "wlMeta": f"{reqs} request{plural}",
         "reqMeta": f"live &#183; last {len(recent)}",
         "rangeLabel": range_label,
         "rangeLabelLong": range_label_long,
         "workloadRows": _dashboard_workload_rows(usage.get("by_workload", [])),
         "requestRows": _dashboard_request_rows(recent),
-        "chart": _dashboard_chart(recent),
+        "chart": chart,
     }
 
 
 _DASHBOARD_RANGES = {"1h": 1.0 / 24, "24h": 1.0, "7d": 7.0, "30d": 30.0, "all": None}
-_DASHBOARD_DEFAULT_RANGE = "24h"
+_DASHBOARD_DEFAULT_RANGE = "1h"
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -620,12 +677,19 @@ def dashboard(request: Request, response: Response) -> str:
     status_class = "" if upstream_ok else "degraded"
 
     now = datetime.now(timezone.utc)
+    # All-time summary feeds the two Lifetime cards, which stay constant across tabs.
+    lifetime = store.usage_summary(project_id=principal.project_id, since=None)
     payloads: dict[str, dict[str, Any]] = {}
     for name, days in _DASHBOARD_RANGES.items():
         since = None if days is None else now - timedelta(days=days)
         u = store.usage_summary(project_id=principal.project_id, since=since)
         rec = store.recent_usage(project_id=principal.project_id, limit=6, since=since)
-        payloads[name] = _range_payload(u, rec, name)
+        # Performance chart: a real time-series across this range's window (full last
+        # hour for 1h, whole history for all) — not just the last few requests.
+        series = store.usage_savings_timeseries(
+            project_id=principal.project_id, since=since, until=now, buckets=_CHART_BUCKETS)
+        chart = _dashboard_chart(series, now)
+        payloads[name] = _range_payload(u, rec, lifetime, chart, name)
 
     dp = payloads[_DASHBOARD_DEFAULT_RANGE]
     chart = dp["chart"]
@@ -1215,8 +1279,12 @@ async def anthropic_messages_proxy(request: Request, payload: MessagesRequest) -
         # (an HTTP header the byte-parsing tracker can't see).
         legacy = SSEUsageTracker()
         stream_tracker = StreamUsageTracker()
+        # Real-tokenizer baseline of the uncompressed prompt, fired concurrently with the stream
+        # (which runs for seconds) so it is ready at completion and adds no latency. _safe_complete
+        # awaits the async recorder in a shielded task, so this survives a client disconnect.
+        baseline_task = asyncio.create_task(_real_token_baseline(model, body, upstream_key=upstream_key))
 
-        def record_stream_usage(done: StreamUsageTracker) -> None:
+        async def record_stream_usage(done: StreamUsageTracker) -> None:
             done.upstream_request_id = done.upstream_request_id or legacy.upstream_request_id
             if done.cancelled:
                 status_code = 499
@@ -1228,6 +1296,18 @@ async def anthropic_messages_proxy(request: Request, payload: MessagesRequest) -
                 status_code = 200
             if done.cancelled:
                 log.info("stream cancelled", extra={"extra": {"request_id": request_id, "reason": done.cancel_reason}})
+            # Reconcile to Anthropic's BILLED input (fixed at message_start) on the real tokenizer.
+            # A stream that errored/cancelled before message_start has input_tokens==0 -> keep the
+            # estimate, never a phantom 100% savings.
+            billed_input = real_raw = None
+            if status_code == 200 and done.input_tokens > 0:
+                billed_input = done.input_tokens
+                try:
+                    real_raw = await baseline_task
+                except Exception:
+                    real_raw = None
+            else:
+                baseline_task.cancel()
             _record_usage(
                 principal=principal, endpoint="/v1/messages:stream", model=model,
                 raw_input_tokens=comp.tokens_before, yscompress_input_tokens=comp.tokens_after,
@@ -1240,6 +1320,7 @@ async def anthropic_messages_proxy(request: Request, payload: MessagesRequest) -
                 start_time=start, workload_class=workload, session_id=session_id,
                 stream_status=done.status, stream_cancelled=done.cancelled,
                 stream_cancel_reason=done.cancel_reason, stream_json=done.to_dict(),
+                billed_input_tokens=billed_input, real_raw_input_tokens=real_raw,
             )
 
         async def body_iter(release_slot):
@@ -1263,10 +1344,16 @@ async def anthropic_messages_proxy(request: Request, payload: MessagesRequest) -
         # fire only after the 200 status line is already committed on the wire).
         release_slot = rate_limits.acquire_stream_slot(principal.project_id)
         return StreamingResponse(body_iter(release_slot), media_type="text/event-stream", headers=headers)
+    # Real-tokenizer baseline of the UNCOMPRESSED prompt, fired CONCURRENTLY with generation so
+    # it adds ~0 wall-time. Started for every request; only USED when no CCR retrieval re-sent
+    # originals (see below) — including CCR requests where Claude never retrieved, which is the
+    # common high-savings case the estimator most overstated.
+    baseline_task = asyncio.create_task(_real_token_baseline(model, body, upstream_key=upstream_key))
     result = await call_anthropic_messages(compressed_body, settings=settings, upstream_api_key=upstream_key, prompt_cache_mode=prompt_cache_mode, extra_headers=dict(request.headers))
     # Honest accounting: CCR savings only materialize if Claude does NOT retrieve.
     # When it does, the originals come back and must be counted as tokens sent.
     final_input_tokens = plan.yellowstone_final_input_tokens
+    ccr_rounds = 0
     if comp.ccr_keys:
         result, ccr_rounds, retrieved_tokens = await _resolve_ccr_retrievals(result, compressed_body, principal=principal, upstream_key=upstream_key, prompt_cache_mode=prompt_cache_mode, request=request)
         if ccr_rounds:
@@ -1276,7 +1363,19 @@ async def anthropic_messages_proxy(request: Request, payload: MessagesRequest) -
             headers["x-decompute-tokens-after"] = str(final_input_tokens)
             headers["x-decompute-tokens-saved"] = str(max(0, comp.tokens_before - final_input_tokens))
     usage = _usage_from_result(result)
-    _record_usage(principal=principal, endpoint="/v1/messages", model=model, raw_input_tokens=comp.tokens_before, yscompress_input_tokens=comp.tokens_after, yellowstone_final_input_tokens=final_input_tokens, output_tokens=usage["output_tokens"], cache_creation_input_tokens=usage["cache_creation_input_tokens"], cache_read_input_tokens=usage["cache_read_input_tokens"], prompt_cache_mode=prompt_cache_mode, plan=plan, request_id=request_id, upstream_request_id=result.upstream_request_id, status_code=result.status_code, start_time=start, workload_class=workload, session_id=session_id)
+    # Reconcile recorded savings to Anthropic's BILLED input on the real tokenizer. Skip ONLY when
+    # retrieval re-sent originals across rounds (ccr_rounds>0) — there billed reflects just the last
+    # round and would undercount, so keep the estimate+retrieved accounting (documented follow-up).
+    billed_input = real_raw = None
+    if ccr_rounds == 0 and result.status_code < 400 and usage["input_tokens"] > 0:
+        billed_input = usage["input_tokens"]
+        try:
+            real_raw = await baseline_task
+        except Exception:
+            real_raw = None
+    else:
+        baseline_task.cancel()  # CCR-with-retrieval / error / empty body -> keep the estimate
+    _record_usage(principal=principal, endpoint="/v1/messages", model=model, raw_input_tokens=comp.tokens_before, yscompress_input_tokens=comp.tokens_after, yellowstone_final_input_tokens=final_input_tokens, output_tokens=usage["output_tokens"], cache_creation_input_tokens=usage["cache_creation_input_tokens"], cache_read_input_tokens=usage["cache_read_input_tokens"], prompt_cache_mode=prompt_cache_mode, plan=plan, request_id=request_id, upstream_request_id=result.upstream_request_id, status_code=result.status_code, start_time=start, workload_class=workload, session_id=session_id, billed_input_tokens=billed_input, real_raw_input_tokens=real_raw)
     body_out = result.body
     if (settings.return_proxy_metadata or request.headers.get("x-decompute-metadata", "false").lower() == "true") and isinstance(body_out, dict):
         body_out = dict(body_out)

@@ -14,4 +14,4 @@ set +a
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 exec /Users/avii/Documents/YSCompress/.venv-proxy/bin/python3.12 -m uvicorn \
-  decompute_gateway.main:app --app-dir apps/api --host 127.0.0.1 --port 8080
+  decompute_gateway.main:app --app-dir apps/api --host 127.0.0.1 --port 8080 --reload

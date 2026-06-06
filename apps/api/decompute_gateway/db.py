@@ -21,6 +21,10 @@ from .secret_scanner import SecretScanner
 
 log = logging.getLogger("decompute.gateway.db")
 
+# Headline savings median is a ROLLING median over the most recent N requests (newest first),
+# so it tracks current performance rather than being diluted by the whole history.
+ROLLING_MEDIAN_WINDOW = 50
+
 
 ALL_SCOPES = [
     "messages:write",
@@ -811,13 +815,15 @@ class Store:
             row = q.one()
             by_model = scope(s.query(UsageEvent.model, func.count(UsageEvent.id), func.coalesce(func.sum(UsageEvent.estimated_cost_usd), 0.0))).group_by(UsageEvent.model).all()
 
-            # Per-request (raw, final) pairs for latest + median, newest first.
+            # Per-request (raw, final) pairs for latest + ROLLING MEDIAN, newest first.
             # id.desc() is a deterministic tiebreaker so "latest" can't flip between
             # dashboard loads when two rows share a created_at (Python-clock ties).
+            # Capped at the latest 50 so the headline median is a rolling median of the most
+            # recent 50 requests (reflects current performance, not diluted by old history).
             per_request = scope(s.query(
                 UsageEvent.raw_input_tokens,
                 UsageEvent.yellowstone_final_input_tokens,
-            )).order_by(UsageEvent.created_at.desc(), UsageEvent.id.desc()).all()
+            )).order_by(UsageEvent.created_at.desc(), UsageEvent.id.desc()).limit(ROLLING_MEDIAN_WINDOW).all()
 
             # By-workload aggregation.
             by_workload_rows = scope(s.query(
@@ -879,6 +885,70 @@ class Store:
                 stmt = stmt.where(UsageEvent.created_at >= since)
             stmt = stmt.order_by(UsageEvent.created_at.desc(), UsageEvent.id.desc()).limit(limit)
             return [self.usage_to_dict(u) for u in s.execute(stmt).scalars().all()]
+
+    def usage_savings_timeseries(
+        self,
+        *,
+        project_id: str,
+        since: datetime | None,
+        until: datetime | None = None,
+        buckets: int = 48,
+    ) -> dict[str, Any]:
+        """Per-request savings % bucketed into `buckets` equal time-slices across the
+        window, for the performance-over-time chart.
+
+        The window is [since, until]; for since=None ("all time") it starts at the
+        project's earliest usage event so the chart spans the whole history. Each
+        bucket carries the MEAN savings % of the requests whose created_at falls in
+        its slice, or None when the slice has no requests (so the caller can draw real
+        gaps rather than fabricating zeros). Returns
+        {"t_start", "t_end", "buckets": [ {"saved_pct": float, "n": int} | None ]}."""
+        until = until or utc_ts()
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=timezone.utc)
+        with self.session() as s:
+            q = s.query(
+                UsageEvent.created_at,
+                UsageEvent.raw_input_tokens,
+                UsageEvent.yellowstone_final_input_tokens,
+            ).filter(UsageEvent.project_id == project_id, UsageEvent.created_at <= until)
+            if since is not None:
+                q = q.filter(UsageEvent.created_at >= since)
+            rows = q.order_by(UsageEvent.created_at.asc()).all()
+
+        if not rows:
+            return {"t_start": None, "t_end": None, "buckets": [None] * buckets}
+
+        def _aware(dt: datetime) -> datetime:
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+        # For a fixed range, anchor the window at `since` so the axis spans the FULL
+        # window (e.g. the whole last hour) even if the first request landed later.
+        # For "all time", anchor at the earliest event.
+        t_start = _aware(since) if since is not None else _aware(rows[0][0])
+        t_end = until
+        span = (t_end - t_start).total_seconds()
+
+        sums = [0.0] * buckets
+        counts = [0] * buckets
+        for created, raw, final in rows:
+            created = _aware(created)
+            raw = int(raw or 0)
+            final = int(final or 0)
+            pct = max(0.0, (1.0 - final / raw) * 100.0) if raw else 0.0
+            if span <= 0:
+                idx = buckets - 1
+            else:
+                idx = int((created - t_start).total_seconds() / span * buckets)
+                idx = max(0, min(buckets - 1, idx))
+            sums[idx] += pct
+            counts[idx] += 1
+
+        out = [
+            {"saved_pct": sums[i] / counts[i], "n": counts[i]} if counts[i] else None
+            for i in range(buckets)
+        ]
+        return {"t_start": t_start, "t_end": t_end, "buckets": out}
 
     def monthly_spend(self, *, project_id: str, now: datetime | None = None) -> float:
         now = now or utc_ts()
