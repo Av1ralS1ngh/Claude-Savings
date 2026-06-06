@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.4
+- **Marketplace metadata fixes** (resolve "suspicious content" on upload): dropped the
+  `repository` link that pointed at a non-public repo (404), added a public `homepage`,
+  reframed the name/description to make clear routing is **opt-in, through your own local
+  gateway, on your own key** (not traffic interception).
+
 ## 0.1.3
 - **First-run onboarding:** the welcome and the "gateway not reachable" status now guide new users
   with a **Get Started** action (and a `Decompute: Get Started` command) instead of dead-ending —
