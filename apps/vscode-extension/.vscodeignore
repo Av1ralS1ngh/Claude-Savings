@@ -9,4 +9,6 @@ tsconfig.json
 test/**
 dist/settings.mjs
 PRODUCTION_REVIEW.md
+RELEASE.md
 package-lock.json
+*.vsix

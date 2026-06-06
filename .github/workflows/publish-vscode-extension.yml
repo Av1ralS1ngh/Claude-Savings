@@ -15,6 +15,12 @@ defaults:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    # Hoist secrets to JOB-level env so the step `if: env.* != ''` guards can read them.
+    # A step's OWN `env:` is not visible to that step's `if:`, so the previous per-step env
+    # made the publish guards evaluate against an empty value (publish never ran / failed).
+    env:
+      VSCE_PAT: ${{ secrets.VSCE_PAT }}
+      OVSX_PAT: ${{ secrets.OVSX_PAT }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -32,11 +38,7 @@ jobs:
           path: apps/vscode-extension/decompute.vsix
       - name: Publish to VS Code Marketplace
         if: env.VSCE_PAT != ''
-        env:
-          VSCE_PAT: ${{ secrets.VSCE_PAT }}
         run: npx --yes @vscode/vsce@latest publish --no-dependencies --packagePath decompute.vsix
       - name: Publish to Open VSX
         if: env.OVSX_PAT != ''
-        env:
-          OVSX_PAT: ${{ secrets.OVSX_PAT }}
         run: npx --yes ovsx publish decompute.vsix -p "$OVSX_PAT"
