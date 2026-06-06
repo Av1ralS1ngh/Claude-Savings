@@ -1,16 +1,17 @@
 # Decompute for VS Code
 
-Route **Claude Code** (and any Anthropic-API tool) in your VS Code terminal through the
-**Decompute gateway** — it compresses context and cuts tokens before your request reaches
-Claude, on your own key (BYOK). Free tier: **100 compressions/day per device**; over the limit
-Claude keeps working, just uncompressed. **Pro** removes the limit.
+**Opt-in, off by default.** Route **Claude Code** through your **own local Decompute gateway** to
+compress context and cut tokens before the request reaches Claude — on **your own Anthropic key
+(BYOK)**. Nothing is sent to us; the extension only flips a setting you control. Free tier:
+**100 compressions/day per device**; over the limit Claude keeps working, just uncompressed.
+**Pro** removes the limit.
 
 ## Quick start
 
 1. **Get the gateway running** — it does the compression; this extension is its VS Code client:
    ```bash
    pip install decompute-ai     # or the provided wheel
-   decompute init               # BYOK setup; starts the local gateway at 127.0.0.1:8080
+   decompute init               # BYOK setup; starts the local gateway at localhost:8080
    ```
 2. In VS Code, run **Decompute: Set Claude (Anthropic) Key** (BYOK — stored at `~/.decompute/claude.key`, chmod 600).
 3. Run **Decompute: Enable Routing**. The status bar shows your tier (e.g. `Decompute Free 100/100`), and Claude Code now flows through the gateway and compresses.
@@ -42,7 +43,7 @@ Claude keeps working, just uncompressed. **Pro** removes the limit.
 
 ## Requirements
 
-A running Decompute gateway (default `http://127.0.0.1:8080`). Install the CLI and start it:
+A running Decompute gateway (default `http://localhost:8080`). Install the CLI and start it:
 
 ```bash
 pip install decompute-ai      # or the wheel
@@ -66,7 +67,7 @@ Set `decompute.gatewayUrl` if your gateway is elsewhere.
 
 ## Settings
 
-- `decompute.gatewayUrl` — gateway base URL (default `http://127.0.0.1:8080`)
+- `decompute.gatewayUrl` — gateway base URL (default `http://localhost:8080`)
 - `decompute.routeClaudeCodePanel` — route the Claude Code panel + CLI via `~/.claude/settings.json` (default `false`)
 - `decompute.autoWireTerminal` — inject routing env into integrated terminals (default `false`)
 - `decompute.pollSeconds` — status refresh interval, seconds (default `60`, min `15`)

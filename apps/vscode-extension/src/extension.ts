@@ -19,7 +19,7 @@ function cfg<T>(key: string, dflt: T): T {
   return vscode.workspace.getConfiguration("decompute").get<T>(key, dflt);
 }
 function gatewayUrl(): string {
-  return cfg("gatewayUrl", "http://127.0.0.1:8080").replace(/\/+$/, "");
+  return cfg("gatewayUrl", "http://localhost:8080").replace(/\/+$/, "");
 }
 
 // Where "Get Started" points a first-time user who doesn't have the gateway running yet.
@@ -416,7 +416,7 @@ async function doActivate(key: string): Promise<void> {
 
 async function setKey(): Promise<void> {
   const key = await vscode.window.showInputBox({
-    prompt: "Your Anthropic/Claude key (sk-ant-…). Stored locally at ~/.decompute/claude.key (chmod 600); never synced or committed.",
+    prompt: "Your Anthropic API key. Stored locally at ~/.decompute/claude.key (owner-only, chmod 600); never synced or committed.",
     password: true,
     ignoreFocusOut: true,
   });

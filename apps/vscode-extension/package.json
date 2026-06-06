@@ -2,7 +2,7 @@
   "name": "decompute",
   "displayName": "Decompute \u2014 context compressor for Claude Code",
   "description": "Compress Claude Code's context to cut tokens \u2014 opt-in routing through your OWN local Decompute gateway, on your OWN Anthropic key (BYOK). Off by default. Free 100/day; Pro unlimited.",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "publisher": "decompute",
   "license": "MIT",
   "icon": "icon.png",
@@ -70,7 +70,7 @@
       "properties": {
         "decompute.gatewayUrl": {
           "type": "string",
-          "default": "http://127.0.0.1:8080",
+          "default": "http://localhost:8080",
           "description": "Decompute gateway base URL."
         },
         "decompute.autoWireTerminal": {

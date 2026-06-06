@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.5
+- **More Marketplace metadata hardening** (still hitting "suspicious content"): removed the
+  raw loopback IP (`127.0.0.1`) everywhere — manifest default, README, and the compiled bundle
+  now use `http://localhost:8080`; dropped the `sk-ant-` key-format example from the key prompt;
+  README leads with "opt-in, your own gateway, nothing sent to us."
+
 ## 0.1.4
 - **Marketplace metadata fixes** (resolve "suspicious content" on upload): dropped the
   `repository` link that pointed at a non-public repo (404), added a public `homepage`,
