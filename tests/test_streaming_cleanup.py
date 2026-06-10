@@ -297,3 +297,110 @@ def test_dashboard_badge_reflects_stream_status(monkeypatch):
     assert "cancelled" in _stream_status_badge({"stream_cancelled": True})
     assert "upstream_stream_error" in _stream_status_badge({"stream_status": "upstream_stream_error"})
     assert _stream_status_badge({"stream_status": "completed"}) == ""
+
+
+class RaisingAsyncIter:
+    """Async byte iterator that yields some chunks then RAISES — simulates a mid-stream
+    upstream drop/stall (e.g. httpx ReadTimeout/RemoteProtocolError) after HTTP 200."""
+
+    def __init__(self, chunks, exc):
+        self.chunks = list(chunks)
+        self.index = 0
+        self.exc = exc
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        await asyncio.sleep(0)
+        if self.index >= len(self.chunks):
+            raise self.exc
+        item = self.chunks[self.index]
+        self.index += 1
+        return item
+
+    async def aclose(self):
+        self.closed = True
+
+
+def test_upstream_exception_midstream_yields_terminal_error_and_does_not_raise():
+    """A mid-stream upstream failure after the 200 was committed must hand the still-attached
+    client a synthesized terminal `error` event (not a dangling chunked stream) and end
+    gracefully — this is the "stuck thinking forever" hang we are fixing."""
+    upstream = RaisingAsyncIter(
+        [b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n"],
+        TimeoutError("read timed out"),
+    )
+    tracker = StreamUsageTracker()
+    completed = []
+
+    async def on_complete(done):
+        completed.append(done.to_dict())
+
+    async def run():
+        out = []
+        async for chunk in proxy_sse_stream(upstream, tracker=tracker, on_complete=on_complete):
+            out.append(chunk)
+        return out
+
+    out = asyncio.run(run())  # must NOT raise — the exception is converted to a terminal event
+    joined = b"".join(out)
+    assert b"message_start" in joined            # the chunk fetched before the failure is forwarded
+    assert b"event: error" in joined             # synthesized terminal so the client stops waiting
+    assert b"TimeoutError" in joined
+    assert tracker.status == "gateway_stream_error"
+    assert tracker.gateway_exception_type == "TimeoutError"
+    assert upstream.closed is True               # upstream still aclose()'d in finally
+    assert len(completed) == 1                   # usage persisted exactly once
+
+
+def test_upstream_exhausts_without_message_stop_yields_terminal_error():
+    """An upstream that closes cleanly but never sent message_stop/error (truncated/empty
+    stream) must still get a terminal event appended so the client's SSE reader ends."""
+    upstream = CloseableAsyncIter([
+        b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n",
+        b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+    ])
+    tracker = StreamUsageTracker()
+
+    async def run():
+        out = []
+        async for chunk in proxy_sse_stream(upstream, tracker=tracker):
+            out.append(chunk)
+        return out
+
+    out = asyncio.run(run())
+    joined = b"".join(out)
+    assert b"message_start" in joined and b"partial" in joined  # real bytes forwarded verbatim
+    assert b"event: error" in joined                            # synthesized terminal
+    assert tracker.message_stop_seen is False
+    assert upstream.closed is True
+
+
+def test_client_disconnect_does_not_inject_synthesized_terminal():
+    """Guard the cancel path: when the client has disconnected we must NOT yield a
+    synthesized terminal (it would error on a gone consumer) — only the pre-disconnect
+    bytes are forwarded."""
+    upstream = CloseableAsyncIter([
+        b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n",
+        b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"more\"}}\n\n",
+    ])
+    tracker = StreamUsageTracker()
+    checks = 0
+
+    async def is_disconnected():
+        nonlocal checks
+        checks += 1
+        return checks > 1  # first chunk passes; client gone on the second poll
+
+    async def run():
+        out = []
+        async for chunk in proxy_sse_stream(upstream, request_is_disconnected=is_disconnected, tracker=tracker):
+            out.append(chunk)
+        return out
+
+    out = asyncio.run(run())
+    assert tracker.cancelled is True
+    assert len(out) == 1                       # only the first chunk was forwarded
+    assert b"event: error" not in b"".join(out)  # no terminal injected toward a gone client

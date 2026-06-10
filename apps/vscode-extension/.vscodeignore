@@ -8,6 +8,7 @@ tsconfig.json
 .github/**
 test/**
 dist/settings.mjs
+dist/*.mjs
 PRODUCTION_REVIEW.md
 RELEASE.md
 package-lock.json

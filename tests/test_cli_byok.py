@@ -26,7 +26,9 @@ runner = CliRunner()
 def env(tmp_path, monkeypatch):
     """Reload config + cli with ~/.decompute redirected into a tmp dir, key/base env cleared."""
     cfgdir = tmp_path / ".decompute"
+    claude_dir = tmp_path / ".claude"
     monkeypatch.setenv("DECOMPUTE_CONFIG_DIR", str(cfgdir))
+    monkeypatch.setenv("DECOMPUTE_CLAUDE_CONFIG_DIR", str(claude_dir))
     for k in ("DECOMPUTE_CLAUDE_KEY", "ANTHROPIC_API_KEY", "DECOMPUTE_BASE_URL"):
         monkeypatch.delenv(k, raising=False)
     config = importlib.reload(importlib.import_module("decompute_ai.config"))
@@ -122,6 +124,21 @@ def test_vscode_omits_key_from_settings(env, tmp_path):
     assert "sk-ant-leakcheck" not in settings           # the key must NOT be in a committable file
     assert "ANTHROPIC_API_KEY" not in settings
     assert "x-decompute-session-id" in settings          # routing IS written
+
+
+def test_configure_claude_code_defaults_to_hosted_without_provider_key(env):
+    config, cli, _ = env
+    res = runner.invoke(cli.app, ["configure", "claude-code", "--yes"])
+    assert res.exit_code == 0, res.stdout
+    settings_path = Path(os.environ["DECOMPUTE_CLAUDE_CONFIG_DIR"]) / "settings.json"
+    settings = json.loads(settings_path.read_text())
+    env_block = settings["env"]
+    assert env_block["ANTHROPIC_BASE_URL"] == "https://gateway.decompute.run"
+    assert "x-decompute-device:" in env_block["ANTHROPIC_CUSTOM_HEADERS"]
+    assert "x-decompute-session-id:" in env_block["ANTHROPIC_CUSTOM_HEADERS"]
+    assert "ANTHROPIC_API_KEY" not in settings_path.read_text()
+    assert "sk-ant" not in settings_path.read_text()
+    assert config.base_url() == "https://gateway.decompute.run"
 
 
 # ── uninstall: safe by default, destructive only on --purge ─────────────────────

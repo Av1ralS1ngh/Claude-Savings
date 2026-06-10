@@ -18,7 +18,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import text
 
-from .anthropic_provider import ProviderResult, call_anthropic_messages, count_tokens, list_anthropic_models, stream_anthropic_messages
+from .anthropic_provider import ProviderResult, call_anthropic_messages, count_tokens, list_anthropic_models, stream_anthropic_messages, _request_has_cache_control
 from .capabilities import capabilities_dict
 from .config import get_settings
 from .crypto import CCRCrypto
@@ -493,51 +493,56 @@ def _dur_compact(seconds: float) -> str:
     return f"{s // 604800}w"
 
 
-# Time-slices the performance chart is bucketed into across the selected window.
-_CHART_BUCKETS = 48
+# Max number of recent requests plotted as individual points on the performance chart.
+_CHART_POINTS = 60
 # x of the 5 axis ticks in the SVG (must match the <text> positions in the template),
-# and the time fractions across the window [t_start .. now] they label (rightmost = now).
+# and the fractions across the plotted points [oldest .. newest] they label (rightmost = newest).
 _CHART_TICKS = (40, 220, 400, 580, 730)
 _CHART_TICK_FRACS = (0.0, 0.25, 0.5, 0.75, 1.0)
 
 
 def _dashboard_chart(series: dict[str, Any], now: datetime) -> dict[str, Any]:
-    """SVG path 'd' strings + end-dot coords + time-axis labels for the performance
-    chart, built from a savings series bucketed across the SELECTED window (see
-    Store.usage_savings_timeseries). Each point sits at its real time position across
-    the window, so the x-axis is a true timeline: 'all' spans the whole history, '1h'
-    spans the last hour. Empty buckets stay gaps instead of being zero-filled. Same
-    shape is used for the initial server render and the JS range-swap."""
+    """SVG path 'd' strings + end-dot coords + axis labels for the performance chart, built
+    from the recent PER-REQUEST points (see Store.usage_savings_timeseries). One point per
+    request, spaced evenly left->right with the newest at the right edge, so the chart's
+    end point IS the latest request — it equals the headline "Latest request" % exactly and
+    updates the moment a new request arrives. (Time-bucketing was replaced because a burst of
+    requests in one turn averaged into a single diluted slice, so the right edge never matched
+    the headline.) x-axis ticks are labelled with the elapsed time of the point at each tick
+    position, so the timeline stays meaningful even though spacing is per-request. Stable on
+    reload: identical points render identically. Same shape for initial render and JS swap."""
     empty = {"savedAreaD": "", "savedLineD": "", "sentAreaD": "", "sentLineD": "",
              "dotX": -10, "dotY": -10, "xLabels": ["", "", "", "", ""], "hasData": False}
-    buckets = series.get("buckets") or []
-    t_start, t_end = series.get("t_start"), series.get("t_end")
-    pts = [(i, b) for i, b in enumerate(buckets) if b]  # non-empty slices only
-    if not pts or t_start is None or t_end is None:
+    points = series.get("points") or []
+    if not points:
         return empty
-    nb = len(buckets)
+    n = len(points)
     x0, x1 = 40.0, 760.0
 
     def xf(i: int) -> float:
-        # center of bucket i across the full plot width == its real time position
-        return x0 + (x1 - x0) * ((i + 0.5) / nb)
+        # newest point (i == n-1) anchors the right edge; a lone point also sits at the right
+        return x1 if n == 1 else x0 + (x1 - x0) * (i / (n - 1))
 
     def yf(pct: float) -> float:
         return 220.0 - (max(0.0, min(100.0, pct)) / 100.0) * 200.0
 
-    saved_xy = [(xf(i), yf(b["saved_pct"])) for i, b in pts]
-    sent_xy = [(xf(i), yf(100.0 - b["saved_pct"])) for i, b in pts]
+    saved_xy = [(xf(i), yf(p["saved_pct"])) for i, p in enumerate(points)]
+    sent_xy = [(xf(i), yf(100.0 - p["saved_pct"])) for i, p in enumerate(points)]
 
     def line(xy):
+        if len(xy) == 1:  # a single point: draw a flat segment so the line/area is visible
+            (x, y) = xy[0]
+            return f"M{x0:.1f},{y:.1f} L{x:.1f},{y:.1f}"
         return "M" + " L".join(f"{x:.1f},{y:.1f}" for x, y in xy)
 
     def area(xy):
         base = yf(0.0)  # fill down to the 0% baseline, not past it
-        return f'{line(xy)} L{xy[-1][0]:.1f},{base:.1f} L{xy[0][0]:.1f},{base:.1f} Z'
+        left = x0 if len(xy) == 1 else xy[0][0]
+        return f'{line(xy)} L{xy[-1][0]:.1f},{base:.1f} L{left:.1f},{base:.1f} Z'
 
-    span = (t_end - t_start).total_seconds()
+    # Label each tick with the elapsed time of the point nearest that position.
     x_labels = [
-        _dur_compact((now - (t_start + timedelta(seconds=f * span))).total_seconds())
+        _dur_compact((now - points[round(f * (n - 1))]["created_at"]).total_seconds())
         for f in _CHART_TICK_FRACS
     ]
 
@@ -684,10 +689,10 @@ def dashboard(request: Request, response: Response) -> str:
         since = None if days is None else now - timedelta(days=days)
         u = store.usage_summary(project_id=principal.project_id, since=since)
         rec = store.recent_usage(project_id=principal.project_id, limit=6, since=since)
-        # Performance chart: a real time-series across this range's window (full last
-        # hour for 1h, whole history for all) — not just the last few requests.
+        # Performance chart: the most recent requests in this range's window, one point
+        # each (newest anchors the right edge), so the end point == the headline latest %.
         series = store.usage_savings_timeseries(
-            project_id=principal.project_id, since=since, until=now, buckets=_CHART_BUCKETS)
+            project_id=principal.project_id, since=since, until=now, limit=_CHART_POINTS)
         chart = _dashboard_chart(series, now)
         payloads[name] = _range_payload(u, rec, lifetime, chart, name)
 
@@ -1252,6 +1257,20 @@ async def anthropic_messages_proxy(request: Request, payload: MessagesRequest) -
         if license_meta and not license_meta["compress"]:
             mode = "off"
     raw_estimate = estimate_tokens(body.get("messages")) + estimate_tokens(body.get("system")) + estimate_tokens(body.get("tools"))
+    # COST GUARD — preserve prompt caching, but ONLY for very large contexts. When the client manages
+    # prompt caching (Claude Code sends cache_control), compressing rewrites the cached prefix and
+    # busts the cache. For a HUGE repeated context (e.g. a ~700K-token Opus session) the cache discount
+    # (~90% off repeated input) dwarfs compression savings, so we skip compression and let the cache
+    # work (this is what fixed the ~$10/turn re-bills). But for normal requests — a fresh log read, a
+    # few tool results — the NEW content compresses ~90-99% while the cache being protected is small,
+    # so compression is the bigger win and we MUST still compress. The threshold separates the two:
+    # below it, compress; above it, preserve the cache.
+    cache_preserved = False
+    if (mode != "off" and settings.preserve_prompt_cache
+            and raw_estimate >= settings.preserve_cache_min_tokens
+            and _request_has_cache_control(body)):
+        mode = "off"
+        cache_preserved = True
     rate_limits.check_body_size(request.headers.get("content-length"))
     rate_limits.check_preflight(principal=principal, estimated_input_tokens=raw_estimate, estimated_output_tokens=int(body.get("max_tokens", 1024)), store=store)
     comp = await yscompress.compress_messages(body.get("messages") or [], project_id=principal.project_id, mode=mode, ccr=ys_cfg.get("ccr", settings.ccr_enabled))
@@ -1271,6 +1290,8 @@ async def anthropic_messages_proxy(request: Request, payload: MessagesRequest) -
     upstream_key = upstream_anthropic_key(request, settings)
     headers = _response_headers(request_id=request_id, comp=comp, plan=plan)
     _apply_license_headers(headers, license_meta)
+    if cache_preserved:
+        headers["x-decompute-prompt-cache-preserved"] = "true"  # compression skipped to keep the client's cache hits
     if bool(body.get("stream")):
         # Streaming with client-disconnect cleanup. proxy_sse_stream polls the
         # downstream client; on disconnect/cancel it closes the upstream Anthropic

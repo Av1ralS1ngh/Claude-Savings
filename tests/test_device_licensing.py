@@ -15,6 +15,7 @@ from decompute_gateway.billing import BillingError, BillingService
 from decompute_gateway.config import Settings
 from decompute_gateway.db import Store
 from decompute_gateway.licensing import LicenseService, device_fingerprint_from_request
+from decompute_gateway import signed_license
 import pytest
 
 
@@ -351,3 +352,76 @@ def test_metered_api_key_caller_is_not_device_gated():
     r = client.post("/v1/messages", json=_big_tool_body(), headers={"x-decompute-api-key": key, "x-decompute-device": dev})
     assert r.status_code == 200
     assert "x-decompute-tier" not in r.headers
+
+
+# ── offline signed-license file (local-engine Pro gate) ──────────────────────
+# These prove the tamper-resistant path: a signed file grants Pro through resolve(), while a
+# forged/expired/foreign/keyless file degrades to the free tier (never fail-open to unlimited).
+
+def _signed_settings(tmp_path, pub_pem, kid, **over):
+    import json as _json
+    return _settings(
+        tmp_path, free_compression_quota=3, signed_license_enabled=True,
+        license_file=str(tmp_path / "license.dcmp"),
+        license_public_keys_json=_json.dumps({kid: pub_pem}), **over,
+    )
+
+
+def _issue(priv, kid, fp, *, days_valid=365, tier="pro", device_fp=None):
+    now = dt.datetime.now(dt.timezone.utc)
+    return signed_license.sign_license(
+        private_pem=priv, kid=kid, license_id="lic_e2e",
+        device_id=signed_license.canonical_device_id(device_fp or fp),
+        issued_at=now - dt.timedelta(days=1),
+        expires_at=None if days_valid is None else now + dt.timedelta(days=days_valid),
+        tier=tier,
+    )
+
+
+def test_signed_license_grants_pro_through_resolver(tmp_path):
+    priv, pub = signed_license.generate_keypair()
+    kid = signed_license.key_id(pub)
+    st = _store(_signed_settings(tmp_path, pub, kid))
+    (tmp_path / "license.dcmp").write_text(_issue(priv, kid, "dev-signed-1"))
+    d = LicenseService(st.settings, st).resolve("dev-signed-1", consume=False)
+    assert d["plan"] == "pro" and d["reason"] == "pro_signed_license" and d["compress"] is True
+
+
+def test_forged_signed_license_is_ignored(tmp_path):
+    # Attacker signs Pro with their OWN key but ships it under our real kid -> bad signature -> free.
+    priv, pub = signed_license.generate_keypair()
+    kid = signed_license.key_id(pub)
+    attacker_priv, _ = signed_license.generate_keypair()
+    st = _store(_signed_settings(tmp_path, pub, kid))
+    (tmp_path / "license.dcmp").write_text(_issue(attacker_priv, kid, "dev-x"))
+    d = LicenseService(st.settings, st).resolve("dev-x", consume=False)
+    assert d["plan"] == "free"  # forgery rejected, fell through to free tier (not unlimited)
+
+
+def test_signed_license_for_other_machine_is_ignored(tmp_path):
+    priv, pub = signed_license.generate_keypair()
+    kid = signed_license.key_id(pub)
+    st = _store(_signed_settings(tmp_path, pub, kid))
+    # License bound to a DIFFERENT device than the one making the request.
+    (tmp_path / "license.dcmp").write_text(_issue(priv, kid, "dev-me", device_fp="dev-someone-else"))
+    d = LicenseService(st.settings, st).resolve("dev-me", consume=False)
+    assert d["plan"] == "free"
+
+
+def test_expired_signed_license_is_ignored(tmp_path):
+    priv, pub = signed_license.generate_keypair()
+    kid = signed_license.key_id(pub)
+    st = _store(_signed_settings(tmp_path, pub, kid))
+    (tmp_path / "license.dcmp").write_text(_issue(priv, kid, "dev-exp", days_valid=-2))  # expired 2d ago
+    d = LicenseService(st.settings, st).resolve("dev-exp", consume=False)
+    assert d["plan"] == "free"
+
+
+def test_signed_license_inert_without_trusted_key(tmp_path):
+    # Hosted deployments ship no verify key -> the file is ignored entirely (existing DB path stands).
+    priv, pub = signed_license.generate_keypair()
+    kid = signed_license.key_id(pub)
+    st = _store(_settings(tmp_path, license_file=str(tmp_path / "license.dcmp")))  # no public key json
+    (tmp_path / "license.dcmp").write_text(_issue(priv, kid, "dev-nokey"))
+    d = LicenseService(st.settings, st).resolve("dev-nokey", consume=False)
+    assert d["plan"] == "free"

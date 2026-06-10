@@ -1,54 +1,27 @@
 # Changelog
 
-## 0.1.5
-- **More Marketplace metadata hardening** (still hitting "suspicious content"): removed the
-  raw loopback IP (`127.0.0.1`) everywhere — manifest default, README, and the compiled bundle
-  now use `http://localhost:8080`; dropped the `sk-ant-` key-format example from the key prompt;
-  README leads with "opt-in, your own gateway, nothing sent to us."
+## 0.1.7
 
-## 0.1.4
-- **Marketplace metadata fixes** (resolve "suspicious content" on upload): dropped the
-  `repository` link that pointed at a non-public repo (404), added a public `homepage`,
-  reframed the name/description to make clear routing is **opt-in, through your own local
-  gateway, on your own key** (not traffic interception).
+- **First-run setup wizard (`Decompute: Set Up`).** A user who installs only this extension has no `decompute` CLI yet, so the extension now detects that and guides them through the whole thing, telling them exactly what to do at each step:
+  1. **Install the helper** — runs the installer in a terminal (overridable via `decompute.cliInstallCommand`) and auto-detects when the `decompute` command appears.
+  2. **Connect your Claude key** — opens the interactive `decompute init` wizard with on-screen instructions (choose Anthropic API key, paste your `sk-ant-…` key — it stays on your machine).
+  3. **Route Claude Code** — runs `decompute configure claude-code` for the configured gateway.
+  4. **Verify** — runs `decompute doctor`, then offers a one-click window reload.
+- The status bar now shows **"Decompute: Set up"** (one click into the wizard) until the CLI is installed and configured, instead of a misleading gateway-unreachable state.
+- First activation offers the wizard; **"Run Setup"** is also in the status-bar menu and command palette.
+- Added the `decompute.cliInstallCommand` setting so teams/local developers can point the installer at a custom command (e.g. `bash /path/to/decompute/scripts/install.sh`).
+- Hardened (from an adversarial review): the wizard routes Claude Code **in-process** and verifies over the gateway's `/health` endpoint instead of typing follow-up commands into the still-interactive `init` terminal (which would have been swallowed by its prompts); `decompute.cliInstallCommand` is **machine-scoped** and setup honors Workspace Trust so an untrusted repo can't inject an install command; success is only reported once the gateway is actually reachable; the CLI's `config.toml` is now written atomically; and CLI detection honors the installer's `DECOMPUTE_BIN`/`DECOMPUTE_HOME` overrides.
 
-## 0.1.3
-- **First-run onboarding:** the welcome and the "gateway not reachable" status now guide new users
-  with a **Get Started** action (and a `Decompute: Get Started` command) instead of dead-ending —
-  making clear the extension is a client to a Decompute gateway you need running.
-- **Marketplace listing:** added an extension icon and a top-of-README **Quick start** (get the
-  gateway → set your BYOK key → enable routing).
+## 0.1.6
 
-## 0.1.2
-- **Data-safety:** `~/.claude/settings.json` is never overwritten when it isn't valid JSON
-  (comments/corrupt) — it's left untouched with a warning instead of being wiped. Writes are now
-  atomic (temp+rename) with a one-time backup, write **through** symlinks (dotfiles-safe), and
-  preserve the file's permissions.
-- **Routing reliability:** routing no longer silently turns itself off on window reload (deactivate
-  no longer unwires); the terminal env-collection is non-persistent and rebuilt from settings on
-  activate; **Disable Routing** clears only the keys we manage (never your `ANTHROPIC_API_KEY`),
-  warns that already-running sessions keep routing until restarted, and reports if it couldn't
-  revert settings.json. The status bar now shows routing **ON/OFF** and the license state
-  (**Pro / Free N/limit / Paused**), and warns if routing is on but the gateway is unreachable.
-  Enable/Disable Routing now offer a one-click **Reload Window** so the change applies to the
-  already-open Claude Code panel immediately (it captures routing at session start, so a live
-  session can't be re-routed without a reload).
-- **Security:** the BYOK key is no longer written into VS Code's synced env-collection — it stays in
-  `~/.decompute/claude.key` (chmod 600, enforced even on a pre-existing file). The `vscode://activate`
-  deep link validates the key shape and exact path.
-- **Robustness:** API calls time out (no more hung status bar); `pollSeconds` is coerced/validated
-  and the poller restarts on change; health-check before enabling routing.
-- **Packaging:** `MIT` license id; the VSIX no longer ships tests/internal docs; CI gates releases on
-  the settings-safety test suite. Unit tests added for the data-loss/symlink/permission paths.
+- Rebuilt the VS Code extension as a thin controller/config UI for Decompute Claude Gateway.
+- Default gateway is hosted HTTPS: `https://gateway.decompute.run`.
+- Added commands for license activation, status, usage/savings, gateway URL configuration, dashboard access, local gateway health check, and copying the Claude Code setup command.
+- Removed direct Claude Code configuration mutation and provider credential collection from the VSIX.
+- Status bar now reflects actual routing: shows "Decompute off" when Claude Code isn't configured to use the gateway (`~/.claude/settings.json` has no matching `ANTHROPIC_BASE_URL`), instead of showing "Pro"/quota when Decompute isn't in the request path.
+- Added **Enable Routing** / **Disable Routing** commands (command palette + the status-bar click menu). They safely write/remove the routing `env` block in `~/.claude/settings.json` — preserving the user's other settings, never overwriting an unparseable file, writing atomically through symlinks with a one-time backup — and offer a one-click window reload so an open Claude Code panel picks up the change. The status bar updates immediately to reflect the new state.
+- Kept local gateway mode as an advanced opt-in setting for users who install Decompute Local Gateway separately.
 
-## 0.1.1
-- **Safety fix (incident):** routing is now **OFF by default** and never redirects Claude Code
-  until you run **"Decompute: Enable Routing"** and confirm a warning. Routing requires a funded
-  Anthropic **API key (BYOK)** — a **claude.ai subscription is not compatible** (routing would
-  divert billing to an API key and fail if it has no credits, surfacing as "credit balance too
-  low"). The extension also **self-heals** any routing block left by 0.1.0 and reverts cleanly on
-  disable/uninstall. Added a one-time welcome and an explicit enable/disable flow.
+## 0.1.5 and earlier
 
-## 0.1.0
-- Initial release: terminal routing, license/quota status bar, free-limit upgrade modal,
-  per-device Pro activation (paste or `vscode://` deep link), BYOK key setup, dashboard.
+- Internal pre-release Marketplace packaging iterations.

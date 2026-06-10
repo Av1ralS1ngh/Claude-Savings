@@ -4,7 +4,9 @@ from dataclasses import dataclass
 import asyncio
 import copy
 import json
+import random
 import time
+from contextlib import suppress
 from typing import Any, AsyncIterator
 
 import httpx
@@ -30,6 +32,37 @@ def _sanitize_auth_error(status_code: int) -> dict[str, Any]:
 from .config import Settings
 from .sse import SSEUsageTracker
 from .yscompress import estimate_tokens
+
+
+def _stream_timeout(settings: Settings) -> httpx.Timeout:
+    """Timeout for a streaming upstream call. `read` bounds the GAP BETWEEN chunks (not the
+    whole response) — Anthropic emits periodic pings, so a real stream stays well under it,
+    while a stalled upstream is broken instead of hanging the proxy forever. No overall cap,
+    so a legitimately long generation is never cut off mid-stream."""
+    return httpx.Timeout(
+        connect=settings.upstream_connect_timeout_s,
+        read=settings.upstream_read_timeout_s,
+        write=settings.upstream_write_timeout_s,
+        pool=settings.upstream_connect_timeout_s,
+    )
+
+
+def _nonstream_timeout(settings: Settings) -> httpx.Timeout:
+    """Timeout for a unary upstream call. The full body lands at once and can take minutes,
+    so `read` is the generous overall budget rather than a between-chunk gap."""
+    return httpx.Timeout(
+        connect=settings.upstream_connect_timeout_s,
+        read=settings.upstream_overall_timeout_s,
+        write=settings.upstream_write_timeout_s,
+        pool=settings.upstream_connect_timeout_s,
+    )
+
+
+def _retry_backoff_s(settings: Settings, attempt: int) -> float:
+    """Exponential backoff with jitter (full-jitter, capped) so concurrent Claude Code
+    requests retrying a 529 don't resynchronize into a thundering herd."""
+    base = settings.upstream_retry_backoff_s * (2 ** attempt)
+    return base + random.uniform(0.0, base * 0.25)
 
 
 @dataclass
@@ -144,12 +177,12 @@ async def call_anthropic_messages(
     clean_body = maybe_apply_prompt_cache(clean_gateway_fields(body), prompt_cache_mode)
     headers = upstream_headers(settings, upstream_api_key, extra_headers)
     url = settings.anthropic_base_url.rstrip("/") + "/v1/messages"
-    async with httpx.AsyncClient(timeout=None) as client:
+    async with httpx.AsyncClient(timeout=_nonstream_timeout(settings)) as client:
         for attempt in range(settings.upstream_max_retries + 1):
             resp = await client.post(url, json=clean_body, headers=headers)
             if resp.status_code not in RETRYABLE_STATUS or attempt >= settings.upstream_max_retries:
                 break
-            await asyncio.sleep(settings.upstream_retry_backoff_s * (2 ** attempt))
+            await asyncio.sleep(_retry_backoff_s(settings, attempt))
     if resp.status_code in (401, 403):
         # Hide provider key/account detail; keep headers (request-id) for tracing.
         return ProviderResult(status_code=resp.status_code, body=_sanitize_auth_error(resp.status_code), headers=dict(resp.headers))
@@ -227,25 +260,43 @@ async def stream_anthropic_messages(
 
     clean_body = maybe_apply_prompt_cache(clean_gateway_fields(body), prompt_cache_mode)
     headers = upstream_headers(settings, upstream_api_key, extra_headers, stream=True)
-    async with httpx.AsyncClient(timeout=None) as client:
-        async with client.stream("POST", settings.anthropic_base_url.rstrip("/") + "/v1/messages", json=clean_body, headers=headers) as resp:
-            tracker.upstream_request_id = resp.headers.get("request-id") or resp.headers.get("anthropic-request-id") or resp.headers.get("x-request-id")
-            if resp.status_code >= 400:
-                try:
-                    err_body = await resp.aread()
-                    err_json = json.loads(err_body.decode("utf-8"))
-                    if not isinstance(err_json, dict):
-                        err_json = {"type": "error", "error": {"message": str(err_json)}}
-                except Exception:
-                    err_json = {"type": "error", "error": {"message": f"upstream HTTP {resp.status_code}"}}
-                # Carry the real upstream HTTP status on the SSE error payload so the
-                # gateway can record it (rather than collapsing every stream error to
-                # 502); SSE events otherwise have no place for an HTTP status.
-                err_json.setdefault("http_status", resp.status_code)
-                chunk = f"event: error\ndata: {json_dumps(err_json)}\n\n".encode()
-                tracker.feed(chunk)
-                yield chunk
-                return
-            async for chunk in resp.aiter_bytes():
-                tracker.feed(chunk)
-                yield chunk
+    url = settings.anthropic_base_url.rstrip("/") + "/v1/messages"
+    async with httpx.AsyncClient(timeout=_stream_timeout(settings)) as client:
+        # Retry a transient upstream status (500/504/529) BEFORE any byte is yielded — once
+        # we forward a chunk the HTTP 200 status line is committed and retrying is impossible.
+        # This absorbs Anthropic overload at the gateway instead of surfacing it as an error
+        # event that Claude Code would itself retry, turning one 529 into a client-side storm.
+        for attempt in range(settings.upstream_max_retries + 1):
+            async with client.stream("POST", url, json=clean_body, headers=headers) as resp:
+                tracker.upstream_request_id = (
+                    resp.headers.get("request-id")
+                    or resp.headers.get("anthropic-request-id")
+                    or resp.headers.get("x-request-id")
+                )
+                if resp.status_code in RETRYABLE_STATUS and attempt < settings.upstream_max_retries:
+                    # Drain the small error body so the connection closes cleanly, then retry.
+                    with suppress(Exception):
+                        await resp.aread()
+                else:
+                    if resp.status_code >= 400:
+                        try:
+                            err_body = await resp.aread()
+                            err_json = json.loads(err_body.decode("utf-8"))
+                            if not isinstance(err_json, dict):
+                                err_json = {"type": "error", "error": {"message": str(err_json)}}
+                        except Exception:
+                            err_json = {"type": "error", "error": {"message": f"upstream HTTP {resp.status_code}"}}
+                        # Carry the real upstream HTTP status on the SSE error payload so the
+                        # gateway can record it (rather than collapsing every stream error to
+                        # 502); SSE events otherwise have no place for an HTTP status.
+                        err_json.setdefault("http_status", resp.status_code)
+                        chunk = f"event: error\ndata: {json_dumps(err_json)}\n\n".encode()
+                        tracker.feed(chunk)
+                        yield chunk
+                    else:
+                        async for chunk in resp.aiter_bytes():
+                            tracker.feed(chunk)
+                            yield chunk
+                    return
+            # Reached only on the retry path (the response context has now closed cleanly).
+            await asyncio.sleep(_retry_backoff_s(settings, attempt))

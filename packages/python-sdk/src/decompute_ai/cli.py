@@ -7,7 +7,7 @@ import subprocess
 import time
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import typer
 from rich import print
@@ -39,6 +39,12 @@ from .config import (
 from .errors import DecomputeError
 
 app = typer.Typer(help="Decompute Gateway CLI — BYOK (bring your own Claude key)")
+configure_app = typer.Typer(help="Configure editor and agent integrations.")
+app.add_typer(configure_app, name="configure")
+
+HOSTED_GATEWAY_URL = "https://gateway.decompute.run"
+CLAUDE_CONFIG_DIR = Path(os.getenv("DECOMPUTE_CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
+CLAUDE_SETTINGS = CLAUDE_CONFIG_DIR / "settings.json"
 
 
 def _client() -> Decompute:
@@ -95,6 +101,106 @@ def _conn() -> tuple[str, str]:
 def _new_session_id() -> str:
     """A fresh, opaque working-session id (safe charset, well under the gateway's 64-char cap)."""
     return f"cc-{uuid.uuid4().hex[:20]}"
+
+
+def _safe_gateway_url(value: str) -> str:
+    url = (value or "").strip().rstrip("/")
+    if not (url.startswith("https://") or url.startswith("http://")):
+        raise typer.BadParameter("gateway URL must start with http:// or https://")
+    return url
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"{path} is not valid JSON; leaving it untouched ({exc})") from exc
+    if not isinstance(obj, dict):
+        raise RuntimeError(f"{path} must contain a JSON object; leaving it untouched")
+    return obj
+
+
+def _write_json_atomic(path: Path, obj: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = 0o600
+    if path.exists():
+        try:
+            mode = path.stat().st_mode & 0o777
+        except Exception:
+            pass
+    tmp = path.with_name(f".{path.name}.decompute.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(obj, indent=2) + "\n", encoding="utf-8")
+    try:
+        tmp.chmod(mode)
+    except Exception:
+        pass
+    os.replace(tmp, path)
+
+
+def _claude_code_env(base_url: str, *, decompute_api_key: str | None = None, session_id: str | None = None) -> dict[str, str]:
+    sid = session_id or _new_session_id()
+    headers = [
+        f"x-decompute-session-id: {sid}",
+        f"x-decompute-device: {load_device_id()}",
+    ]
+    if decompute_api_key:
+        headers.insert(0, f"x-decompute-api-key: {decompute_api_key.strip()}")
+    return {
+        "ANTHROPIC_BASE_URL": base_url,
+        "ANTHROPIC_CUSTOM_HEADERS": "\n".join(headers),
+    }
+
+
+def _write_claude_code_settings(env_block: dict[str, str]) -> None:
+    settings = _read_json_object(CLAUDE_SETTINGS)
+    env = settings.get("env")
+    if env is not None and not isinstance(env, dict):
+        raise RuntimeError(f"{CLAUDE_SETTINGS} has a non-object env block; leaving it untouched")
+    settings["env"] = {**(env or {}), **env_block}
+    _write_json_atomic(CLAUDE_SETTINGS, settings)
+
+
+@configure_app.command("claude-code")
+def configure_claude_code(
+    gateway_url: Optional[str] = typer.Option(None, "--gateway-url", help="Decompute Gateway URL. Defaults to the hosted gateway."),
+    local: bool = typer.Option(False, "--local", help="Use the locally configured gateway URL instead of the hosted gateway."),
+    decompute_api_key: Optional[str] = typer.Option(None, "--decompute-api-key", envvar="DECOMPUTE_API_KEY", help="Optional Decompute platform key for hosted gateways."),
+    print_env: bool = typer.Option(False, "--print-env", help="Print the Claude Code env block instead of writing settings."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Apply without an interactive confirmation."),
+):
+    """Configure Claude Code to use Decompute Gateway.
+
+    This command belongs in the CLI/native installer path, not in the VS Code extension. It writes
+    gateway routing and Decompute headers only; it never asks for provider credentials.
+    """
+    base_url = _safe_gateway_url(gateway_url or (cfg_base_url() if local else HOSTED_GATEWAY_URL))
+    sid = _new_session_id()
+    env_block = _claude_code_env(base_url, decompute_api_key=decompute_api_key, session_id=sid)
+
+    if print_env:
+        for key, value in env_block.items():
+            print(f'export {key}="{value}"')
+        return
+
+    if not yes:
+        print(f"Claude Code settings: [cyan]{CLAUDE_SETTINGS}[/cyan]")
+        print(f"Gateway: [cyan]{base_url}[/cyan]")
+        if not typer.confirm("Apply this Decompute configuration?", default=True):
+            raise typer.Exit(1)
+
+    try:
+        _write_claude_code_settings(env_block)
+    except RuntimeError as exc:
+        print(f"[red]✗[/red] {exc}")
+        raise typer.Exit(1)
+
+    save_config({"gateway": {"base_url": base_url}})
+    set_session_id(sid)
+    print(f"[green]✓[/green] Claude Code configured for Decompute Gateway: [cyan]{base_url}[/cyan]")
+    print(f"  Settings: [cyan]{CLAUDE_SETTINGS}[/cyan]")
+    print("  Restart Claude Code or open a new session for the change to take effect.")
 
 
 def _claude_env_lines(base_url: str, claude_key: str, session_id: str, *, include_key: bool = True) -> dict[str, str]:

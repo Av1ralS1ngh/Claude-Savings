@@ -149,9 +149,27 @@ def _render_toml(cfg: dict) -> str:
 
 
 def save_config(updates: dict) -> Path:
-    """Deep-merge nested updates into config.toml. NEVER write the Claude key here."""
+    """Deep-merge nested updates into config.toml. NEVER write the Claude key here.
+
+    Written atomically (temp file in the same dir → fsync → os.replace) so a concurrent reader
+    (the gateway, or the VS Code extension polling for config.toml during `decompute init`) never
+    sees a truncated/half-written file: config.toml holds either the old or the complete new
+    contents, never a partial state."""
     _ensure_config_dir()  # owner-only dir, even if it pre-existed looser
-    CONFIG_TOML.write_text(_render_toml(_deep_merge(load_config(), updates or {})), encoding="utf-8")
+    data = _render_toml(_deep_merge(load_config(), updates or {})).encode("utf-8")
+    fd, tmp = tempfile.mkstemp(dir=str(CONFIG_DIR), prefix=CONFIG_TOML.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, CONFIG_TOML)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     return CONFIG_TOML
 
 

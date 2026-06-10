@@ -892,17 +892,22 @@ class Store:
         project_id: str,
         since: datetime | None,
         until: datetime | None = None,
-        buckets: int = 48,
+        limit: int = 60,
     ) -> dict[str, Any]:
-        """Per-request savings % bucketed into `buckets` equal time-slices across the
-        window, for the performance-over-time chart.
+        """The most recent `limit` requests in the window [since, until], each as its own
+        point (NOT time-bucketed), for the performance-over-time chart. Ordered oldest ->
+        newest, so the LAST point is always the latest request.
 
-        The window is [since, until]; for since=None ("all time") it starts at the
-        project's earliest usage event so the chart spans the whole history. Each
-        bucket carries the MEAN savings % of the requests whose created_at falls in
-        its slice, or None when the slice has no requests (so the caller can draw real
-        gaps rather than fabricating zeros). Returns
-        {"t_start", "t_end", "buckets": [ {"saved_pct": float, "n": int} | None ]}."""
+        Why per-request instead of time-bucketing: Claude Code fires a burst of requests
+        per turn (the agent loop), all within seconds. Bucketing them into a time slice and
+        plotting the slice MEAN averaged the burst into one diluted value (e.g. four log
+        reads at 34/29/4/6% -> 18%), so the chart's right edge could never equal the
+        headline "Latest request" %. One point per request fixes that: the end point IS the
+        latest request, and savings use the SAME calc as the headline (`_row_savings_pct`),
+        so the two always agree. Stable on reload — the same recent requests render
+        identically until a new one arrives. Returns
+        {"points": [ {"saved_pct": float, "created_at": datetime} ] oldest->newest,
+         "t_start", "t_end"} (t_start/t_end = first/last point time, for axis labels)."""
         until = until or utc_ts()
         if until.tzinfo is None:
             until = until.replace(tzinfo=timezone.utc)
@@ -914,41 +919,25 @@ class Store:
             ).filter(UsageEvent.project_id == project_id, UsageEvent.created_at <= until)
             if since is not None:
                 q = q.filter(UsageEvent.created_at >= since)
-            rows = q.order_by(UsageEvent.created_at.asc()).all()
+            # Newest first (id.desc tiebreaker = same "latest" as the headline card), capped,
+            # then reversed to oldest->newest for left-to-right plotting.
+            rows = q.order_by(
+                UsageEvent.created_at.desc(), UsageEvent.id.desc()
+            ).limit(max(1, limit)).all()
 
         if not rows:
-            return {"t_start": None, "t_end": None, "buckets": [None] * buckets}
+            return {"points": [], "t_start": None, "t_end": None}
 
         def _aware(dt: datetime) -> datetime:
             return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
-        # For a fixed range, anchor the window at `since` so the axis spans the FULL
-        # window (e.g. the whole last hour) even if the first request landed later.
-        # For "all time", anchor at the earliest event.
-        t_start = _aware(since) if since is not None else _aware(rows[0][0])
-        t_end = until
-        span = (t_end - t_start).total_seconds()
-
-        sums = [0.0] * buckets
-        counts = [0] * buckets
-        for created, raw, final in rows:
-            created = _aware(created)
-            raw = int(raw or 0)
-            final = int(final or 0)
-            pct = max(0.0, (1.0 - final / raw) * 100.0) if raw else 0.0
-            if span <= 0:
-                idx = buckets - 1
-            else:
-                idx = int((created - t_start).total_seconds() / span * buckets)
-                idx = max(0, min(buckets - 1, idx))
-            sums[idx] += pct
-            counts[idx] += 1
-
-        out = [
-            {"saved_pct": sums[i] / counts[i], "n": counts[i]} if counts[i] else None
-            for i in range(buckets)
+        rows = list(reversed(rows))  # oldest -> newest
+        points = [
+            {"saved_pct": self._row_savings_pct(int(raw or 0), int(final or 0)),
+             "created_at": _aware(created)}
+            for created, raw, final in rows
         ]
-        return {"t_start": t_start, "t_end": t_end, "buckets": out}
+        return {"points": points, "t_start": points[0]["created_at"], "t_end": points[-1]["created_at"]}
 
     def monthly_spend(self, *, project_id: str, now: datetime | None = None) -> float:
         now = now or utc_ts()

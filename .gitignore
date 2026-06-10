@@ -26,3 +26,4 @@ docs/*CHECKLIST*.md
 CCsetup.md
 *.whl
 *.pyarmor
+pyarmor.bug.log

@@ -81,6 +81,17 @@ class Settings:
     ccr_key_id: str = os.getenv("DECOMPUTE_CCR_KEY_ID", "local-v1")
 
     prompt_cache_mode: str = os.getenv("DECOMPUTE_PROMPT_CACHE", "auto")
+    # When the client already manages prompt caching (Claude Code sends cache_control), compressing
+    # the conversation rewrites the cached prefix and BUSTS the cache — re-billing the full context
+    # at list price every turn. The cache discount (~90% off repeated input) dwarfs compression
+    # savings for agentic sessions, so by default we skip compression for cache-controlled requests
+    # and let the cache work. Set false to force compression (accepting the cache bust).
+    preserve_prompt_cache: bool = _bool("DECOMPUTE_PRESERVE_PROMPT_CACHE", True)
+    # ...but only when the request is THIS large (estimated input tokens). Below this, compression
+    # wins (new content compresses ~90-99% and any cache being busted is small); above it, the cache
+    # discount on a huge repeated context dominates, so we preserve it. Tuned to sit between a normal
+    # Claude Code turn / log read (tens of K) and a giant re-sent Opus context (hundreds of K).
+    preserve_cache_min_tokens: int = _int("DECOMPUTE_PRESERVE_CACHE_MIN_TOKENS", 250000)
 
     # Privacy-safe support bundle (decompute support bundle / POST /v1/support/bundle).
     # Defaults the bundle's PII mode to the gateway-wide pii_mode so they stay aligned.
@@ -143,6 +154,21 @@ class Settings:
     # Enable only for manual ops / demos behind real admin auth.
     enable_admin_license_issue: bool = _bool("DECOMPUTE_ENABLE_ADMIN_LICENSE_ISSUE", False)
 
+    # ── Offline signed-license file (local-engine Pro gate) ───────────────────
+    # When the gateway runs ON THE USER'S MACHINE the DB row above is forgeable (insert a License
+    # row -> free Pro), so Pro is instead proven by an Ed25519-SIGNED license file the hosted issuer
+    # mints. The engine ships only the PUBLIC key(s) and verifies offline; see signed_license.py.
+    signed_license_enabled: bool = _bool("DECOMPUTE_SIGNED_LICENSE_ENABLED", True)
+    # Path to the signed license file (chmod 600). Tilde-expanded at read time.
+    license_file: str = os.getenv("DECOMPUTE_LICENSE_FILE", "~/.decompute/license.dcmp")
+    # Trusted public verify-keys as JSON {kid: PEM}. Empty => only signed_license.EMBEDDED_*
+    # (which a release build bakes in) is trusted. The PRIVATE key NEVER lives here.
+    license_public_keys_json: str = os.getenv("DECOMPUTE_LICENSE_PUBLIC_KEYS", "")
+    # Forward clock-skew tolerance and post-expiry offline grace (a lapsed sub keeps Pro this long
+    # after the signed expiry, since an offline client can't be told the sub ended any sooner).
+    license_clock_skew_s: int = _int("DECOMPUTE_LICENSE_CLOCK_SKEW_S", 300)
+    license_offline_grace_days: int = _int("DECOMPUTE_LICENSE_OFFLINE_GRACE_DAYS", 0)
+
     @property
     def billing_enabled(self) -> bool:
         return bool(self.stripe_secret_key)
@@ -150,6 +176,18 @@ class Settings:
     # Retry transient upstream failures (500/504/529) with exponential backoff.
     upstream_max_retries: int = _int("DECOMPUTE_UPSTREAM_MAX_RETRIES", 2)
     upstream_retry_backoff_s: float = _float("DECOMPUTE_UPSTREAM_RETRY_BACKOFF_S", 0.25)
+
+    # Upstream HTTP timeouts. A bare timeout=None lets a stalled Anthropic response hang
+    # the proxy (and the Claude Code client) forever — and a hung stream never releases its
+    # concurrency slot. connect/write are shared; read differs by path:
+    #   - streaming uses read as the max GAP BETWEEN chunks (Anthropic pings keep an active
+    #     stream well under this), with no overall cap so long generations stay legitimate;
+    #   - non-streaming uses upstream_overall_timeout_s as read, since the whole body lands
+    #     at once and can legitimately take minutes.
+    upstream_connect_timeout_s: float = _float("DECOMPUTE_UPSTREAM_CONNECT_TIMEOUT_S", 10.0)
+    upstream_read_timeout_s: float = _float("DECOMPUTE_UPSTREAM_READ_TIMEOUT_S", 120.0)
+    upstream_write_timeout_s: float = _float("DECOMPUTE_UPSTREAM_WRITE_TIMEOUT_S", 120.0)
+    upstream_overall_timeout_s: float = _float("DECOMPUTE_UPSTREAM_OVERALL_TIMEOUT_S", 600.0)
 
     allowed_models: list[str] = field(default_factory=lambda: _csv("DECOMPUTE_ALLOWED_MODELS", "claude-sonnet,claude-opus,claude-haiku"))
     return_proxy_metadata: bool = _bool("DECOMPUTE_RETURN_PROXY_METADATA", False)

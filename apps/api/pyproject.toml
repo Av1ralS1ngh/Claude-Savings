@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "decompute-gateway"
+version = "0.1.0"
+description = "Decompute Claude optimization gateway — local, BYOK. Runs on the user's machine and routes Claude Code through the compression engine."
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [{ name = "Decompute", email = "xcomp.decompute@gmail.com" }]
+
+# The actually-imported third-party deps (requirements.txt was incomplete — missing sqlalchemy,
+# prometheus-client, cryptography, and the engine itself). `yscompress` is the compression engine;
+# the installer can point pip at the obfuscated/signed wheel on your index instead of plain PyPI.
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "starlette>=0.27",
+  "httpx>=0.27",
+  "pydantic>=2.7",
+  "sqlalchemy>=2.0",
+  "alembic>=1.13",
+  "python-dotenv>=1.0",
+  "prometheus-client>=0.20",
+  "stripe>=9,<16",
+  "cryptography>=42",
+  "yscompress",
+]
+
+[project.scripts]
+# `decompute claude` finds this on PATH and starts the gateway (see SDK _find_gateway_launcher).
+decompute-gateway = "decompute_gateway.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["decompute_gateway*"]
+
+[tool.setuptools.package-data]
+# main.py loads this via Path(__file__).parent — it must ship inside the wheel.
+decompute_gateway = ["*.html"]

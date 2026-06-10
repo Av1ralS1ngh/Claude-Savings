@@ -1,11 +1,16 @@
 {
   "name": "decompute",
-  "displayName": "Decompute \u2014 context compressor for Claude Code",
-  "description": "Compress Claude Code's context to cut tokens \u2014 opt-in routing through your OWN local Decompute gateway, on your OWN Anthropic key (BYOK). Off by default. Free 100/day; Pro unlimited.",
-  "version": "0.1.5",
+  "displayName": "Decompute Claude Gateway",
+  "description": "Configure Decompute Gateway for Claude Code, view license and usage, and copy the setup command. Hosted HTTPS gateway by default; local gateway is advanced opt-in.",
+  "version": "0.1.7",
   "publisher": "decompute",
   "license": "MIT",
   "icon": "icon.png",
+  "qna": false,
+  "galleryBanner": {
+    "color": "#0f172a",
+    "theme": "dark"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -16,49 +21,77 @@
   ],
   "keywords": [
     "claude",
-    "anthropic",
     "claude code",
+    "gateway",
     "tokens",
-    "compression"
+    "compression",
+    "usage"
   ],
   "homepage": "https://decompute.ai",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Decompute-AI/Claude-Coder.git",
+    "directory": "apps/vscode-extension"
+  },
+  "bugs": {
+    "url": "https://github.com/Decompute-AI/Claude-Coder/issues"
+  },
   "activationEvents": [
-    "onStartupFinished"
+    "onStartupFinished",
+    "onUri"
   ],
   "main": "./dist/extension.js",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "Setup runs an installer command and writes Claude Code routing config. Open a folder you trust before running 'Decompute: Set Up'."
+    }
+  },
   "contributes": {
     "commands": [
+      {
+        "command": "decompute.setup",
+        "title": "Decompute: Set Up (install CLI + connect Claude Code)"
+      },
       {
         "command": "decompute.getStarted",
         "title": "Decompute: Get Started"
       },
       {
         "command": "decompute.activate",
-        "title": "Decompute: Activate Pro License"
+        "title": "Decompute: Activate License"
       },
       {
         "command": "decompute.upgrade",
-        "title": "Decompute: Upgrade to Pro"
+        "title": "Decompute: Upgrade"
       },
       {
         "command": "decompute.status",
         "title": "Decompute: Show Status"
       },
       {
-        "command": "decompute.setKey",
-        "title": "Decompute: Set Claude (Anthropic) Key"
+        "command": "decompute.showUsage",
+        "title": "Decompute: Show Usage and Savings"
+      },
+      {
+        "command": "decompute.configureGateway",
+        "title": "Decompute: Configure Gateway URL"
+      },
+      {
+        "command": "decompute.copyClaudeSetup",
+        "title": "Decompute: Copy Claude Code Setup Command"
       },
       {
         "command": "decompute.enableRouting",
-        "title": "Decompute: Enable Routing (compress via gateway)"
-      },
-      {
-        "command": "decompute.rewire",
-        "title": "Decompute: Re-wire Claude Code Routing"
+        "title": "Decompute: Enable Routing (route Claude Code through the gateway)"
       },
       {
         "command": "decompute.disableRouting",
         "title": "Decompute: Disable Routing (go direct)"
+      },
+      {
+        "command": "decompute.checkLocalGateway",
+        "title": "Decompute: Check Local Gateway Status"
       },
       {
         "command": "decompute.openDashboard",
@@ -70,23 +103,25 @@
       "properties": {
         "decompute.gatewayUrl": {
           "type": "string",
-          "default": "http://localhost:8080",
-          "description": "Decompute gateway base URL."
+          "default": "https://gateway.decompute.run",
+          "scope": "machine-overridable",
+          "description": "Decompute Gateway base URL. Hosted HTTPS is the default; self-managed gateways are advanced opt-in."
         },
-        "decompute.autoWireTerminal": {
-          "type": "boolean",
-          "default": false,
-          "description": "Route the Claude Code CLI in integrated terminals through the gateway (ANTHROPIC_BASE_URL + Decompute headers). OFF by default \u2014 routing requires a funded Anthropic API key (BYOK); enable via 'Decompute: Enable Routing'. The Claude key is never written here."
-        },
-        "decompute.routeClaudeCodePanel": {
-          "type": "boolean",
-          "default": false,
-          "description": "Route the Claude Code VS Code panel (and CLI) through the gateway via an env block in ~/.claude/settings.json. OFF by default. WARNING: if you use a claude.ai subscription, routing switches billing to an API key and will fail if it has no credits. Reverted automatically when disabled."
+        "decompute.localGatewayUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Optional advanced local gateway URL used only by the local status check. Leave blank unless you installed Decompute Local Gateway separately."
         },
         "decompute.pollSeconds": {
           "type": "number",
           "default": 60,
-          "description": "How often (seconds) to refresh license/quota status in the status bar."
+          "description": "How often, in seconds, to refresh license and quota status in the status bar."
+        },
+        "decompute.cliInstallCommand": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Command run in a terminal by 'Decompute: Set Up' to install the `decompute` CLI when it's missing. Leave blank to use the default installer (curl … install.sh | bash). Local development: set to e.g. `bash /path/to/decompute/scripts/install.sh`. (Machine-scoped: cannot be set by a workspace, so an untrusted repo can't inject an install command.)"
         }
       }
     }
@@ -97,7 +132,7 @@
     "build:min": "npm run build -- --minify",
     "watch": "npm run build -- --sourcemap --watch",
     "typecheck": "tsc --noEmit",
-    "test": "esbuild src/settings.ts --bundle --format=esm --platform=node --outfile=dist/settings.mjs && node --test test/settings.test.mjs",
+    "test": "esbuild src/url.ts --bundle --format=esm --platform=node --outfile=dist/url.mjs && esbuild src/settings.ts --bundle --format=esm --platform=node --outfile=dist/settings.mjs && esbuild src/setup.ts --bundle --format=esm --platform=node --outfile=dist/setup.mjs && node --test test/url.test.mjs test/settings.test.mjs test/setup.test.mjs",
     "package": "vsce package --no-dependencies",
     "publish": "vsce publish --no-dependencies"
   },

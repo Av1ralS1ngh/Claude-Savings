@@ -353,6 +353,21 @@ class StreamUsageTracker:
         return event
 
 
+def _error_event_bytes(message: str, http_status: int | None = None) -> bytes:
+    """A terminal Anthropic-style SSE `error` event, synthesized by the gateway.
+
+    Once a StreamingResponse has emitted its first byte the HTTP 200 is committed, so an
+    upstream stall/drop/error after that point cannot change the status. Without an explicit
+    terminal event the downstream client (Claude Code) keeps waiting on a silent chunked
+    stream — the "stuck thinking forever" symptom. Emitting this guarantees the client's SSE
+    reader always sees an end. The true status is still recorded in usage accounting.
+    """
+    err: JsonDict = {"type": "error", "error": {"type": "api_error", "message": f"Decompute gateway: {message}"}}
+    if http_status is not None:
+        err["http_status"] = http_status
+    return sse_bytes("error", err)
+
+
 async def proxy_sse_stream(
     upstream_chunks: AsyncIterator[bytes],
     *,
@@ -402,8 +417,15 @@ async def proxy_sse_stream(
             for ev in decoder.flush():
                 tracker.observe(ev)
             tracker.mark_finished()
+            if not tracker.message_stop_seen and not tracker.stream_error:
+                # Upstream closed cleanly but never delivered a terminal event (a
+                # truncated or empty stream). The client is still attached — give it an
+                # explicit end so its SSE reader doesn't wait forever.
+                yield _error_event_bytes("upstream stream ended without message_stop")
 
     except asyncio.CancelledError:
+        # Client disconnect / task cancellation: the downstream client is gone, so we must
+        # NOT yield (it would error) — just record and re-raise to propagate cancellation.
         tracker.mark_cancelled("stream_task_cancelled")
         raise
 
@@ -411,9 +433,19 @@ async def proxy_sse_stream(
         tracker.mark_cancelled("stream_generator_closed")
         raise
 
-    except BaseException as exc:
+    except Exception as exc:
+        # Upstream/gateway failure after the 200 was committed (e.g. httpx ReadTimeout on a
+        # stalled stream, RemoteProtocolError on a mid-stream drop). Hand the still-attached
+        # client a clean terminal `error` event instead of a dangling half-written chunked
+        # response, then end gracefully — re-raising here would just abort the socket with no
+        # terminal, which is the hang we are fixing. The failure is recorded for accounting.
         tracker.mark_gateway_exception(exc)
-        raise
+        if not tracker.message_stop_seen and not tracker.stream_error:
+            with suppress(Exception):
+                yield _error_event_bytes(
+                    f"upstream stream failed: {type(exc).__name__}", tracker.upstream_status_code
+                )
+        return
 
     finally:
         # Always close an async generator if we own it. This is what prevents a
