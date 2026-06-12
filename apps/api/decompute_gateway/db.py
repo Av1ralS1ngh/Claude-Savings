@@ -94,18 +94,19 @@ class Store:
         # switching to Postgres) sees the schema as up-to-date. create_all builds the
         # LATEST ORM schema, so we stamp the latest head — never a hard-coded revision.
         head = self._alembic_head()
-        with self.engine.begin() as conn:
-            conn.execute(text(
-                "CREATE TABLE IF NOT EXISTS alembic_version "
-                "(version_num VARCHAR(32) NOT NULL, PRIMARY KEY (version_num))"
-            ))
-            existing = conn.execute(text("SELECT version_num FROM alembic_version")).fetchone()
-            if not existing:
-                conn.execute(text("INSERT INTO alembic_version(version_num) VALUES (:v)"), {"v": head})
-            elif existing[0] != head:
-                # Schema was just evolved to head by create_all + column shim; advance
-                # the stamp so it matches reality and a later upgrade is a clean no-op.
-                conn.execute(text("UPDATE alembic_version SET version_num = :v"), {"v": head})
+        if head is not None:  # None when no migrations ship (pip-installed wheel) — skip stamping
+            with self.engine.begin() as conn:
+                conn.execute(text(
+                    "CREATE TABLE IF NOT EXISTS alembic_version "
+                    "(version_num VARCHAR(32) NOT NULL, PRIMARY KEY (version_num))"
+                ))
+                existing = conn.execute(text("SELECT version_num FROM alembic_version")).fetchone()
+                if not existing:
+                    conn.execute(text("INSERT INTO alembic_version(version_num) VALUES (:v)"), {"v": head})
+                elif existing[0] != head:
+                    # Schema was just evolved to head by create_all + column shim; advance
+                    # the stamp so it matches reality and a later upgrade is a clean no-op.
+                    conn.execute(text("UPDATE alembic_version SET version_num = :v"), {"v": head})
         self.ensure_default_project()
 
     def _evolve_sqlite_columns(self) -> None:
@@ -127,22 +128,28 @@ class Store:
                     conn.execute(text(f'ALTER TABLE {table.name} ADD COLUMN "{col.name}" {coltype}'))
 
     @staticmethod
-    def _alembic_head() -> str:
-        """Current Alembic head revision, so the SQLite create_all path stamps the
-        same version `alembic upgrade head` would. Resolves the script location to an
-        ABSOLUTE path so head detection works regardless of process CWD (gunicorn/
-        systemd often run from / or a unit WorkingDirectory)."""
+    def _alembic_head() -> str | None:
+        """Current Alembic head revision, so the SQLite create_all path stamps the same version
+        `alembic upgrade head` would. Returns None when the alembic migration scripts aren't present
+        — a pip-installed wheel ships no `alembic/` directory, so there's no migration history to
+        stamp against and the gateway must still start. Resolves to an ABSOLUTE script path so head
+        detection works regardless of process CWD (gunicorn/systemd often run from /)."""
         from pathlib import Path
-        from alembic.config import Config
-        from alembic.script import ScriptDirectory
+        try:
+            from alembic.config import Config
+            from alembic.script import ScriptDirectory
+        except ImportError:
+            return None
         ini = Path(__file__).resolve().parents[3] / "alembic.ini"
-        cfg = Config(str(ini)) if ini.exists() else Config("alembic.ini")
-        # script_location in alembic.ini is relative ("alembic"); make it absolute so
-        # ScriptDirectory doesn't resolve against CWD and silently fail.
-        script_dir = (ini.parent / "alembic")
-        if script_dir.exists():
-            cfg.set_main_option("script_location", str(script_dir))
-        return ScriptDirectory.from_config(cfg).get_current_head()
+        script_dir = ini.parent / "alembic"
+        if not script_dir.exists():
+            return None  # installed layout: no migrations shipped — nothing to stamp
+        cfg = Config(str(ini)) if ini.exists() else Config()
+        cfg.set_main_option("script_location", str(script_dir))
+        try:
+            return ScriptDirectory.from_config(cfg).get_current_head()
+        except Exception:
+            return None
 
     @staticmethod
     def _id(prefix: str) -> str:

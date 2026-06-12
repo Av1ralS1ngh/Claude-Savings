@@ -164,7 +164,7 @@ class YSCompressClient:
                 loop = asyncio.get_running_loop()
                 result = await loop.run_in_executor(
                     None,
-                    partial(_headroom_compress, stage_messages, model="claude-haiku-4-5")
+                    partial(_headroom_compress, stage_messages, model="claude-haiku-4-5", compress_user_messages=self.settings.compress_user_messages)
                 )
                 final_messages = result.messages
                 tokens_after = estimate_tokens(final_messages)

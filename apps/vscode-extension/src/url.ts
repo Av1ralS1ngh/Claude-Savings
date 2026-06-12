@@ -1,4 +1,6 @@
-export const DEFAULT_GATEWAY_URL = "https://gateway.decompute.run";
+// Local-first: the setup wizard installs a gateway on the user's machine that listens here, and
+// compression runs locally (BYOK). A hosted/self-managed gateway is an opt-in override.
+export const DEFAULT_GATEWAY_URL = "http://127.0.0.1:8080";
 export const CLAUDE_SETUP_COMMAND = "decompute configure claude-code";
 
 export function normalizeGatewayUrl(value: string | null | undefined, fallback = DEFAULT_GATEWAY_URL): string {

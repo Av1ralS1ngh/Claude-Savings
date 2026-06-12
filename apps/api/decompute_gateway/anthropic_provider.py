@@ -164,6 +164,30 @@ def mock_claude_response(body: dict[str, Any]) -> ProviderResult:
     return ProviderResult(status_code=200, body=payload, headers={"request-id": "req_mock"})
 
 
+def mock_claude_stream_chunks(payload: dict[str, Any]) -> list[bytes]:
+    """Anthropic-shaped SSE chunks for the local/mock provider path.
+
+    Claude Code requires `message_start` to wrap the message object under a
+    `message` key. Sending the raw message object makes the client ignore the
+    start event, then fail on the next content_block_delta with "without a
+    current message".
+    """
+
+    text = payload["content"][0]["text"]
+    message = {k: v for k, v in payload.items() if k != "content"}
+    message["content"] = []
+    message["usage"] = {"input_tokens": payload["usage"]["input_tokens"], "output_tokens": 0}
+    output_tokens = payload["usage"]["output_tokens"]
+    return [
+        f"event: message_start\ndata: {json_dumps({'type': 'message_start', 'message': message})}\n\n".encode(),
+        f"event: content_block_start\ndata: {json_dumps({'type':'content_block_start','index':0,'content_block':{'type':'text','text':''}})}\n\n".encode(),
+        f"event: content_block_delta\ndata: {json_dumps({'type':'content_block_delta','index':0,'delta':{'type':'text_delta','text':text}})}\n\n".encode(),
+        f"event: content_block_stop\ndata: {json_dumps({'type':'content_block_stop','index':0})}\n\n".encode(),
+        f"event: message_delta\ndata: {json_dumps({'type':'message_delta','delta':{'stop_reason':'end_turn','stop_sequence':None},'usage':{'output_tokens':output_tokens}})}\n\n".encode(),
+        f"event: message_stop\ndata: {json_dumps({'type':'message_stop'})}\n\n".encode(),
+    ]
+
+
 async def call_anthropic_messages(
     body: dict[str, Any],
     *,
@@ -244,16 +268,7 @@ async def stream_anthropic_messages(
     if settings.mock_anthropic or not upstream_api_key:
         tracker.upstream_request_id = "req_mock"
         payload = mock_claude_response(body).body
-        text = payload["content"][0]["text"]
-        chunks = [
-            f"event: message_start\ndata: {json_dumps({k:v for k,v in payload.items() if k != 'content'})}\n\n".encode(),
-            f"event: content_block_start\ndata: {json_dumps({'type':'content_block_start','index':0,'content_block':{'type':'text','text':''}})}\n\n".encode(),
-            f"event: content_block_delta\ndata: {json_dumps({'type':'content_block_delta','index':0,'delta':{'type':'text_delta','text':text}})}\n\n".encode(),
-            f"event: content_block_stop\ndata: {json_dumps({'type':'content_block_stop','index':0})}\n\n".encode(),
-            f"event: message_delta\ndata: {json_dumps({'type':'message_delta','delta':{'stop_reason':'end_turn','stop_sequence':None},'usage':payload['usage']})}\n\n".encode(),
-            f"event: message_stop\ndata: {json_dumps({'type':'message_stop'})}\n\n".encode(),
-        ]
-        for c in chunks:
+        for c in mock_claude_stream_chunks(payload):
             tracker.feed(c)
             yield c
         return

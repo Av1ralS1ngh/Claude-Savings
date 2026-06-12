@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 import secrets
 from typing import Iterable
 
@@ -94,9 +95,33 @@ def auth_context(request: Request, store: Store, settings: Settings, *, required
     return principal
 
 
+def _read_byok_key(settings: Settings) -> str | None:
+    """The BYOK Claude key the user connected via `decompute init` (~/.decompute/claude.key).
+
+    Read it here so a routed Claude Code on a claude.ai SUBSCRIPTION — which sends an OAuth bearer,
+    not an sk-ant key — still authenticates UPSTREAM with the funded key. Without this the gateway
+    forwards the client's OAuth token, Anthropic returns 401, and the client retries the 401 forever,
+    which looks exactly like Claude Code "thinking" with no reply. Read per-request so a key connected
+    after the gateway started is picked up without a restart; the file is tiny and OS-cached, and the
+    key never leaves ~/.decompute (it is NOT written into ~/.claude/settings.json)."""
+    try:
+        p = Path(settings.data_dir) / "claude.key"
+        if p.is_file():
+            return p.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        pass
+    return None
+
+
 def upstream_anthropic_key(request: Request, settings: Settings) -> str | None:
     if settings.anthropic_api_key:
         return settings.anthropic_api_key
+    # Local BYOK: the key connected via `decompute init`. Preferred over the client's credential so a
+    # subscription client's OAuth bearer isn't forwarded upstream (→ 401 → the client retries forever).
+    # A hosted/teams gateway has no local claude.key, so this is None and the client's key is used.
+    byok = _read_byok_key(settings)
+    if byok:
+        return byok
     if not settings.allow_client_provider_key:
         return None
     # x-api-key is reserved for Anthropic/Claude clients. Bearer is used only if it is not a Decompute dc_* key.

@@ -26,6 +26,11 @@ dependencies = [
   "stripe>=9,<16",
   "cryptography>=42",
   "yscompress",
+  # The ML compressor (kompress) needs an ONNX runtime + a tokenizer. yscompress declares these only
+  # as an OPTIONAL extra, so without them the gateway silently falls back to lighter (non-ML)
+  # compression — the headline savings never run. Make them hard deps of the gateway.
+  "onnxruntime>=1.20,<2",
+  "transformers>=4.44,<6",
 ]
 
 [project.scripts]

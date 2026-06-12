@@ -3,6 +3,12 @@ import os
 
 import pytest
 
+from decompute_gateway.config import Settings
+
+
+def test_local_gateway_defaults_to_real_upstream_when_key_is_present():
+    assert Settings().mock_anthropic is False
+
 
 def test_production_refuses_sqlite_and_mock(monkeypatch):
     monkeypatch.setenv("DECOMPUTE_ENV", "production")

@@ -1,45 +1,73 @@
-# Decompute Claude Gateway for VS Code
+**Cut your Claude Code token bill — without changing how you work.**
 
-Decompute for VS Code is a thin controller for Decompute Claude Gateway. It lets you connect a Decompute license, view usage and savings, configure the gateway URL, open the dashboard, and copy the Claude Code setup command.
+Decompute runs a lightweight gateway **on your own machine** that compresses the context Claude Code sends to Anthropic. You pay for fewer tokens on every request, with the same model and the same answers.
 
-Compression does not run inside this VSIX. It runs in the hosted Decompute Gateway by default, or in a separately installed Decompute Local Gateway for advanced private/local mode.
+> 🔒 **Private by design.** Bring your own Anthropic key. Your code and prompts are compressed locally and never touch a Decompute server.
 
-## Quick Start (first time)
+---
 
-The extension is a controller for the `decompute` CLI/gateway. If you've only installed the extension, it will detect that and set everything up for you:
+## Why Decompute
 
-1. Install the extension. On first launch it offers **Set Up Decompute** (or click **"Decompute: Set up"** in the status bar / run `Decompute: Set Up` from the command palette).
-2. The wizard walks you through it, one step at a time, telling you exactly what to do:
-   - **Step 1 — Install the helper.** It runs the installer in a terminal and waits until the `decompute` command is available.
-   - **Step 2 — Connect your Claude key.** The interactive `decompute init` wizard opens; choose *Anthropic API key*, paste your `sk-ant-…` key (it's hidden and stays on your machine), and accept the defaults.
-   - **Step 3 — Route Claude Code.** It runs `decompute configure claude-code` so this editor's Claude Code routes through the gateway.
-   - **Step 4 — Verify.** It runs `decompute doctor` and offers a one-click window reload.
-3. After the reload, open a Claude Code panel — it now routes through Decompute. Use `Decompute: Show Usage and Savings` or open the dashboard to see compression.
+- ⚡ **Lower cost, same Claude.** A native compression core trims redundant context before each request — often **50–90% fewer tokens** on code, logs, diffs, and structured data.
+- 🧩 **Zero workflow change.** Point Claude Code at the local gateway once, then keep using `claude` exactly as you do today.
+- 🛡️ **Yours, end to end.** Everything runs locally with your own API key. No prompts, no source, nothing leaves your machine.
+- 📊 **See every dollar saved.** A live dashboard shows tokens saved and cost avoided — per request and per workload.
 
-> Local development: set `decompute.cliInstallCommand` to your checkout's installer (e.g. `bash /path/to/decompute/scripts/install.sh`), or click **Edit Command** in step 1.
+---
+
+## Quick Start
+
+When you install the extension, it detects that the Decompute helper isn't set up yet and offers a **one-time guided setup**:
+
+1. Click **Set Up Decompute** (or **“Decompute: Set up”** in the status bar, or run **`Decompute: Set Up`** from the Command Palette).
+2. The wizard walks you through four steps, telling you exactly what to do at each one:
+   - **Install the helper** — installs the local Decompute gateway (one command, runs in a terminal).
+   - **Connect your Claude key** — paste your `sk-ant-…` key. It's hidden and stays on your machine.
+   - **Route Claude Code** — points Claude Code at the local gateway.
+   - **Verify** — confirms the gateway is running, then offers a one-click window reload.
+3. Reopen a Claude Code panel — it now routes through Decompute. Run **`Decompute: Show Usage and Savings`** to watch the compression live.
+
+That's it. Compression is automatic from then on.
+
+> **Working from a local checkout?** Set `decompute.cliInstallCommand` to your installer (e.g. `bash /path/to/decompute/scripts/install.sh`), or click **Edit Command** in step 1.
+
+---
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `Decompute: Set Up` | Installs the `decompute` CLI (if missing), connects your Claude key, routes Claude Code, and verifies — step by step. |
-| `Decompute: Get Started` | Opens Decompute setup information. |
-| `Decompute: Activate License` | Activates a Decompute license on this device. |
-| `Decompute: Upgrade` | Opens the Decompute upgrade page. |
-| `Decompute: Show Status` | Shows gateway, license, and quota status. |
-| `Decompute: Show Usage and Savings` | Opens the usage and savings panel. |
-| `Decompute: Configure Gateway URL` | Sets the Decompute Gateway URL used by the extension. |
-| `Decompute: Copy Claude Code Setup Command` | Copies `decompute configure claude-code`. |
-| `Decompute: Check Local Gateway Status` | Checks an advanced local gateway URL you configured separately. |
-| `Decompute: Open Dashboard` | Opens the Decompute dashboard. |
+| **Decompute: Set Up** | Installs the helper (if missing), connects your Claude key, routes Claude Code, and verifies — step by step. |
+| **Decompute: Show Status** | Gateway, license, and routing status at a glance. |
+| **Decompute: Show Usage and Savings** | Opens the savings panel — tokens saved and cost avoided. |
+| **Decompute: Enable / Disable Routing** | Turns gateway routing for Claude Code on or off. |
+| **Decompute: Open Dashboard** | Opens the live savings dashboard. |
+| **Decompute: Activate License** | Activates a Decompute Pro license on this device. |
+| **Decompute: Configure Gateway URL** | Points the extension at a self-managed / hosted gateway (advanced). |
+| **Decompute: Check Local Gateway Status** | Health-checks a separately installed gateway. |
+
+---
 
 ## Settings
 
-- `decompute.gatewayUrl` - Decompute Gateway URL. The default is `https://gateway.decompute.run`.
-- `decompute.localGatewayUrl` - optional advanced local gateway URL for the local status check.
-- `decompute.pollSeconds` - status refresh interval in seconds.
-- `decompute.cliInstallCommand` - command the setup wizard runs to install the `decompute` CLI when it's missing. Blank uses the default installer; set it to a custom command (e.g. a local checkout's `scripts/install.sh`) for development.
+| Setting | Default | Description |
+|---|---|---|
+| `decompute.gatewayUrl` | `http://127.0.0.1:8080` | The gateway the extension talks to. Defaults to the local gateway the setup installs; set a self-managed/hosted URL for advanced setups. |
+| `decompute.pollSeconds` | `60` | How often the status bar refreshes license/quota. |
+| `decompute.cliInstallCommand` | *(blank)* | Override the installer command the setup runs (e.g. a local checkout). Machine-scoped — a workspace can't set it. |
+| `decompute.localGatewayUrl` | *(blank)* | Optional URL for the “Check Local Gateway” command. |
 
-## Privacy
+---
 
-The extension stores a random Decompute device id so the gateway can report license and quota status for this device. It does not ask for or store model-provider credentials. Local gateway installation and Claude Code configuration are handled by the separate Decompute CLI/native installer path.
+## Privacy & Security
+
+- **BYOK.** You use your own Anthropic key. Decompute never asks for or stores model-provider credentials in the extension.
+- **Local compression.** Context is compressed by the gateway on your machine before a slimmer request is forwarded to Anthropic.
+- **Safe configuration.** Routing is written to `~/.claude/settings.json` only with your consent, atomically, preserving your other settings. The installer runs only from a trusted workspace.
+- **Minimal identity.** The extension stores a random device id so the gateway can report license and quota status for this device.
+
+---
+
+## About
+
+Decompute is a cost-control gateway — it optimizes Claude Code traffic, it doesn't host Claude. **Anthropic, Claude, and Claude Code are trademarks of Anthropic.** Decompute is not affiliated with or endorsed by Anthropic.

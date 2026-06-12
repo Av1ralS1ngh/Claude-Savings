@@ -9,13 +9,13 @@ import {
   validateGatewayInput,
 } from "../dist/url.mjs";
 
-test("normalizeGatewayUrl defaults to the hosted HTTPS gateway", () => {
+test("normalizeGatewayUrl defaults to the local gateway", () => {
   assert.equal(normalizeGatewayUrl(""), DEFAULT_GATEWAY_URL);
   assert.equal(normalizeGatewayUrl(undefined), DEFAULT_GATEWAY_URL);
 });
 
 test("normalizeGatewayUrl trims trailing slashes", () => {
-  assert.equal(normalizeGatewayUrl("https://gateway.decompute.run///"), DEFAULT_GATEWAY_URL);
+  assert.equal(normalizeGatewayUrl("http://127.0.0.1:8080///"), DEFAULT_GATEWAY_URL);
 });
 
 test("parseHttpUrl accepts only http and https URLs", () => {

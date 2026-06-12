@@ -16,9 +16,19 @@ import { cliBinCandidates, configFiles, claudeKeyFile, resolveInstallCommand, sh
 
 const CONFIG_DIR = path.join(os.homedir(), ".decompute");
 const DEVICE_ID_FILE = path.join(CONFIG_DIR, "device.id");
+const LICENSE_FILE = path.join(CONFIG_DIR, "license.dcmp");
 const CLAUDE_SETTINGS = path.join(os.homedir(), ".claude", "settings.json");
-const SETUP_URL = "https://decompute.ai";
-const UPGRADE_URL = "https://decompute.ai/pro";
+const CLAUDE_CODE_EXT_ID = "anthropic.claude-code"; // the Claude Code extension Decompute sits in front of
+const LOCAL_BIN = path.join(os.homedir(), ".local", "bin"); // where the installer links the shims
+const SHELL_RC_FILES = [path.join(os.homedir(), ".zprofile"), path.join(os.homedir(), ".bash_profile")];
+const SETUP_URL = "https://decompute.run";
+const UPGRADE_URL = "https://decompute.run/pro";
+// Stripe Payment Link for the Pro plan. We append ?client_reference_id=<deviceId> so the purchase is
+// tagged with the buyer's machine; the license issuer (Worker webhook) reads it back to mint a license
+// bound to THIS device, which "Activate Pro" then fetches. Override via the `decompute.checkoutUrl` setting.
+const PRO_CHECKOUT_URL = "https://buy.stripe.com/14A5kD1twdNifow5te1wY01";
+// Deployed license Worker (issues/serves the signed license). Override via `decompute.licenseApiUrl`.
+const LICENSE_API_URL = "https://decompute-checkout.xcomp-decompute.workers.dev";
 
 function cfg<T>(key: string, dflt: T): T {
   return vscode.workspace.getConfiguration("decompute").get<T>(key, dflt);
@@ -145,6 +155,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("decompute.setup", () => runSetupWizard()),
     vscode.commands.registerCommand("decompute.getStarted", () => openSetup()),
     vscode.commands.registerCommand("decompute.activate", () => activateLicense()),
+    vscode.commands.registerCommand("decompute.activatePro", () => activatePro()),
     vscode.commands.registerCommand("decompute.upgrade", () => upgrade()),
     vscode.commands.registerCommand("decompute.status", () => showStatus()),
     vscode.commands.registerCommand("decompute.showUsage", () => showUsagePanel()),
@@ -154,6 +165,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("decompute.disableRouting", () => disableRouting()),
     vscode.commands.registerCommand("decompute.checkLocalGateway", () => checkLocalGateway()),
     vscode.commands.registerCommand("decompute.openDashboard", () => openDashboard()),
+    vscode.commands.registerCommand("decompute.uninstall", () => uninstallDecompute(context)),
   );
 
   context.subscriptions.push(
@@ -177,12 +189,16 @@ export function activate(context: vscode.ExtensionContext): void {
 
   void maybeOnboard(context);
   void refresh();
+  void refreshLicense(); // pick up subscription renewals so an offline Pro license doesn't lapse
   restartPolling();
   context.subscriptions.push({ dispose: () => timer && clearInterval(timer) });
 }
 
 export function deactivate(): void {
   if (timer) clearInterval(timer);
+  // Belt-and-suspenders: also dispose the status bar item so it can't linger on uninstall+reload
+  // (it's in context.subscriptions too, so VS Code disposes it anyway).
+  try { statusBar?.dispose(); } catch { /* ignore */ }
 }
 
 // ── First-run onboarding ─────────────────────────────────────────────────────
@@ -190,25 +206,47 @@ export function deactivate(): void {
 // fresh user who installed only the VSIX has no CLI yet, so the extension detects that and walks
 // them through install → connect key → route → verify. See runSetupWizard.
 
+let onboardPromptedThisSession = false;
+
 async function maybeOnboard(context: vscode.ExtensionContext): Promise<void> {
   const installed = (await whichCli()) !== null;
   const ready = installed && cliConfigured();
   if (!ready) {
-    // Auto-popup once per PHASE so "Later" doesn't silence us forever: if the user installs the CLI
-    // later (phase install → configure), we prompt again. The status bar ("Decompute: Set up")
-    // nudges persistently in between, so this is discovery, not nagging.
-    const phase = installed ? "configure" : "install";
-    if (context.globalState.get("decompute.onboard.dismissedAt") === phase) return;
+    // Suppress the auto-popup per WINDOW SESSION, not persistently. VS Code globalState is keyed by
+    // extension id and SURVIVES uninstall/reinstall, so a persistent "dismissed" flag would silence the
+    // wizard forever — including after a clean reinstall (the reported complaint). So we prompt at most
+    // once per window; the status bar ("Decompute: Set up") nudges persistently in between; "Don't ask
+    // again" is the explicit opt-out that DOES persist.
+    if (onboardPromptedThisSession || context.globalState.get("decompute.onboard.neverAsk")) return;
+    onboardPromptedThisSession = true;
     const pick = await vscode.window.showInformationMessage(
       installed
         ? "Decompute is installed but not connected to Claude Code yet. Finish setup?"
         : "Welcome to Decompute! A one-time setup installs the helper and routes Claude Code through the compression gateway.",
       "Set Up Decompute",
-      "Later"
+      "Later",
+      "Don't ask again"
     );
     if (pick === "Set Up Decompute") await runSetupWizard();
-    else if (pick === "Later") void context.globalState.update("decompute.onboard.dismissedAt", phase);
+    else if (pick === "Don't ask again") void context.globalState.update("decompute.onboard.neverAsk", true);
     return;
+  }
+  // Installed + configured. One-time-per-engine-update nudge: a user who UPDATED the extension is
+  // still running their OLD local compression engine until they re-run setup (which now force-
+  // reinstalls the wheels). Only nudge users who were ALREADY set up — a fresh install just ran setup
+  // with the latest engine, so it doesn't need the prompt.
+  const ENGINE_UPDATE_KEY = "decompute.engineUpdate.v0_1_14";
+  if (!context.globalState.get(ENGINE_UPDATE_KEY)) {
+    void context.globalState.update(ENGINE_UPDATE_KEY, true);
+    if (context.globalState.get("decompute.welcomed.thinController")) {
+      const pick = await vscode.window.showInformationMessage(
+        "Decompute's compression engine was upgraded — attached files, logs, and HTML now compress up to ~99% (previously ~0%). Update your local engine to get it?",
+        "Update now",
+        "Later"
+      );
+      if (pick === "Update now") await runSetupWizard();
+      return;
+    }
   }
   // Installed + configured: show the original one-time tip.
   if (context.globalState.get("decompute.welcomed.thinController")) return;
@@ -331,7 +369,60 @@ function isLoopbackGateway(url: string): boolean {
 // IN-PROCESS (write ~/.claude/settings.json directly, so nothing collides with init's stdin) →
 // Step 4 verify over the network (gateway /health), then show `doctor` in a fresh terminal. Each
 // step says exactly what the user must do; success is only claimed once the gateway is reachable.
+function claudeCodeInstalled(): boolean {
+  return !!vscode.extensions.getExtension(CLAUDE_CODE_EXT_ID);
+}
+
+/** Decompute is a controller that sits in front of the Claude Code extension, so it must be installed
+ *  first. Returns true to proceed with setup; false to abort (Claude Code missing / still installing). */
+async function ensureClaudeCode(): Promise<boolean> {
+  if (claudeCodeInstalled()) return true;
+  const pick = await vscode.window.showInformationMessage(
+    "Decompute needs the Claude Code extension, which isn't installed yet.",
+    {
+      modal: true,
+      detail:
+        "Decompute routes Claude Code through a local compression gateway, so the Claude Code extension " +
+        "has to be installed before setup. Install it now?",
+    },
+    "Install Claude Code"
+  );
+  if (pick !== "Install Claude Code") return false;
+  const result = await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: "Installing Claude Code…", cancellable: true },
+    async (_progress, token): Promise<{ ok: boolean; error?: string }> => {
+      try {
+        await vscode.commands.executeCommand("workbench.extensions.installExtension", CLAUDE_CODE_EXT_ID);
+      } catch (e: any) {
+        return { ok: false, error: e?.message || String(e) };
+      }
+      // installExtension can resolve before the extension host registers the extension — poll briefly
+      // so setup auto-continues instead of dead-ending on "run setup again".
+      for (let i = 0; i < 30 && !token.isCancellationRequested; i++) {
+        if (claudeCodeInstalled()) return { ok: true };
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+      return { ok: claudeCodeInstalled() };
+    }
+  );
+  if (result.error) {
+    const open = await vscode.window.showWarningMessage(
+      `Couldn't install Claude Code automatically (${result.error}). Open it in the Marketplace?`,
+      "Open Marketplace"
+    );
+    if (open === "Open Marketplace") void vscode.commands.executeCommand("workbench.extensions.search", `@id:${CLAUDE_CODE_EXT_ID}`);
+    return false;
+  }
+  if (result.ok) {
+    vscode.window.showInformationMessage("Claude Code installed — continuing Decompute setup.");
+    return true;
+  }
+  vscode.window.showInformationMessage("Claude Code is installing. Run “Decompute: Set Up” again once it finishes.");
+  return false;
+}
+
 async function runSetupWizard(): Promise<void> {
+  if (!(await ensureClaudeCode())) return;
   const gw = gatewayUrl();
   // Never interpolate an unparseable gateway URL into a terminal command (defense-in-depth).
   if (!parseHttpUrl(gw)) {
@@ -526,7 +617,7 @@ async function configureGatewayUrl(): Promise<void> {
   const parsed = parseHttpUrl(normalized);
   if (!parsed) return;
 
-  if (parsed.protocol !== "https:") {
+  if (parsed.protocol !== "https:" && !isLoopbackGateway(normalized)) {
     const pick = await vscode.window.showWarningMessage(
       "Use a non-HTTPS gateway only for an advanced local or self-managed setup.",
       { modal: true },
@@ -584,6 +675,7 @@ function applyRoutingWrite(gw: string): { status: "ok" | "noread" | "unparseable
 }
 
 async function enableRouting(): Promise<void> {
+  if (!(await ensureClaudeCode())) return;
   const gw = gatewayUrl();
   const r = applyRoutingWrite(gw);
   if (r.status === "noread") {
@@ -625,6 +717,118 @@ async function disableRouting(): Promise<void> {
   }
   await refresh();
   await offerReload("Decompute routing disabled. Already-running Claude Code sessions keep routing until the window reloads — reload now to go direct?");
+}
+
+/** Remove Decompute completely: stop the gateway, delete the CLI/gateway/config + PATH entry, unroute
+ *  Claude Code, and clear onboarding state so a future reinstall starts fresh. The marketplace
+ *  "Uninstall" only removes the extension, never this footprint — so we expose it as a command. */
+async function uninstallDecompute(context: vscode.ExtensionContext): Promise<void> {
+  const pick = await vscode.window.showWarningMessage(
+    "Remove Decompute completely from this machine?",
+    {
+      modal: true,
+      detail:
+        "Stops the gateway and deletes the Decompute CLI, gateway, config and PATH entry (~/.decompute, the " +
+        "decompute/decompute-gateway commands, the ~/.zprofile line), and removes Decompute's routing from " +
+        "Claude Code (~/.claude/settings.json — backed up first). Your Claude Code key and other settings are " +
+        "left untouched.\n\nAfter this, uninstall the “Decompute” extension from the Extensions view to finish.",
+    },
+    "Remove Decompute"
+  );
+  if (pick !== "Remove Decompute") return;
+
+  const done: string[] = [];
+
+  // 1. Remove the launchd watchdog FIRST (so it doesn't restart the gateway), then stop the gateway.
+  const plist = path.join(os.homedir(), "Library", "LaunchAgents", "run.decompute.gateway.plist");
+  try { execFile("launchctl", ["unload", plist], () => undefined); } catch { /* ignore */ }
+  try { fs.rmSync(plist, { force: true }); } catch { /* ignore */ }
+  try { execFile("pkill", ["-f", "decompute-gateway"], () => undefined); } catch { /* ignore */ }
+
+  // 2. Remove Decompute's routing from Claude Code — touch ONLY our two keys (planUnwire), and surface
+  //    it if we couldn't (rather than silently leaving routing on). No backup file is left behind: the
+  //    write is atomic and reversible by re-running setup, so a complete uninstall stays clean.
+  let routingNote = "";
+  try {
+    const text = readFileOrNull(CLAUDE_SETTINGS);
+    const plan = planUnwire(text);
+    if (plan.status === "unparseable") {
+      routingNote = " — couldn't auto-remove routing (~/.claude/settings.json isn't valid JSON; remove ANTHROPIC_BASE_URL / ANTHROPIC_CUSTOM_HEADERS yourself)";
+    } else if (plan.text !== null) {
+      writeFileAtomic(CLAUDE_SETTINGS, plan.text);
+      done.push("unrouted Claude Code");
+    }
+  } catch (e: any) {
+    routingNote = ` — couldn't update ~/.claude/settings.json (${e?.message || e})`;
+  }
+
+  // 3. Delete the install: ~/.decompute, the shims, and the installer's PATH line.
+  try { fs.rmSync(CONFIG_DIR, { recursive: true, force: true }); done.push("removed ~/.decompute"); } catch { /* ignore */ }
+  for (const cmd of ["decompute", "decompute-gateway"]) {
+    try { fs.rmSync(path.join(LOCAL_BIN, cmd), { force: true }); } catch { /* ignore */ }
+  }
+  for (const rc of SHELL_RC_FILES) removeInstallerPathLine(rc);
+  done.push("removed CLI + PATH entry");
+
+  // 4. Clear onboarding state so a fresh reinstall prompts setup again from scratch.
+  await context.globalState.update("decompute.onboard.dismissedAt", undefined); // legacy key
+  await context.globalState.update("decompute.onboard.neverAsk", undefined);
+  await context.globalState.update("decompute.welcomed.thinController", undefined);
+  onboardPromptedThisSession = false;
+  cachedBin = undefined; // forget any resolved CLI path
+
+  // Stop polling and remove the status bar item right away.
+  if (timer) clearInterval(timer);
+  try { statusBar.dispose(); } catch { /* already disposed */ }
+
+  // Uninstall the EXTENSION itself too, so this is one-stop — the user shouldn't also have to remove it
+  // from the Extensions view. VS Code finalizes the removal (and drops the status bar) on reload.
+  let extNote: string;
+  try {
+    await vscode.commands.executeCommand("workbench.extensions.uninstallExtension", "decompute.decompute");
+    extNote = " The Decompute extension will finish uninstalling when you reload.";
+  } catch {
+    extNote = " Also remove the “Decompute” extension from the Extensions view, then reload.";
+  }
+  const reload = await vscode.window.showInformationMessage(
+    `Decompute removed (${done.join(", ")})${routingNote}.${extNote}`,
+    "Reload Window"
+  );
+  if (reload === "Reload Window") void vscode.commands.executeCommand("workbench.action.reloadWindow");
+}
+
+/** Silently pull the latest signed Pro license from the license Worker, so subscription RENEWALS
+ *  propagate and an offline license never lapses while the user keeps paying. No-op when there's no
+ *  license yet (nothing to renew) or we're offline (keep the current one). Runs on each activation. */
+async function refreshLicense(): Promise<void> {
+  const apiUrl = (cfg<string>("licenseApiUrl", "") || LICENSE_API_URL).replace(/\/+$/, "");
+  if (!apiUrl) return;
+  let current = "";
+  try { current = fs.readFileSync(LICENSE_FILE, "utf8").trim(); } catch { return; } // no license → nothing to refresh
+  if (!current) return;
+  try {
+    const r = await fetch(`${apiUrl}/license?device=${encodeURIComponent(loadDeviceId())}`);
+    if (r.status !== 200) return;
+    const j: any = await r.json();
+    const latest = j?.license ? String(j.license).trim() : "";
+    if (latest && latest !== current) {
+      fs.writeFileSync(LICENSE_FILE, latest + "\n", { mode: 0o600 });
+      await refresh();
+    }
+  } catch { /* offline / worker unreachable — keep the current license */ }
+}
+
+/** Strip the marker-guarded PATH block the installer appended to a shell rc (idempotent; leaves the
+ *  rest of the file intact). */
+function removeInstallerPathLine(rcFile: string): void {
+  try {
+    const text = readFileOrNull(rcFile);
+    if (!text) return;
+    const cleaned = text
+      .replace(/\n?# added by decompute installer \(PATH\)\nexport PATH="[^"\n]*"\n?/g, "\n")
+      .replace(/\n{3,}/g, "\n\n");
+    if (cleaned !== text) writeFileAtomic(rcFile, cleaned);
+  } catch { /* ignore */ }
 }
 
 async function checkLocalGateway(): Promise<void> {
@@ -734,16 +938,21 @@ async function promptUpgrade(s: any): Promise<void> {
 }
 
 async function upgrade(url?: string): Promise<void> {
-  let target = url;
-  if (!target) {
-    try {
-      const s = await api<any>("/v1/license/status", { method: "GET" });
-      target = s.upgrade_url;
-    } catch {
-      // Fall back to the public purchase page.
-    }
-  }
-  await vscode.env.openExternal(vscode.Uri.parse(target || UPGRADE_URL));
+  // Send the user to Stripe checkout for Pro, tagging the session with THIS device's id so the
+  // license minted after payment binds to this machine. After paying, "Activate Pro" fetches it back.
+  const base = url || cfg<string>("checkoutUrl", "") || PRO_CHECKOUT_URL;
+  const sep = base.includes("?") ? "&" : "?";
+  const target = `${base}${sep}client_reference_id=${encodeURIComponent(loadDeviceId())}`;
+  await vscode.env.openExternal(vscode.Uri.parse(target));
+  // Nudge the user back to activation once they've paid (checkout opens in the browser).
+  void vscode.window
+    .showInformationMessage(
+      "Complete your purchase in the browser, then come back and run “Decompute: Activate Pro”.",
+      "Activate Pro",
+    )
+    .then((pick) => {
+      if (pick === "Activate Pro") void activatePro();
+    });
 }
 
 async function activateLicense(): Promise<void> {
@@ -764,48 +973,117 @@ async function doActivate(key: string): Promise<void> {
   }
 }
 
-async function showStatus(): Promise<void> {
+/** Fetch this device's signed Pro license from the license Worker and install it. Call after the
+ *  user has paid via Stripe checkout — the Worker mints the license from the payment webhook, keyed
+ *  by the same device id we tagged the checkout with. The gateway then verifies the file offline. */
+async function activatePro(): Promise<void> {
+  const apiUrl = (cfg<string>("licenseApiUrl", "") || LICENSE_API_URL).replace(/\/+$/, "");
+  if (!apiUrl) {
+    void vscode.window.showWarningMessage(
+      "Pro activation isn't configured yet — the license service URL is unset (decompute.licenseApiUrl).",
+    );
+    return;
+  }
+  const device = loadDeviceId();
   try {
-    const s = await api<any>("/v1/license/status", { method: "GET" });
-    const actions = [
-      claudeCodeRoutedToGateway() ? "Disable Routing" : "Enable Routing",
-      "Usage and Savings",
-      "Copy Setup Command",
-      "Open Dashboard",
-      "Set Gateway URL",
-      ...(isPro(s) ? [] : ["Upgrade", "Activate License"]),
-      "Run Setup",
-      "Check Local Gateway",
-    ];
-    const pick = await vscode.window.showInformationMessage(
-      `Decompute Gateway: ${gatewayUrl()} · Routing ${claudeCodeRoutedToGateway() ? "ON" : "OFF"}\n${planSummary(s)}`,
-      ...actions
+    const license = await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: "Activating Decompute Pro…", cancellable: false },
+      async () => {
+        // The license appears moments after Stripe fires the webhook — poll briefly.
+        for (let attempt = 0; attempt < 12; attempt++) {
+          try {
+            const r = await fetch(`${apiUrl}/license?device=${encodeURIComponent(device)}`);
+            if (r.status === 200) {
+              const j: any = await r.json();
+              if (j?.license) return String(j.license);
+            }
+          } catch {
+            // transient — keep polling
+          }
+          await new Promise((res) => setTimeout(res, 2500));
+        }
+        return null;
+      },
     );
-    await handleStatusPick(pick, s);
+    if (!license) {
+      void vscode.window.showWarningMessage(
+        "No Pro license found for this device yet. If you just paid, give it a few seconds and run “Activate Pro” again.",
+      );
+      return;
+    }
+    fs.mkdirSync(CONFIG_DIR, { recursive: true });
+    fs.writeFileSync(LICENSE_FILE, license.trim() + "\n", { mode: 0o600 });
+    void vscode.window.showInformationMessage("Decompute Pro is active on this device. 🎉");
+    await refresh();
   } catch (e: any) {
-    const pick = await vscode.window.showWarningMessage(
-      `Could not reach Decompute Gateway at ${gatewayUrl()}: ${e?.message || String(e)}`,
-      "Run Setup",
-      "Set Gateway URL",
-      "Copy Setup Command",
-      "Open Dashboard",
-      "Check Local Gateway"
-    );
-    await handleStatusPick(pick, undefined);
+    void vscode.window.showErrorMessage("Pro activation failed: " + (e?.message || String(e)));
   }
 }
 
-async function handleStatusPick(pick: string | undefined, status: any): Promise<void> {
-  if (pick === "Enable Routing") await enableRouting();
-  else if (pick === "Disable Routing") await disableRouting();
-  else if (pick === "Usage and Savings") await showUsagePanel();
-  else if (pick === "Copy Setup Command") await copyClaudeSetupCommand();
-  else if (pick === "Open Dashboard") openDashboard();
-  else if (pick === "Set Gateway URL") await configureGatewayUrl();
-  else if (pick === "Upgrade") await upgrade(status?.upgrade_url);
-  else if (pick === "Activate License") await activateLicense();
-  else if (pick === "Run Setup") await runSetupWizard();
-  else if (pick === "Check Local Gateway") await checkLocalGateway();
+interface StatusAction extends vscode.QuickPickItem {
+  id: string;
+}
+
+/** The actions menu, as a readable Quick Pick (full labels + descriptions + icons), instead of a
+ *  row of message buttons that VS Code truncates to "En…", "Usa…" once there are more than ~3. */
+function statusActions(routed: boolean, reachable: boolean, s: any): StatusAction[] {
+  const items: StatusAction[] = [];
+  if (reachable) {
+    items.push(
+      routed
+        ? { id: "disable", label: "$(circle-slash) Disable routing", description: "Send Claude Code straight to Anthropic" }
+        : { id: "enable", label: "$(zap) Enable routing", description: "Route Claude Code through the gateway" }
+    );
+    items.push({ id: "usage", label: "$(graph) Usage & savings", description: "Tokens saved and cost avoided" });
+  }
+  items.push({ id: "dashboard", label: "$(dashboard) Open dashboard", description: "Live savings dashboard" });
+  items.push({ id: "gateway", label: "$(gear) Set gateway URL", description: gatewayUrl() });
+  if (reachable && !isPro(s)) {
+    items.push({ id: "upgrade", label: "$(star-full) Upgrade to Pro", description: "Buy Pro — unlimited fair-use compression" });
+    items.push({ id: "activatePro", label: "$(check) Activate Pro", description: "Already paid? Fetch your Pro license for this device" });
+    items.push({ id: "activate", label: "$(key) Enter license key", description: "Activate with a license key instead" });
+  }
+  items.push({ id: "setup", label: "$(cloud-download) Run setup", description: "Install or reconnect the Decompute helper" });
+  items.push({ id: "copy", label: "$(clippy) Copy setup command", description: "Copy the CLI command for Claude Code" });
+  items.push({ id: "local", label: "$(server) Check local gateway", description: "Health-check a separately installed gateway" });
+  items.push({ id: "uninstall", label: "$(trash) Uninstall Decompute", description: "Remove the CLI, gateway, config & routing" });
+  return items;
+}
+
+async function dispatchStatus(id: string | undefined, s: any): Promise<void> {
+  switch (id) {
+    case "enable": await enableRouting(); break;
+    case "disable": await disableRouting(); break;
+    case "usage": await showUsagePanel(); break;
+    case "copy": await copyClaudeSetupCommand(); break;
+    case "dashboard": openDashboard(); break;
+    case "gateway": await configureGatewayUrl(); break;
+    case "upgrade": await upgrade(); break;
+    case "activatePro": await activatePro(); break;
+    case "activate": await activateLicense(); break;
+    case "setup": await runSetupWizard(); break;
+    case "local": await checkLocalGateway(); break;
+    case "uninstall": await vscode.commands.executeCommand("decompute.uninstall"); break;
+  }
+}
+
+async function showStatus(): Promise<void> {
+  let s: any;
+  let reachable = true;
+  try {
+    s = await api<any>("/v1/license/status", { method: "GET" });
+  } catch {
+    reachable = false;
+  }
+  const routed = claudeCodeRoutedToGateway();
+  const title = reachable
+    ? `Decompute  ·  Routing ${routed ? "ON" : "OFF"}  ·  ${planSummary(s)}`
+    : `Decompute  ·  gateway not reachable at ${gatewayUrl()}`;
+  const pick = await vscode.window.showQuickPick(statusActions(routed, reachable, s), {
+    title,
+    placeHolder: reachable ? gatewayUrl() : "Run setup to install and start the gateway",
+  });
+  await dispatchStatus(pick?.id, s);
 }
 
 async function showUsagePanel(): Promise<void> {

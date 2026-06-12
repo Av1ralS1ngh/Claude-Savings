@@ -248,7 +248,7 @@ def test_contract_headers_and_modal(tmp_path):
     assert h1["x-decompute-license-plan"] == "free"
     assert h1["x-decompute-compression-allowed"] == "true"
     assert h1["x-decompute-quota-free-remaining"] == "1"
-    assert h1["x-decompute-upgrade-url"].startswith("https://decompute.ai/pro")
+    assert h1["x-decompute-upgrade-url"].startswith("https://decompute.run/pro")
     assert LicenseService.ui_metadata(m1)["ui"]["show_modal"] is False
     # exhaust -> paused, modal with both actions
     lic.resolve("dev-c")

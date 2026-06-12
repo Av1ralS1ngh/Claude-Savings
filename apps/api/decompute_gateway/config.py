@@ -34,17 +34,29 @@ def _float(name: str, default: float) -> float:
         return default
 
 
+def _default_data_dir() -> Path:
+    """The gateway's data directory — ALWAYS absolute.
+
+    launchd starts the installed gateway with cwd=/ (read-only). A relative default like
+    ".decompute" makes ensure_dirs() do mkdir("/.decompute") → OSError [Errno 30], so the gateway
+    crashes before it binds and Claude Code — routed at a port nothing is listening on — appears to
+    "think" forever. Anchor to the install dir (DECOMPUTE_HOME) or ~/.decompute so the path never
+    depends on the launch cwd. (Dev runs from a writable cwd, which is why this was latent.)"""
+    raw = os.getenv("DECOMPUTE_DATA_DIR") or os.getenv("DECOMPUTE_HOME")
+    return Path(raw).expanduser() if raw else Path.home() / ".decompute"
+
+
 @dataclass(frozen=True)
 class Settings:
     app_name: str = "Decompute Gateway"
     environment: str = os.getenv("DECOMPUTE_ENV", "local").lower()
     host: str = os.getenv("DECOMPUTE_HOST", "127.0.0.1")
     port: int = _int("DECOMPUTE_PORT", 8080)
-    data_dir: Path = Path(os.getenv("DECOMPUTE_DATA_DIR", ".decompute"))
+    data_dir: Path = field(default_factory=_default_data_dir)
 
     database_url: str = os.getenv(
         "DECOMPUTE_DATABASE_URL",
-        os.getenv("DATABASE_URL", "sqlite+pysqlite:///.decompute/decompute.db"),
+        os.getenv("DATABASE_URL") or f"sqlite+pysqlite:///{_default_data_dir() / 'decompute.db'}",
     )
     db_pool_size: int = _int("DECOMPUTE_DB_POOL_SIZE", 5)
     db_max_overflow: int = _int("DECOMPUTE_DB_MAX_OVERFLOW", 10)
@@ -59,13 +71,19 @@ class Settings:
     anthropic_base_url: str = os.getenv("ANTHROPIC_BASE_URL_UPSTREAM", "https://api.anthropic.com")
     anthropic_version: str = os.getenv("ANTHROPIC_VERSION", "2023-06-01")
     allowed_anthropic_beta_headers: list[str] = field(default_factory=lambda: _csv("DECOMPUTE_ALLOWED_ANTHROPIC_BETAS", ""))
-    mock_anthropic: bool = _bool("DECOMPUTE_MOCK_ANTHROPIC", True)
+    mock_anthropic: bool = _bool("DECOMPUTE_MOCK_ANTHROPIC", False)
 
     yscompress_base_url: str | None = os.getenv("YSCOMPRESS_BASE_URL") or os.getenv("HEADROOM_BASE_URL")
     yscompress_timeout_s: float = _float("YSCOMPRESS_TIMEOUT_S", _float("HEADROOM_TIMEOUT_S", 8.0))
     yscompress_default_mode: str = os.getenv("YSCOMPRESS_MODE", os.getenv("HEADROOM_MODE", "safe"))
     yscompress_ccr_enabled: bool = _bool("YSCOMPRESS_CCR", _bool("HEADROOM_CCR", False))
     yscompress_bypass_header: str = "x-yscompress-bypass"
+    # Compress user-message content (attached files, pasted docs/logs). Default ON: without it the
+    # engine skips ALL user-message content (a coding-agent safety default), so a request that's
+    # mostly an attached file shows ~0% savings. Large blocks compress (retrievable on demand via
+    # CCR); short blocks — the user's actual question — pass through, and code the user asks to
+    # "review/analyze" stays protected. Set DECOMPUTE_COMPRESS_USER_MESSAGES=false for max fidelity.
+    compress_user_messages: bool = _bool("DECOMPUTE_COMPRESS_USER_MESSAGES", True)
 
     ccr_enabled: bool = _bool("DECOMPUTE_CCR_ENABLED", yscompress_ccr_enabled)
     ccr_retention_days: int = _int("DECOMPUTE_CCR_RETENTION_DAYS", 7)
@@ -96,7 +114,7 @@ class Settings:
     # Privacy-safe support bundle (decompute support bundle / POST /v1/support/bundle).
     # Defaults the bundle's PII mode to the gateway-wide pii_mode so they stay aligned.
     support_bundle_enabled: bool = _bool("DECOMPUTE_SUPPORT_BUNDLE_ENABLED", True)
-    support_bundle_output_dir: Path = Path(os.getenv("DECOMPUTE_SUPPORT_BUNDLE_DIR", "")) if os.getenv("DECOMPUTE_SUPPORT_BUNDLE_DIR") else Path(os.getenv("DECOMPUTE_DATA_DIR", ".decompute")) / "support"
+    support_bundle_output_dir: Path = Path(os.getenv("DECOMPUTE_SUPPORT_BUNDLE_DIR")).expanduser() if os.getenv("DECOMPUTE_SUPPORT_BUNDLE_DIR") else _default_data_dir() / "support"
     support_bundle_pii_mode: str = os.getenv("DECOMPUTE_SUPPORT_BUNDLE_PII_MODE", os.getenv("DECOMPUTE_PII_MODE", "tokenize"))
     support_bundle_max_log_bytes: int = int(os.getenv("DECOMPUTE_SUPPORT_BUNDLE_MAX_LOG_BYTES", "250000"))
     support_bundle_include_env: bool = _bool("DECOMPUTE_SUPPORT_BUNDLE_INCLUDE_ENV", True)
@@ -126,9 +144,9 @@ class Settings:
     stripe_api_version: str | None = os.getenv("DECOMPUTE_STRIPE_API_VERSION")
     # Grace after a subscription period lapses before a missed-deletion webhook self-heals to free.
     billing_grace_days: int = _int("DECOMPUTE_BILLING_GRACE_DAYS", 3)
-    billing_success_url: str = os.getenv("DECOMPUTE_BILLING_SUCCESS_URL", "https://decompute.ai/billing/success")
-    billing_cancel_url: str = os.getenv("DECOMPUTE_BILLING_CANCEL_URL", "https://decompute.ai/billing/cancel")
-    billing_portal_return_url: str = os.getenv("DECOMPUTE_BILLING_PORTAL_RETURN_URL", "https://decompute.ai/account")
+    billing_success_url: str = os.getenv("DECOMPUTE_BILLING_SUCCESS_URL", "https://decompute.run/billing/success")
+    billing_cancel_url: str = os.getenv("DECOMPUTE_BILLING_CANCEL_URL", "https://decompute.run/billing/cancel")
+    billing_portal_return_url: str = os.getenv("DECOMPUTE_BILLING_PORTAL_RETURN_URL", "https://decompute.run/account")
 
     # ── Device licensing (BYOK/self-hosted axis) ──────────────────────────────
     # Monetizes the compression itself for self-hosted BYOK users (who are otherwise
@@ -142,11 +160,14 @@ class Settings:
     # Pepper for at-rest hashing of issued license keys (only the hash is stored).
     license_key_hash_salt: str = os.getenv("DECOMPUTE_LICENSE_KEY_HASH_SALT", "local-dev-license-salt-change-me")
     # Free tier: N compressed requests per device per window before degrading to no-compression.
-    free_compression_quota: int = _int("DECOMPUTE_FREE_COMPRESSION_QUOTA", 100)
+    # Counted PER /v1/messages request, and Claude Code fires many requests per user prompt (tool
+    # calls, sub-agents), so 100 was exhausted in ~1 prompt. 1000/day gives a usable free experience;
+    # lower it (env DECOMPUTE_FREE_COMPRESSION_QUOTA) to monetize harder — it's the key pricing knob.
+    free_compression_quota: int = _int("DECOMPUTE_FREE_COMPRESSION_QUOTA", 1000)
     free_quota_window: str = os.getenv("DECOMPUTE_FREE_QUOTA_WINDOW", "daily")  # daily | lifetime
     device_license_tier: str = os.getenv("DECOMPUTE_DEVICE_LICENSE_TIER", "pro")
     # Purchase site the upgrade modal/CLI sends the user to, and the app deep-link to return to.
-    pro_upgrade_url: str = os.getenv("DECOMPUTE_PRO_UPGRADE_URL", "https://decompute.ai/pro")
+    pro_upgrade_url: str = os.getenv("DECOMPUTE_PRO_UPGRADE_URL", "https://decompute.run/pro")
     pro_upgrade_return_to: str | None = os.getenv("DECOMPUTE_PRO_UPGRADE_RETURN_TO", "decompute://license/activate")
     license_max_devices: int = _int("DECOMPUTE_LICENSE_MAX_DEVICES", 1)
     # Admin/dev license minting (no-Stripe grant) is OFF by default: on a self-hosted gateway the
@@ -218,7 +239,11 @@ class Settings:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         if self.database_url.startswith("sqlite"):
             rel = self.database_url.split("///", 1)[-1]
-            Path(rel).parent.mkdir(parents=True, exist_ok=True)
+            db_path = Path(rel)
+            if not db_path.is_absolute():
+                # Never anchor the DB to the (read-only under launchd) cwd — resolve under data_dir.
+                db_path = self.data_dir / db_path
+            db_path.parent.mkdir(parents=True, exist_ok=True)
 
     def model_allowed(self, model: str) -> bool:
         if not self.allowed_models:

@@ -256,6 +256,30 @@ def _find_gateway_launcher() -> Optional[list[str]]:
     binary = shutil.which("decompute-gateway")
     if binary:
         return [binary]
+    # PATH-independent fallback: `decompute` and `decompute-gateway` are pip console-scripts installed
+    # side-by-side in the SAME venv bin (and symlinked together into DECOMPUTE_BIN). If the caller's PATH
+    # lacks ~/.local/bin (e.g. an absolute-path invocation or the VS Code wizard), `which` misses the
+    # gateway even though it exists next to us. Resolve the invoked CLI and check its sibling + the
+    # installer's known dirs, so the gateway is found whenever the CLI itself was.
+    import sys
+    cli = shutil.which("decompute") or sys.argv[0]
+    home = Path.home()
+    dchome = Path(os.getenv("DECOMPUTE_HOME") or (home / ".decompute"))
+    seen: set[Path] = set()
+    for cand in (
+        Path(cli).resolve().parent / "decompute-gateway",   # next to the resolved CLI (the venv bin)
+        home / ".local" / "bin" / "decompute-gateway",       # DECOMPUTE_BIN default (installer shim dir)
+        dchome / "venv" / "bin" / "decompute-gateway",        # installer venv default
+    ):
+        try:
+            rp = cand.resolve()
+        except Exception:
+            continue
+        if rp in seen:
+            continue
+        seen.add(rp)
+        if cand.exists():
+            return [str(cand)]
     # Dev: walk up from CWD looking for scripts/run_gateway.sh.
     for base in (Path.cwd(), *Path.cwd().parents):
         cand = base / "scripts" / "run_gateway.sh"
@@ -309,6 +333,7 @@ def init(
     mode = "anthropic_api"
     upstream_base_url = ""
     if not yes:
+        print("[dim]Tip: at each step, press [bold]Enter[/bold] to accept the recommended option shown in [brackets].[/dim]\n")
         print("Upstream Claude mode:")
         print("  [1] Anthropic API key   [dim](bring your own — recommended)[/dim]")
         print("  [2] Enterprise Claude gateway URL")
@@ -319,10 +344,32 @@ def init(
     if mode == "anthropic_api":
         key = claude_key or os.getenv("ANTHROPIC_API_KEY")
         if not key and not yes:
-            key = typer.prompt("Anthropic API key (sk-ant-…)", hide_input=True, default="").strip()
+            print("\n[bold]Paste your Anthropic API key[/bold] (it starts with [cyan]sk-ant-[/cyan]…).")
+            print("[dim]• It stays HIDDEN as you paste — nothing will appear on screen. That's normal. Paste once, then press Enter.[/dim]")
+            print("[dim]• Get one at https://console.anthropic.com/settings/keys[/dim]")
+            while True:  # re-prompt until the key is valid (or the user chooses to skip)
+                key = typer.prompt("Anthropic API key", hide_input=True, default="").strip()
+                if not key:
+                    if typer.confirm("No key entered — skip for now (local/mock only)?", default=False):
+                        key = ""
+                        break
+                    continue
+                if not key.startswith("sk-ant-"):
+                    print("[yellow]⚠ That doesn't look like an Anthropic key (they start with 'sk-ant-'). Paste it again.[/yellow]")
+                    continue
+                print("[dim]  verifying the key with Anthropic…[/dim]")
+                status = _check_anthropic_key(key)
+                if status == "ok":
+                    print("[green]✓ key verified[/green]")
+                    break
+                if status == "bad":
+                    print("[yellow]⚠ Anthropic rejected that key (invalid or unauthorized). Paste it again.[/yellow]")
+                    continue
+                print("[dim]  (couldn't reach Anthropic to verify, but the format looks right — saving it.)[/dim]")
+                break
+        elif key and not key.startswith("sk-ant-"):
+            print("[yellow]⚠[/yellow] Anthropic keys usually start with 'sk-ant-'. Saving it anyway.")
         if key:
-            if not key.startswith("sk-ant-"):
-                print("[yellow]⚠[/yellow] Anthropic keys usually start with 'sk-ant-'. Saving it anyway.")
             save_claude_key(key)
             print(f"[green]✓[/green] Claude key saved (chmod 600) → {CONFIG_DIR / 'claude.key'}")
         else:
@@ -379,6 +426,27 @@ def init(
         print("For a VS Code project: [bold]decompute vscode .[/bold]")
     else:
         print("Next: [bold]decompute claude[/bold] when you're ready.")
+
+
+def _check_anthropic_key(key: str) -> str:
+    """Live-validate an Anthropic API key with a cheap, free call (GET /v1/models).
+
+    Returns "ok" (verified), "bad" (Anthropic rejected it → re-prompt), or "unknown" (couldn't reach
+    Anthropic — accept the format-valid key and let the gateway surface any issue later)."""
+    import httpx
+    try:
+        r = httpx.get(
+            "https://api.anthropic.com/v1/models",
+            headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
+            timeout=10.0,
+        )
+        if r.status_code == 200:
+            return "ok"
+        if r.status_code in (401, 403):
+            return "bad"
+        return "unknown"
+    except Exception:
+        return "unknown"
 
 
 def _verify_engine(base_url: str, *, verified_mode: bool) -> bool:

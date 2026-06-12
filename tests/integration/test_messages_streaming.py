@@ -1,6 +1,7 @@
 import asyncio
+import json
 
-from decompute_gateway.anthropic_provider import stream_anthropic_messages
+from decompute_gateway.anthropic_provider import mock_claude_response, mock_claude_stream_chunks, stream_anthropic_messages
 from decompute_gateway.config import Settings
 from decompute_gateway.sse import SSEUsageTracker
 
@@ -69,3 +70,15 @@ def test_mock_stream_captures_upstream_request_id_and_usage():
     assert tracker.upstream_request_id == "req_mock"
     assert "message_start" in tracker.events_seen and "message_stop" in tracker.events_seen
     assert tracker.output_tokens > 0
+
+
+def test_mock_stream_message_start_matches_anthropic_shape():
+    """Regression for Claude Code: malformed message_start breaks the current message state."""
+    payload = mock_claude_response({"model": "claude-haiku-4-5", "messages": []}).body
+    first = mock_claude_stream_chunks(payload)[0].decode("utf-8")
+    data = json.loads(first.split("data: ", 1)[1])
+
+    assert data["type"] == "message_start"
+    assert data["message"]["type"] == "message"
+    assert data["message"]["content"] == []
+    assert "content_block_delta" not in first

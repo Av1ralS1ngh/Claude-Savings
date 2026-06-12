@@ -1,8 +1,8 @@
 {
   "name": "decompute",
   "displayName": "Decompute Claude Gateway",
-  "description": "Configure Decompute Gateway for Claude Code, view license and usage, and copy the setup command. Hosted HTTPS gateway by default; local gateway is advanced opt-in.",
-  "version": "0.1.7",
+  "description": "Cut your Claude Code token bill. A local gateway compresses context before each request — same model, same answers, fewer tokens. Bring your own key; runs entirely on your machine.",
+  "version": "0.1.14",
   "publisher": "decompute",
   "license": "MIT",
   "icon": "icon.png",
@@ -59,11 +59,15 @@
       },
       {
         "command": "decompute.activate",
-        "title": "Decompute: Activate License"
+        "title": "Decompute: Activate License Key"
+      },
+      {
+        "command": "decompute.activatePro",
+        "title": "Decompute: Activate Pro (after paying)"
       },
       {
         "command": "decompute.upgrade",
-        "title": "Decompute: Upgrade"
+        "title": "Decompute: Upgrade to Pro"
       },
       {
         "command": "decompute.status",
@@ -96,6 +100,10 @@
       {
         "command": "decompute.openDashboard",
         "title": "Decompute: Open Dashboard"
+      },
+      {
+        "command": "decompute.uninstall",
+        "title": "Decompute: Uninstall (remove CLI, gateway & config)"
       }
     ],
     "configuration": {
@@ -103,9 +111,9 @@
       "properties": {
         "decompute.gatewayUrl": {
           "type": "string",
-          "default": "https://gateway.decompute.run",
+          "default": "http://127.0.0.1:8080",
           "scope": "machine-overridable",
-          "description": "Decompute Gateway base URL. Hosted HTTPS is the default; self-managed gateways are advanced opt-in."
+          "description": "Decompute Gateway base URL. Defaults to the local gateway the setup installs on this machine; set a self-managed/hosted URL for advanced setups."
         },
         "decompute.localGatewayUrl": {
           "type": "string",
@@ -122,6 +130,16 @@
           "default": "",
           "scope": "machine",
           "description": "Command run in a terminal by 'Decompute: Set Up' to install the `decompute` CLI when it's missing. Leave blank to use the default installer (curl … install.sh | bash). Local development: set to e.g. `bash /path/to/decompute/scripts/install.sh`. (Machine-scoped: cannot be set by a workspace, so an untrusted repo can't inject an install command.)"
+        },
+        "decompute.checkoutUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Optional override for the Pro checkout link opened by 'Upgrade to Pro'. Leave blank to use the built-in Stripe Payment Link. The buyer's device id is appended as ?client_reference_id so the purchase binds to this machine."
+        },
+        "decompute.licenseApiUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Base URL of the Decompute license service (the Cloudflare Worker) that 'Activate Pro' fetches the signed license from after payment, e.g. https://decompute-checkout.<account>.workers.dev. Leave blank until it's deployed."
         }
       }
     }
