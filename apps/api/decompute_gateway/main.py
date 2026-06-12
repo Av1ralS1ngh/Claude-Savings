@@ -1273,10 +1273,40 @@ async def anthropic_messages_proxy(request: Request, payload: MessagesRequest) -
         cache_preserved = True
     rate_limits.check_body_size(request.headers.get("content-length"))
     rate_limits.check_preflight(principal=principal, estimated_input_tokens=raw_estimate, estimated_output_tokens=int(body.get("max_tokens", 1024)), store=store)
-    comp = await yscompress.compress_messages(body.get("messages") or [], project_id=principal.project_id, mode=mode, ccr=ys_cfg.get("ccr", settings.ccr_enabled))
-    workload = classify_workload(body.get("messages") or [])
+    compress_cache_control_large_blocks = (
+        mode != "off"
+        and not cache_preserved
+        and _request_has_cache_control(body)
+    )
+    comp = await yscompress.compress_messages(
+        body.get("messages") or [],
+        project_id=principal.project_id,
+        mode=mode,
+        ccr=ys_cfg.get("ccr", settings.ccr_enabled),
+        compress_cache_control_large_blocks=compress_cache_control_large_blocks,
+    )
+    compressed_system = body.get("system")
+    system_before = system_after = 0
+    system_transforms: list[str] = []
+    if compressed_system is not None:
+        compressed_system, system_before, system_after, system_transforms = await yscompress.compress_system(
+            compressed_system,
+            mode=mode,
+        )
+        comp.tokens_before += system_before
+        comp.tokens_after += system_after
+        comp.tokens_saved = max(0, comp.tokens_before - comp.tokens_after)
+        comp.compression_ratio = round(comp.tokens_after / max(comp.tokens_before, 1), 4)
+        if system_transforms:
+            comp.transforms_applied.extend(system_transforms)
+    workload_inputs = list(body.get("messages") or [])
+    if body.get("system") is not None:
+        workload_inputs.append({"role": "system", "content": body.get("system")})
+    workload = classify_workload(workload_inputs)
     compressed_body = dict(body)
     compressed_body["messages"] = comp.messages
+    if compressed_system is not None:
+        compressed_body["system"] = compressed_system
     # When CCR elided content behind references, register the retrieve tool so Claude
     # can fetch originals on demand. Append without disturbing customer-set tools.
     if comp.ccr_keys:

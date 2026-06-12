@@ -38,6 +38,15 @@ CODE_PATTERNS = [
     re.compile(r"^[\t ]*(if|for|while|try|except|catch|return)\b", re.M),
     re.compile(r"```[a-zA-Z0-9_-]*\n"),
 ]
+HTML_PATTERNS = [
+    re.compile(r"<!doctype html", re.I),
+    re.compile(r"<html\b", re.I),
+    re.compile(r"<head\b", re.I),
+    re.compile(r"<body\b", re.I),
+    re.compile(r"<script\b", re.I),
+    re.compile(r"<style\b", re.I),
+    re.compile(r"<div\b", re.I),
+]
 
 # CCR reference-replacement is an atomic, self-contained stage (see ccr.py).
 # Re-exported here so existing imports (`from .yscompress import CCR_RETRIEVE_TOOL`)
@@ -84,6 +93,13 @@ def looks_source_code(text: str) -> bool:
     return hits >= 2 or (";" in text and "{" in text and "}" in text)
 
 
+def looks_html_content(text: str) -> bool:
+    if not text or len(text) < 80:
+        return False
+    head = text[:8000]
+    return sum(1 for p in HTML_PATTERNS if p.search(head)) >= 2
+
+
 def looks_compressible(text: str) -> bool:
     if len(text) > 4000 and not looks_source_code(text):
         return True
@@ -116,6 +132,55 @@ def summarize_text(text: str, max_chars: int = 1800) -> str:
     )
 
 
+def _large_cache_control_text(block: dict[str, Any], *, min_chars: int = 4000) -> bool:
+    if "cache_control" not in block:
+        return False
+    btype = block.get("type")
+    if btype == "text" and isinstance(block.get("text"), str):
+        return len(block["text"]) >= min_chars
+    if btype == "tool_result":
+        raw = block.get("content")
+        if isinstance(raw, str):
+            return len(raw) >= min_chars
+        return len(stringify(raw)) >= min_chars
+    return False
+
+
+def release_large_cache_control_blocks(messages: list[dict[str, Any]], *, min_chars: int = 4000) -> tuple[list[dict[str, Any]], int]:
+    """Remove per-block cache_control only from large attached text/tool outputs.
+
+    Claude Code marks attached files/tool outputs with cache_control so repeated
+    turns can hit the provider prefix cache. The gateway already has a route-level
+    cost guard: for huge cache-controlled contexts it disables compression entirely
+    to preserve that cache. Below that threshold, compression should win, but
+    Headroom's per-block cache guard would still refuse to touch these blocks and
+    HTML/log attachments would show ~0% savings. This releases the cache marker
+    only for large blocks that we intentionally send through compression; if the
+    compression validator rejects the result, the original messages (with
+    cache_control intact) are returned.
+    """
+    released = 0
+    out: list[dict[str, Any]] = []
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            out.append(msg)
+            continue
+        changed = False
+        blocks: list[Any] = []
+        for block in content:
+            if isinstance(block, dict) and _large_cache_control_text(block, min_chars=min_chars):
+                b = dict(block)
+                b.pop("cache_control", None)
+                blocks.append(b)
+                changed = True
+                released += 1
+            else:
+                blocks.append(block)
+        out.append({**msg, "content": blocks} if changed else msg)
+    return out, released
+
+
 class YSCompressClient:
     def __init__(self, settings: Settings, store: Store, crypto: CCRCrypto, scanner: SecretScanner):
         self.settings = settings
@@ -123,6 +188,90 @@ class YSCompressClient:
         self.crypto = crypto
         self.scanner = scanner
         self._ccr = CCRStage(store, crypto, scanner)
+
+    async def compress_system(
+        self,
+        system: Any,
+        *,
+        mode: str | None = None,
+        min_chars: int = 4000,
+    ) -> tuple[Any, int, int, list[str]]:
+        """Compress large HTML attachments that Claude Code places in system blocks.
+
+        Claude Code Read-tool output lands in messages, but attached/context files
+        can be sent as top-level Anthropic `system` content blocks. The gateway
+        historically compressed only `messages`, so these HTML files recorded
+        almost no savings even though the same bytes compress well through
+        ContentRouter. To avoid mutating Claude Code's core instructions, this
+        method targets only large HTML-looking text blocks and leaves all other
+        system content untouched.
+        """
+        mode = mode or self.settings.yscompress_default_mode
+        before = estimate_tokens(system)
+        if mode == "off" or not system:
+            return system, before, before, []
+
+        if isinstance(system, str):
+            if len(system) < min_chars or not looks_html_content(system):
+                return system, before, before, []
+            compressed, transforms = await self._compress_single_large_text(system)
+            after_text = estimate_tokens(compressed)
+            if after_text < before * 0.99:
+                return compressed, before, after_text, [f"system:{t}" for t in transforms]
+            return system, before, before, []
+
+        if not isinstance(system, list):
+            return system, before, before, []
+
+        changed = False
+        out: list[Any] = []
+        transforms: list[str] = []
+        for block in system:
+            if not isinstance(block, dict) or block.get("type") != "text" or not isinstance(block.get("text"), str):
+                out.append(block)
+                continue
+            text = block["text"]
+            if len(text) < min_chars or not looks_html_content(text):
+                out.append(block)
+                continue
+            compressed, block_transforms = await self._compress_single_large_text(text)
+            if estimate_tokens(compressed) >= estimate_tokens(text) * 0.99:
+                out.append(block)
+                continue
+            b = dict(block)
+            b["text"] = compressed
+            b.pop("cache_control", None)
+            out.append(b)
+            changed = True
+            transforms.extend(f"system:{t}" for t in block_transforms)
+
+        if not changed:
+            return system, before, before, []
+        after = estimate_tokens(out)
+        return out, before, after, transforms or ["system:html"]
+
+    async def _compress_single_large_text(self, text: str) -> tuple[str, list[str]]:
+        if _HEADROOM_AVAILABLE:
+            try:
+                loop = asyncio.get_running_loop()
+                result = await loop.run_in_executor(
+                    None,
+                    partial(
+                        _headroom_compress,
+                        [{"role": "user", "content": [{"type": "text", "text": text}]}],
+                        model="claude-haiku-4-5",
+                        compress_user_messages=True,
+                        compress_system_messages=True,
+                    ),
+                )
+                content = result.messages[0].get("content") if result.messages else None
+                if isinstance(content, list) and content and isinstance(content[0], dict):
+                    compressed = content[0].get("text")
+                    if isinstance(compressed, str) and compressed:
+                        return compressed, list(result.transforms_applied or ["html"])
+            except Exception:
+                pass
+        return summarize_text(text), ["fallback_html_summary"]
 
     async def compress_messages(
         self,
@@ -132,6 +281,7 @@ class YSCompressClient:
         mode: str | None = None,
         ccr: bool | None = None,
         preserve_latest_user: bool = True,
+        compress_cache_control_large_blocks: bool = False,
     ) -> CompressionResult:
         mode = mode or self.settings.yscompress_default_mode
         ccr_enabled = self.settings.ccr_enabled if ccr is None else bool(ccr)
@@ -156,6 +306,12 @@ class YSCompressClient:
             if ccr_keys:
                 ccr_transforms = [f"ccr:reference_replacement:{len(ccr_keys)}"]
 
+        cache_control_transforms: list[str] = []
+        if compress_cache_control_large_blocks:
+            stage_messages, released = release_large_cache_control_blocks(stage_messages)
+            if released:
+                cache_control_transforms = [f"cache_control:large_block_released:{released}"]
+
         # ── Stage 1: Rust core via headroom Python library (preferred) ─────────
         # compress() is sync + CPU-bound — run in executor to avoid blocking the
         # event loop. SmartCrusher / CodeCompressor / Kompress-base.
@@ -169,7 +325,7 @@ class YSCompressClient:
                 final_messages = result.messages
                 tokens_after = estimate_tokens(final_messages)
                 engine = "yscompress_rust" + ("+ccr" if ccr_keys else "")
-                transforms = list(result.transforms_applied or ["yscompress"]) + ccr_transforms
+                transforms = list(result.transforms_applied or ["yscompress"]) + ccr_transforms + cache_control_transforms
                 return self._validated_result(
                     original=messages,
                     compressed=final_messages,
@@ -179,6 +335,7 @@ class YSCompressClient:
                     engine=engine,
                     transforms=transforms,
                     ccr_keys=ccr_keys,
+                    min_savings_ratio=0.01 if cache_control_transforms else 0.0,
                 )
             except Exception:
                 pass  # fall through to local fallback
@@ -192,8 +349,9 @@ class YSCompressClient:
             tokens_after=tokens_after,
             mode=mode,
             engine="yscompress_fallback_local" + ("+ccr" if ccr_keys else ""),
-            transforms=sorted(transforms) + ccr_transforms,
+            transforms=sorted(transforms) + ccr_transforms + cache_control_transforms,
             ccr_keys=ccr_keys + fb_ccr_keys,
+            min_savings_ratio=0.01 if cache_control_transforms else 0.0,
         )
 
     @staticmethod
@@ -207,12 +365,16 @@ class YSCompressClient:
         engine: str,
         transforms: list[str],
         ccr_keys: list[str],
+        min_savings_ratio: float = 0.0,
     ) -> CompressionResult:
         """Token-validate the compression. If it did not actually shrink the
         context, discard it and pass the ORIGINAL messages through unchanged.
         Compression must never make the payload bigger — that would cost the
         customer more tokens and bust the cache."""
-        if tokens_after >= tokens_before:
+        tokens_saved = tokens_before - tokens_after
+        if tokens_after >= tokens_before or (
+            min_savings_ratio > 0 and tokens_before > 0 and tokens_saved / tokens_before < min_savings_ratio
+        ):
             return CompressionResult(
                 messages=original,
                 tokens_before=tokens_before,

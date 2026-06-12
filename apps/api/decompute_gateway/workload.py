@@ -7,6 +7,7 @@ the dominant content type of its bulk (the largest tool_result / message content
 which is also *why* it compressed as much (or as little) as it did:
 
   structured_json : JSON tool output / API responses   → SmartCrusher (high savings)
+  html            : HTML/webpage attachments           → HTMLExtractor + Kompress (high savings)
   logs            : repetitive log / stack-trace output → log dedup (high savings)
   source_code     : source files / code                 → needs AST (low without it)
   prose           : natural-language text               → Kompress (needs PyTorch)
@@ -31,10 +32,11 @@ _CODE_FENCE_RE = re.compile(r"```(?:python|py|ts|tsx|js|jsx|rust|rs|go|java|cpp|
 _LOG_RE = re.compile(r"\b(ERROR|WARN|WARNING|FATAL|INFO|DEBUG|TRACE|Traceback|Exception|panicked|FAILED|stack trace)\b")
 _LOG_LINE_RE = re.compile(r"^\s*(\d{4}-\d{2}-\d{2}[T ]|\[\d|\d+:\d+:\d+|(INFO|ERROR|WARN|DEBUG)\b)", re.M)
 _JSON_HINT_RE = re.compile(r'^\s*[\[{]')
+_HTML_RE = re.compile(r"<!doctype html|<html\b|<head\b|<body\b|<script\b|<style\b|<div\b", re.I)
 
 SHORT_TOKEN_THRESHOLD = 400  # ~1500 chars; below this nothing meaningfully compresses
 
-CLASSES = ("structured_json", "logs", "source_code", "prose", "short", "mixed")
+CLASSES = ("structured_json", "html", "logs", "source_code", "prose", "short", "mixed")
 
 
 def _text_of(content: Any) -> str:
@@ -86,6 +88,8 @@ def _is_json(text: str) -> bool:
 def _classify_block(text: str) -> str:
     if _is_json(text):
         return "structured_json"
+    if len(_HTML_RE.findall(text[:4000])) >= 2:
+        return "html"
     log_lines = len(_LOG_LINE_RE.findall(text))
     if log_lines >= 5 or (_LOG_RE.search(text) and text.count("\n") > 20):
         return "logs"
