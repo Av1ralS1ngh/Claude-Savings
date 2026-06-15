@@ -12,14 +12,21 @@ import {
   validateGatewayInput,
 } from "./url";
 import { planWire, planUnwire, readFileOrNull, writeFileAtomic, backupOnce } from "./settings";
-import { cliBinCandidates, configFiles, claudeKeyFile, resolveInstallCommand, shQuote } from "./setup";
+import { cliBinCandidates, configFiles, claudeKeyFile, resolveInstallCommand, shQuoteFor, detectEnv } from "./setup";
+
+const IS_WINDOWS = process.platform === "win32";
+/** The detected environment (windows / wsl / macOS / linux). vscode.env.remoteName distinguishes a
+ *  WSL extension host from a native Linux one; os.release() carries the WSL "microsoft" marker. */
+const ENV_INFO = detectEnv({ platform: process.platform, osRelease: os.release(), remoteName: vscode.env.remoteName });
 
 const CONFIG_DIR = path.join(os.homedir(), ".decompute");
 const DEVICE_ID_FILE = path.join(CONFIG_DIR, "device.id");
 const LICENSE_FILE = path.join(CONFIG_DIR, "license.dcmp");
 const CLAUDE_SETTINGS = path.join(os.homedir(), ".claude", "settings.json");
 const CLAUDE_CODE_EXT_ID = "anthropic.claude-code"; // the Claude Code extension Decompute sits in front of
-const LOCAL_BIN = path.join(os.homedir(), ".local", "bin"); // where the installer links the shims
+// POSIX-only artifacts: the installer's shim dir + shell rc files. On Windows the venv Scripts dir goes on
+// PATH directly (no shim dir) and there are no rc files — guarded by IS_WINDOWS at every use site.
+const LOCAL_BIN = path.join(os.homedir(), ".local", "bin");
 const SHELL_RC_FILES = [path.join(os.homedir(), ".zprofile"), path.join(os.homedir(), ".bash_profile")];
 const SETUP_URL = "https://decompute.run";
 const UPGRADE_URL = "https://decompute.run/pro";
@@ -36,6 +43,17 @@ function cfg<T>(key: string, dflt: T): T {
 
 function gatewayUrl(): string {
   return normalizeGatewayUrl(cfg("gatewayUrl", DEFAULT_GATEWAY_URL));
+}
+
+/** Open a terminal for running a decompute command. On Windows we force PowerShell so commands quoted
+ *  for it (shQuoteFor) run as written, regardless of the user's default shell (cmd / pwsh / git-bash). */
+function decomputeTerminal(name: string): vscode.Terminal {
+  return vscode.window.createTerminal(IS_WINDOWS ? { name, shellPath: "powershell.exe" } : { name });
+}
+
+/** Quote a CLI arg for the terminal we'll send it to (PowerShell on Windows, POSIX sh elsewhere). */
+function q(value: string): string {
+  return shQuoteFor(value, process.platform as any);
 }
 
 function optionalConfigUrl(key: string): string {
@@ -279,11 +297,12 @@ function cliInstalledSync(): boolean {
   return false;
 }
 
-/** Resolve the absolute `decompute` path: known shim locations first (fast, PATH-independent), then
- *  a login-shell `command -v` in the user's own shell so a custom-PATH install is still found.
- *  Caches the result. POSIX-only — on Windows there's nothing to probe (the installer is bash). */
+/** Resolve the absolute `decompute` path: known install locations first (fast, PATH-independent), then
+ *  a shell lookup so a custom-PATH install is still found. Caches the result. Cross-OS: on Windows it
+ *  probes the venv Scripts\\decompute.exe and falls back to PowerShell `Get-Command`; on POSIX it probes
+ *  the shim/venv and falls back to a login-shell `command -v`. */
 function whichCli(): Promise<string | null> {
-  for (const c of cliBinCandidates()) {
+  for (const c of cliBinCandidates(os.homedir(), process.env, process.platform as any)) {
     try {
       if (fs.existsSync(c)) {
         cachedBin = c;
@@ -293,7 +312,25 @@ function whichCli(): Promise<string | null> {
       // ignore
     }
   }
-  if (process.platform === "win32") return Promise.resolve(null);
+  if (IS_WINDOWS) {
+    return new Promise((resolve) => {
+      // PowerShell resolves decompute.exe via PATHEXT; Source is its absolute path.
+      execFile(
+        "powershell.exe",
+        ["-NoProfile", "-NonInteractive", "-Command", "(Get-Command decompute -ErrorAction SilentlyContinue).Source"],
+        { timeout: 8000 },
+        (err, stdout) => {
+          const p = String(stdout || "").trim().split(/\r?\n/)[0] || "";
+          if (!err && p && fs.existsSync(p)) {
+            cachedBin = p;
+            resolve(p);
+          } else {
+            resolve(null);
+          }
+        }
+      );
+    });
+  }
   return new Promise((resolve) => {
     // The user's login shell so their PATH (where the shim is linked) is loaded.
     const shell = process.env.SHELL || "/bin/sh";
@@ -492,26 +529,20 @@ async function runSetupWizard(): Promise<void> {
 
   // STEP 1 — install the CLI.
   if (!bin) {
-    if (process.platform === "win32") {
-      const pick = await vscode.window.showWarningMessage(
-        "The Decompute CLI installs on macOS/Linux. On Windows, install it inside WSL, then reopen VS Code connected to WSL.",
-        "Open Docs"
-      );
-      if (pick === "Open Docs") void vscode.env.openExternal(vscode.Uri.parse(SETUP_URL));
-      return;
-    }
     // Don't run an installer command from an untrusted workspace (the install command is normally a
     // user/machine setting, but trust is the backstop). `isTrusted` may be undefined on old hosts.
     if (vscode.workspace.isTrusted === false) {
       vscode.window.showWarningMessage("Open this folder in a trusted window to install the Decompute CLI (setup runs an installer command).");
       return;
     }
-    const defaultCmd = resolveInstallCommand("");
+    // OS-aware installer: PowerShell install.ps1 on native Windows, curl|bash install.sh on macOS/Linux
+    // (incl. WSL, where the extension host is Linux). The status line tells the user exactly where we are.
+    const defaultCmd = resolveInstallCommand("", process.platform as any);
     const configured = String(cfg<string>("cliInstallCommand", "") || "").trim();
     const installCmd = configured || defaultCmd;
     const isCustom = !!configured && configured !== defaultCmd;
     const choice = await vscode.window.showInformationMessage(
-      "Set up Decompute — Step 1 of 4: install the helper",
+      `Set up Decompute — Step 1 of 4: install the helper  ·  Detected: ${ENV_INFO.label}`,
       {
         modal: true,
         detail:
@@ -519,9 +550,12 @@ async function runSetupWizard(): Promise<void> {
           "compression gateway that Claude Code talks to.\n\n" +
           (isCustom
             ? "⚠ Using a CUSTOM install command from your settings (not the default Decompute installer):\n\n"
-            : "I'll run this in a terminal:\n\n") +
+            : `I'll run this in a ${IS_WINDOWS ? "PowerShell" : "terminal"}:\n\n`) +
           `  ${installCmd}\n\n` +
-          "Watch the terminal until it prints “✓ installed” — I'll detect it and continue automatically.",
+          (IS_WINDOWS
+            ? "On Windows, the gateway runs Decompute's built-in compression (the ML engine ships next). "
+            : "") +
+          "Watch the terminal until it finishes — I'll detect it and continue automatically.",
       },
       "Install Now",
       "Edit Command"
@@ -531,7 +565,9 @@ async function runSetupWizard(): Promise<void> {
     if (choice === "Edit Command") {
       const edited = await vscode.window.showInputBox({
         title: "Decompute install command",
-        prompt: "Runs in a terminal to install the `decompute` CLI. Local dev: bash /path/to/decompute/scripts/install.sh",
+        prompt: IS_WINDOWS
+          ? "Runs in a PowerShell terminal to install the `decompute` CLI. Local dev: powershell -File C:\\path\\to\\decompute\\scripts\\install.ps1"
+          : "Runs in a terminal to install the `decompute` CLI. Local dev: bash /path/to/decompute/scripts/install.sh",
         value: installCmd,
         ignoreFocusOut: true,
       });
@@ -539,7 +575,8 @@ async function runSetupWizard(): Promise<void> {
       cmd = edited.trim();
       if (!cmd) return;
     }
-    const term = vscode.window.createTerminal({ name: "Decompute · Install" });
+    // On Windows, open the terminal as PowerShell so the install.ps1 one-liner runs as written.
+    const term = decomputeTerminal("Decompute · Install");
     term.show();
     term.sendText(cmd, true);
     bin = await vscode.window.withProgress(
@@ -548,7 +585,9 @@ async function runSetupWizard(): Promise<void> {
     );
     if (!bin) {
       const pick = await vscode.window.showWarningMessage(
-        "I can't find the `decompute` command yet. If the installer finished, open a new terminal (or add ~/.local/bin to your PATH), then run setup again.",
+        IS_WINDOWS
+          ? "I can't find the `decompute` command yet. If the installer finished, open a NEW terminal (PATH updates only apply to new ones), then run setup again."
+          : "I can't find the `decompute` command yet. If the installer finished, open a new terminal (or add ~/.local/bin to your PATH), then run setup again.",
         "Try Again",
         "Open Docs"
       );
@@ -591,11 +630,11 @@ async function runSetupWizard(): Promise<void> {
     const action = usingClaudePlan ? "Use Claude Plan" : "Open Setup Wizard";
     const go = await vscode.window.showInformationMessage(title, { modal: true, detail }, action);
     if (!go) return;
-    const initTerm = vscode.window.createTerminal({ name: "Decompute · Setup wizard" });
+    const initTerm = decomputeTerminal("Decompute · Setup wizard");
     initTerm.show();
     const initCmd = usingClaudePlan
-      ? `${shQuote(bin)} init --yes --auth-mode claude_subscription --base-url ${shQuote(gw)}`
-      : `${shQuote(bin)} init --auth-mode api_key --base-url ${shQuote(gw)}`;
+      ? `${q(bin)} init --yes --auth-mode claude_subscription --base-url ${q(gw)}`
+      : `${q(bin)} init --auth-mode api_key --base-url ${q(gw)}`;
     initTerm.sendText(initCmd, true);
     const configured = await vscode.window.withProgress(
       {
@@ -626,9 +665,9 @@ async function runSetupWizard(): Promise<void> {
         "Continue Anyway"
       );
       if (pick === "Add Key in Terminal") {
-        const t = vscode.window.createTerminal({ name: "Decompute · Add key" });
+        const t = decomputeTerminal("Decompute · Add key");
         t.show();
-        t.sendText(`${shQuote(bin)} claude --set-key`, true);
+        t.sendText(`${q(bin)} claude --set-key`, true);
         vscode.window.showInformationMessage("Paste your sk-ant-* key in the terminal, then run “Decompute: Set Up” again.");
         return;
       }
@@ -656,9 +695,9 @@ async function runSetupWizard(): Promise<void> {
 
   if (healthy && claudeCodeRoutedToGateway()) {
     // Show doctor in a fresh terminal so the user sees the green checks — safe now (gateway up, no init in flight).
-    const t = vscode.window.createTerminal({ name: "Decompute · Verify" });
+    const t = decomputeTerminal("Decompute · Verify");
     t.show();
-    t.sendText(`${shQuote(bin)} doctor`, true);
+    t.sendText(`${q(bin)} doctor`, true);
     await offerReload("✓ Decompute is set up and the gateway is reachable. Claude Code in this window will route through it after a reload.");
   } else {
     const pick = await vscode.window.showWarningMessage(
@@ -725,7 +764,9 @@ async function copyClaudeSetupCommand(): Promise<void> {
   await vscode.env.clipboard.writeText(command);
   const pick = await vscode.window.showInformationMessage(`Copied: ${command}`, "Open Terminal", "Open Dashboard");
   if (pick === "Open Terminal") {
-    const terminal = vscode.window.createTerminal({ name: "Decompute setup" });
+    // The copied command also lives on the clipboard; we don't auto-run it (sendText with addNewLine
+    // false just pre-types it), so the user reviews it first. PowerShell shell on Windows for parity.
+    const terminal = decomputeTerminal("Decompute setup");
     terminal.show();
     terminal.sendText(command, false);
   } else if (pick === "Open Dashboard") {
@@ -817,8 +858,10 @@ async function uninstallDecompute(context: vscode.ExtensionContext): Promise<voi
     {
       modal: true,
       detail:
-        "Stops the gateway and deletes the Decompute CLI, gateway, config and PATH entry (~/.decompute, the " +
-        "decompute/decompute-gateway commands, the ~/.zprofile line), and removes Decompute's routing from " +
+        "Stops the gateway and deletes the Decompute CLI, gateway and config (~/.decompute, the " +
+        "decompute/decompute-gateway commands" +
+        (IS_WINDOWS ? " and the auto-start task" : ", the ~/.zprofile line") +
+        "), and removes Decompute's routing from " +
         "Claude Code (~/.claude/settings.json — backed up first). Your Claude Code key and other settings are " +
         "left untouched.\n\nAfter this, uninstall the “Decompute” extension from the Extensions view to finish.",
     },
@@ -828,11 +871,17 @@ async function uninstallDecompute(context: vscode.ExtensionContext): Promise<voi
 
   const done: string[] = [];
 
-  // 1. Remove the launchd watchdog FIRST (so it doesn't restart the gateway), then stop the gateway.
-  const plist = path.join(os.homedir(), "Library", "LaunchAgents", "run.decompute.gateway.plist");
-  try { execFile("launchctl", ["unload", plist], () => undefined); } catch { /* ignore */ }
-  try { fs.rmSync(plist, { force: true }); } catch { /* ignore */ }
-  try { execFile("pkill", ["-f", "decompute-gateway"], () => undefined); } catch { /* ignore */ }
+  // 1. Remove the auto-start watchdog FIRST (so it doesn't restart the gateway), then stop the gateway.
+  if (IS_WINDOWS) {
+    // Windows: delete the Task Scheduler job (install.ps1's "DecomputeGateway"), then kill the process.
+    try { execFile("schtasks", ["/Delete", "/TN", "DecomputeGateway", "/F"], () => undefined); } catch { /* ignore */ }
+    try { execFile("taskkill", ["/IM", "decompute-gateway.exe", "/F", "/T"], () => undefined); } catch { /* ignore */ }
+  } else {
+    const plist = path.join(os.homedir(), "Library", "LaunchAgents", "run.decompute.gateway.plist");
+    try { execFile("launchctl", ["unload", plist], () => undefined); } catch { /* ignore */ }
+    try { fs.rmSync(plist, { force: true }); } catch { /* ignore */ }
+    try { execFile("pkill", ["-f", "decompute-gateway"], () => undefined); } catch { /* ignore */ }
+  }
 
   // 2. Remove Decompute's routing from Claude Code — touch ONLY our two keys (planUnwire), and surface
   //    it if we couldn't (rather than silently leaving routing on). No backup file is left behind: the
@@ -851,13 +900,20 @@ async function uninstallDecompute(context: vscode.ExtensionContext): Promise<voi
     routingNote = ` — couldn't update ~/.claude/settings.json (${e?.message || e})`;
   }
 
-  // 3. Delete the install: ~/.decompute, the shims, and the installer's PATH line.
+  // 3. Delete the install: ~/.decompute (holds the venv + Scripts/bin entry points), and the installer's
+  //    PATH registration. On Windows the venv lives under ~/.decompute so removing it drops the .exe
+  //    entry points too; the User PATH entry (added via setx) is left for manual cleanup — VS Code can't
+  //    reliably edit the registry PATH. On POSIX we also remove the ~/.local/bin shims + the rc-file line.
   try { fs.rmSync(CONFIG_DIR, { recursive: true, force: true }); done.push("removed ~/.decompute"); } catch { /* ignore */ }
-  for (const cmd of ["decompute", "decompute-gateway"]) {
-    try { fs.rmSync(path.join(LOCAL_BIN, cmd), { force: true }); } catch { /* ignore */ }
+  if (IS_WINDOWS) {
+    done.push("removed CLI (note: remove the …\\.decompute\\venv\\Scripts PATH entry from User environment variables manually)");
+  } else {
+    for (const cmd of ["decompute", "decompute-gateway"]) {
+      try { fs.rmSync(path.join(LOCAL_BIN, cmd), { force: true }); } catch { /* ignore */ }
+    }
+    for (const rc of SHELL_RC_FILES) removeInstallerPathLine(rc);
+    done.push("removed CLI + PATH entry");
   }
-  for (const rc of SHELL_RC_FILES) removeInstallerPathLine(rc);
-  done.push("removed CLI + PATH entry");
 
   // 4. Clear onboarding state so a fresh reinstall prompts setup again from scratch.
   await context.globalState.update("decompute.onboard.dismissedAt", undefined); // legacy key
