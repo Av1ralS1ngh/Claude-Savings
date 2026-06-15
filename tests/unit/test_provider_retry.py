@@ -5,6 +5,7 @@ import pytest
 
 from decompute_gateway import anthropic_provider as ap
 from decompute_gateway.config import Settings
+from decompute_gateway.security import UpstreamAnthropicAuth
 
 
 class _Resp:
@@ -22,6 +23,7 @@ class _FakeAsyncClient:
     def __init__(self, statuses):
         self.statuses = statuses
         self.calls = 0
+        self.post_kwargs = []
 
     async def __aenter__(self):
         return self
@@ -30,6 +32,7 @@ class _FakeAsyncClient:
         return False
 
     async def post(self, *args, **kwargs):
+        self.post_kwargs.append(kwargs)
         status = self.statuses[min(self.calls, len(self.statuses) - 1)]
         self.calls += 1
         return _Resp(status)
@@ -80,6 +83,24 @@ def test_auth_error_body_is_sanitized_but_request_id_kept(monkeypatch):
     assert result.upstream_request_id == "req_upstream_123"  # still traceable
 
 
+def test_bearer_auth_serialized_on_unary_upstream_call(monkeypatch):
+    fake = _FakeAsyncClient([200])
+    monkeypatch.setattr(ap.httpx, "AsyncClient", lambda **k: fake)
+    settings = Settings(mock_anthropic=False)
+
+    result = asyncio.run(ap.call_anthropic_messages(
+        {"model": "claude-haiku-4-5", "messages": []},
+        settings=settings,
+        upstream_api_key=UpstreamAnthropicAuth("bearer", "oauth-token"),
+        prompt_cache_mode="off",
+    ))
+
+    assert result.status_code == 200
+    headers = fake.post_kwargs[0]["headers"]
+    assert headers["authorization"] == "Bearer oauth-token"
+    assert "x-api-key" not in headers
+
+
 # ── Streaming path retry (mirrors the unary retry above, but BEFORE the first byte) ──
 
 from decompute_gateway.sse import SSEUsageTracker
@@ -126,6 +147,7 @@ class _FakeStreamClient:
         self.statuses = statuses
         self.body_chunks = body_chunks
         self.stream_calls = 0
+        self.stream_kwargs = []
 
     async def __aenter__(self):
         return self
@@ -134,6 +156,7 @@ class _FakeStreamClient:
         return False
 
     def stream(self, *args, **kwargs):
+        self.stream_kwargs.append(kwargs)
         status = self.statuses[min(self.stream_calls, len(self.statuses) - 1)]
         self.stream_calls += 1
         return _FakeStreamCtx(_FakeStreamResp(status, self.body_chunks))
@@ -176,3 +199,28 @@ def test_stream_persistent_529_yields_single_terminal_error(monkeypatch):
     assert joined.count(b"event: error") == 1
     assert b'"http_status":529' in joined
     assert b"message_start" not in joined    # never reached the success body
+
+
+def test_bearer_auth_serialized_on_streaming_upstream_call(monkeypatch):
+    fake = _FakeStreamClient([200], _OK_STREAM_CHUNKS)
+    monkeypatch.setattr(ap.httpx, "AsyncClient", lambda **k: fake)
+    settings = Settings(mock_anthropic=False)
+    tracker = SSEUsageTracker()
+
+    async def run():
+        return [
+            c async for c in ap.stream_anthropic_messages(
+                {"model": "claude-haiku-4-5", "messages": [{"role": "user", "content": "hi"}]},
+                settings=settings,
+                upstream_api_key=UpstreamAnthropicAuth("bearer", "oauth-token"),
+                prompt_cache_mode="off",
+                tracker=tracker,
+            )
+        ]
+
+    out = asyncio.run(run())
+
+    assert b"message_start" in b"".join(out)
+    headers = fake.stream_kwargs[0]["headers"]
+    assert headers["authorization"] == "Bearer oauth-token"
+    assert "x-api-key" not in headers
