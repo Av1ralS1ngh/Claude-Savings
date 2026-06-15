@@ -545,6 +545,9 @@ def init(
     })
     print(f"\n[green]✓[/green] saved {CONFIG_PATH}")
     print(f"  upstream: [cyan]{mode}[/cyan] · privacy: [cyan]{pii_mode}+{secret_mode}[/cyan] · CCR: [cyan]{'on' if ccr_enabled else 'off'}[/cyan]")
+    # One-time transparency notice (opt-out telemetry). Counts only — never prompts/files.
+    print("[dim]  Decompute shares a weekly, anonymous savings total (tokens saved — never your prompts or "
+          "files) to improve the product. Turn it off any time: [bold]decompute telemetry off[/bold].[/dim]")
 
     # 5. Start gateway after setup?
     start = yes or typer.confirm("\nStart gateway after setup?", default=True)
@@ -1000,6 +1003,42 @@ def version(check: bool = typer.Option(False, "--check", help="check PyPI for a 
                 print("[green]✓ up to date[/green]")
         except Exception as exc:
             print(f"[dim]couldn't reach PyPI ({exc}).[/dim]")
+
+
+@app.command()
+def telemetry(action: Optional[str] = typer.Argument(None, help="on | off | status (default: status)")):
+    """Anonymous savings telemetry — controls the WEEKLY counts-only savings rollup.
+
+    Decompute sends a weekly total of how many tokens you've saved (counts only — NEVER your prompts,
+    files, or any content) so we can see aggregate savings. It's on by default; turn it off any time.
+    Honors DO_NOT_TRACK and DECOMPUTE_TELEMETRY=off too.
+    """
+    act = (action or "status").strip().lower()
+    if act in ("on", "enable", "true"):
+        save_config({"telemetry": {"enabled": True}})
+        print("[green]✓[/green] Savings telemetry ON — a weekly, counts-only savings total is shared (never your prompts/files).")
+        return
+    if act in ("off", "disable", "false"):
+        save_config({"telemetry": {"enabled": False}})
+        print("[green]✓[/green] Savings telemetry OFF — nothing is sent. (Re-enable with `decompute telemetry on`.)")
+        return
+    if act != "status":
+        print("[yellow]Usage:[/yellow] decompute telemetry [on|off|status]")
+        raise typer.Exit(2)
+    # status
+    cfg = load_config()
+    enabled = (cfg.get("telemetry") or {}).get("enabled", True)
+    dnt = bool(os.getenv("DO_NOT_TRACK")) or (os.getenv("DECOMPUTE_TELEMETRY", "").strip().lower() in ("0", "off", "false", "no"))
+    on = bool(enabled) and not dnt
+    t = Table(title="savings telemetry", show_header=False)
+    t.add_column("k", style="bold"); t.add_column("v")
+    t.add_row("status", "[green]on[/green] (weekly, counts only)" if on else "[dim]off[/dim]")
+    if dnt and enabled:
+        t.add_row("note", "disabled by DO_NOT_TRACK / DECOMPUTE_TELEMETRY in your environment")
+    t.add_row("what's sent", "request count, tokens saved, est. $ saved, OS, version")
+    t.add_row("never sent", "prompts, files, messages, or any content")
+    t.add_row("toggle", "decompute telemetry on  ·  decompute telemetry off")
+    print(t)
 
 
 @app.command()

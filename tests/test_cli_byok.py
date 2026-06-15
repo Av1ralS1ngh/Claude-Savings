@@ -115,6 +115,25 @@ def test_init_subscription_mode_writes_no_key_and_warns_about_old_key(env, monke
     assert "sk-ant-existing" not in (cfgdir / "config.toml").read_text()
 
 
+def test_telemetry_toggle_on_off_status(env):
+    """`decompute telemetry on|off|status` flips the [telemetry].enabled flag and reports it; status
+    makes the privacy contract visible (counts only, never prompts)."""
+    config, cli, _ = env
+    # default status: on, and it must say it never sends content
+    res = runner.invoke(cli.app, ["telemetry"])
+    assert res.exit_code == 0, res.stdout
+    assert "on" in res.stdout.lower()
+    assert "never sent" in res.stdout.lower() and "prompts" in res.stdout.lower()
+    # off persists to config.toml and is reflected
+    res = runner.invoke(cli.app, ["telemetry", "off"])
+    assert res.exit_code == 0
+    assert config.load_config()["telemetry"]["enabled"] is False
+    assert "off" in runner.invoke(cli.app, ["telemetry", "status"]).stdout.lower()
+    # back on
+    runner.invoke(cli.app, ["telemetry", "on"])
+    assert config.load_config()["telemetry"]["enabled"] is True
+
+
 def test_init_rerun_preserves_existing_byok_mode_interactively(env, monkeypatch):
     """Re-running `decompute init` interactively (no --auth-mode) must NOT flip an existing BYOK user
     to subscription. Pressing Enter keeps their configured mode (regression: default used to be [1])."""

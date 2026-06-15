@@ -1,0 +1,11 @@
+name = "decompute-telemetry"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+
+# Anonymous, counts-only savings rollups. Create the D1 database once, then paste its id:
+#   wrangler d1 create decompute-telemetry
+#   wrangler d1 execute decompute-telemetry --file schema.sql --remote
+[[d1_databases]]
+binding = "DB"
+database_name = "decompute-telemetry"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"

@@ -33,6 +33,7 @@ from .security import AuthPrincipal, assert_csrf_for_browser_mutation, auth_cont
 from .sse import SSEUsageTracker
 from .streaming_cleanup import StreamUsageTracker, proxy_sse_stream
 from .support_router import include_support_bundle_router
+from . import telemetry
 from .workload import classify_workload
 from .yscompress import CCR_RETRIEVE_TOOL, YSCompressClient, estimate_tokens
 from .yellowstone import TrafficProfile, YellowstonePlanner, scan_local_devices
@@ -341,6 +342,12 @@ def startup() -> None:
     purged = store.purge_expired_ccr()
     if purged:
         log.info("purged expired CCR items", extra={"extra": {"purged": purged}})
+    # Anonymous, counts-only weekly savings beacon. Daemon threads; honors the opt-outs and the weekly
+    # cadence internally, beacons at boot then re-checks daily (for a long-running gateway), never raises.
+    try:
+        telemetry.start_periodic(settings, store, version=app.version)
+    except Exception:
+        pass
 
 
 @app.get("/health")

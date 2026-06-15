@@ -210,6 +210,16 @@ class Settings:
     def billing_enabled(self) -> bool:
         return bool(self.stripe_secret_key)
 
+    # ── Anonymous savings telemetry (counts only) ─────────────────────────────
+    # Sends a WEEKLY rollup of savings COUNTS (requests, tokens_saved, tokens_before, est_$ saved) to
+    # the telemetry Worker so we can see aggregate savings across users. NEVER sends prompts, files,
+    # messages, model inputs, or any user content — see telemetry.py, which is the only writer and
+    # asserts the payload is counts-only. On by default but trivially disabled; the gateway also honors
+    # the DO_NOT_TRACK convention, so a user who exports DO_NOT_TRACK=1 is never beaconed.
+    telemetry_enabled: bool = _bool("DECOMPUTE_TELEMETRY", True) and not _bool("DO_NOT_TRACK", False)
+    telemetry_url: str = os.getenv("DECOMPUTE_TELEMETRY_URL", "https://decompute-telemetry.xcomp-decompute.workers.dev")
+    telemetry_interval_days: int = _int("DECOMPUTE_TELEMETRY_INTERVAL_DAYS", 7)
+
     # Retry transient upstream failures (500/504/529) with exponential backoff.
     upstream_max_retries: int = _int("DECOMPUTE_UPSTREAM_MAX_RETRIES", 2)
     upstream_retry_backoff_s: float = _float("DECOMPUTE_UPSTREAM_RETRY_BACKOFF_S", 0.25)
