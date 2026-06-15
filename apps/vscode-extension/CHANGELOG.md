@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.17
+
+- **Claude-plan auth hardening (gateway + CLI).** Several fixes for the "Use my existing Claude plan" path: re-running setup no longer silently switches an existing API-key user to subscription mode; subscription mode is refused on a non-local gateway (your Claude login stays on this machine); and the gateway always reads the same config the CLI wrote. Update your local engine to get them (one-time prompt, or run “Decompute: Set Up”).
+- **No credential detail in error responses.** A rejected/expired credential (HTTP 401/403) from upstream now returns a clean, generic error on every path — including streaming, `/v1/models`, and token counting — instead of forwarding the provider's raw error body. Nothing is changed in your prompts or replies.
+
 ## 0.1.14
 
 - **Much higher compression on real work.** Attached files, pasted logs, and HTML now compress up to ~99% (previously ~0%). The engine was skipping structured content blocks and sending HTML to the prose compressor (which can't shrink markup); it now routes HTML/log content through the right compressor and chains the ML compressor on top, and large attached/read files are no longer left verbatim. Code you ask it to *review/analyze* stays protected, and your short question is never altered.

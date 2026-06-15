@@ -235,12 +235,12 @@ async function maybeOnboard(context: vscode.ExtensionContext): Promise<void> {
   // still running their OLD local compression engine until they re-run setup (which now force-
   // reinstalls the wheels). Only nudge users who were ALREADY set up — a fresh install just ran setup
   // with the latest engine, so it doesn't need the prompt.
-  const ENGINE_UPDATE_KEY = "decompute.engineUpdate.v0_1_14";
+  const ENGINE_UPDATE_KEY = "decompute.engineUpdate.v0_1_17";
   if (!context.globalState.get(ENGINE_UPDATE_KEY)) {
     void context.globalState.update(ENGINE_UPDATE_KEY, true);
     if (context.globalState.get("decompute.welcomed.thinController")) {
       const pick = await vscode.window.showInformationMessage(
-        "Decompute's compression engine was upgraded — attached files, logs, and HTML now compress up to ~99% (previously ~0%). Update your local engine to get it?",
+        "Decompute's gateway got security & reliability fixes (Claude-plan auth hardening). Update your local engine to get them?",
         "Update now",
         "Later"
       );
