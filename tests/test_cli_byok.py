@@ -115,6 +115,35 @@ def test_init_subscription_mode_writes_no_key_and_warns_about_old_key(env, monke
     assert "sk-ant-existing" not in (cfgdir / "config.toml").read_text()
 
 
+def test_init_rerun_preserves_existing_byok_mode_interactively(env, monkeypatch):
+    """Re-running `decompute init` interactively (no --auth-mode) must NOT flip an existing BYOK user
+    to subscription. Pressing Enter keeps their configured mode (regression: default used to be [1])."""
+    config, cli, _ = env
+    config.save_claude_key("sk-ant-existing")
+    config.save_config({"claude": {"mode": "anthropic_api"}})
+    monkeypatch.setattr(cli, "_gateway_running", lambda *_a, **_k: True)
+    # The user already has a key on disk; pass --claude-key so the API-key branch doesn't re-prompt.
+    # Empty stdin then accepts each remaining default — crucially the auth-mode prompt defaults to [2]
+    # (the existing mode), NOT [1], so the mode is preserved rather than flipped to subscription.
+    res = runner.invoke(
+        cli.app, ["init", "--base-url", "http://127.0.0.1:8080", "--claude-key", "sk-ant-existing"], input="\n\n\n\n\n"
+    )
+    assert res.exit_code == 0, res.stdout
+    assert "Current setup: anthropic_api" in res.stdout            # the existing mode was offered as default
+    assert config.load_config()["claude"]["mode"] == "anthropic_api"  # mode preserved, not flipped
+
+
+def test_init_subscription_rejects_non_loopback_gateway(env):
+    """Existing Claude plan auth is local-only; init must refuse a remote gateway in subscription
+    mode (mirrors `configure claude-code`)."""
+    _, cli, _ = env
+    res = runner.invoke(cli.app, [
+        "init", "--yes", "--auth-mode", "claude_subscription", "--base-url", "https://gateway.decompute.run",
+    ])
+    assert res.exit_code == 2
+    assert "local-only" in res.stdout
+
+
 def test_subscription_mode_auth_headers_ignore_saved_api_key(env):
     config, cli, _ = env
     config.save_claude_key("sk-ant-existing")

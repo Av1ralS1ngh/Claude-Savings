@@ -222,6 +222,12 @@ def configure_claude_code(
     if auth_mode and not mode:
         print("[red]✗[/red] --auth-mode must be one of: claude_subscription, api_key")
         raise typer.Exit(2)
+    # When --auth-mode is omitted, inherit the user's already-configured mode. Without this, a
+    # subscription user re-running `configure claude-code` (e.g. to refresh the session header) would
+    # fall through to the HOSTED gateway default below — which blocks bearer passthrough — silently
+    # breaking their local Claude-plan routing.
+    if not mode:
+        mode = _claude_mode()
     if mode == AUTH_ENTERPRISE:
         mode = AUTH_API_KEY
     base_url = _safe_gateway_url(gateway_url or (cfg_base_url() if local or mode == AUTH_SUBSCRIPTION else HOSTED_GATEWAY_URL))
@@ -396,21 +402,42 @@ def init(
     if auth_mode and not mode:
         print("[red]✗[/red] --auth-mode must be one of: claude_subscription, api_key, enterprise_gateway")
         raise typer.Exit(2)
+    # Never silently flip an already-configured user's auth mode when they re-run init (e.g. just to
+    # change the gateway URL). An EXISTING mode is the default; only a brand-new install with no
+    # config falls back to the recommended onboarding default.
+    existing_mode = _claude_mode() if (CONFIG_TOML.exists() or LEGACY_JSON.exists()) else None
     if not mode:
-        mode = AUTH_API_KEY if yes else AUTH_SUBSCRIPTION
+        if existing_mode:
+            mode = existing_mode                       # preserve the user's current mode by default
+        else:
+            mode = AUTH_API_KEY if yes else AUTH_SUBSCRIPTION  # fresh install: onboarding default
     upstream_base_url = ""
     if not yes:
         print("[dim]Tip: at each step, press [bold]Enter[/bold] to accept the recommended option shown in [brackets].[/dim]\n")
         if not auth_mode:
+            # Pre-select the current/recommended option so pressing Enter keeps an existing user's mode.
+            default_choice = {AUTH_API_KEY: "2", AUTH_ENTERPRISE: "3"}.get(mode, "1")
             print("How should Claude Code connect?")
             print("  [1] Use my existing Claude plan   [dim](Pro, Max, Team, or Enterprise — no API key)[/dim]")
             print("  [2] Use an API key                [dim](Anthropic Console sk-ant-* key)[/dim]")
             print("  [3] Enterprise/custom gateway")
-            choice = typer.prompt("Choose", default="1").strip()
-            if choice == "2":
+            if existing_mode:
+                print(f"[dim]Current setup: {existing_mode} — press Enter to keep it.[/dim]")
+            choice = typer.prompt("Choose", default=default_choice).strip()
+            if choice == "1":
+                mode = AUTH_SUBSCRIPTION
+            elif choice == "2":
                 mode = AUTH_API_KEY
             elif choice == "3":
                 mode = AUTH_ENTERPRISE
+
+    # Existing Claude plan auth forwards the client's OAuth bearer upstream, which must stay on this
+    # machine — refuse to bind subscription mode to a non-loopback gateway (mirrors `configure
+    # claude-code`, and the gateway's own production bearer block). Checked before any prompt/write.
+    if mode == AUTH_SUBSCRIPTION and not _is_loopback_gateway(base_url):
+        print("[red]✗[/red] Existing Claude plan auth is local-only. Use a local gateway URL (e.g. "
+              f"{DEFAULT_BASE_URL}), or choose --auth-mode api_key.")
+        raise typer.Exit(2)
 
     # 2. The key (BYOK) or the enterprise base URL.
     if mode == AUTH_SUBSCRIPTION:
