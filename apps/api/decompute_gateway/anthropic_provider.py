@@ -239,6 +239,10 @@ async def list_anthropic_models(*, settings: Settings, upstream_api_key: Upstrea
     headers = upstream_headers(settings, upstream_api_key, extra_headers)
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.get(settings.anthropic_base_url.rstrip("/") + "/v1/models", headers=headers)
+    if resp.status_code in (401, 403):
+        # Same credential-hygiene rule as call_anthropic_messages: never forward the provider's raw
+        # 401/403 body (it can echo key material/account detail); keep headers (request-id) for tracing.
+        return ProviderResult(status_code=resp.status_code, body=_sanitize_auth_error(resp.status_code), headers=dict(resp.headers))
     try:
         payload = resp.json()
     except Exception:
@@ -260,6 +264,9 @@ async def count_tokens(
     clean_body = clean_gateway_fields(body)
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(settings.anthropic_base_url.rstrip("/") + "/v1/messages/count_tokens", json=clean_body, headers=headers)
+    if resp.status_code in (401, 403):
+        # Withhold the provider's raw auth-error body (key/account detail); keep request-id for tracing.
+        return ProviderResult(status_code=resp.status_code, body=_sanitize_auth_error(resp.status_code), headers=dict(resp.headers))
     try:
         payload = resp.json()
     except Exception:
@@ -305,13 +312,21 @@ async def stream_anthropic_messages(
                         await resp.aread()
                 else:
                     if resp.status_code >= 400:
-                        try:
-                            err_body = await resp.aread()
-                            err_json = json.loads(err_body.decode("utf-8"))
-                            if not isinstance(err_json, dict):
-                                err_json = {"type": "error", "error": {"message": str(err_json)}}
-                        except Exception:
-                            err_json = {"type": "error", "error": {"message": f"upstream HTTP {resp.status_code}"}}
+                        if resp.status_code in (401, 403):
+                            # Mirror the non-stream path: never forward the provider's raw 401/403
+                            # body — it can echo key material/account detail, and this SSE error is
+                            # also persisted in the usage record (stream_json). Drain + discard it.
+                            with suppress(Exception):
+                                await resp.aread()
+                            err_json = _sanitize_auth_error(resp.status_code)
+                        else:
+                            try:
+                                err_body = await resp.aread()
+                                err_json = json.loads(err_body.decode("utf-8"))
+                                if not isinstance(err_json, dict):
+                                    err_json = {"type": "error", "error": {"message": str(err_json)}}
+                            except Exception:
+                                err_json = {"type": "error", "error": {"message": f"upstream HTTP {resp.status_code}"}}
                         # Carry the real upstream HTTP status on the SSE error payload so the
                         # gateway can record it (rather than collapsing every stream error to
                         # 502); SSE events otherwise have no place for an HTTP status.

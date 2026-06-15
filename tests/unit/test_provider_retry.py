@@ -224,3 +224,96 @@ def test_bearer_auth_serialized_on_streaming_upstream_call(monkeypatch):
     headers = fake.stream_kwargs[0]["headers"]
     assert headers["authorization"] == "Bearer oauth-token"
     assert "x-api-key" not in headers
+
+
+class _FakeAuthErrStreamResp:
+    """Upstream 401/403 whose raw body echoes account/key detail — must NOT reach the client."""
+    def __init__(self, status):
+        self.status_code = status
+        self.headers = {"request-id": "req_upstream_authfail"}
+
+    async def aread(self):
+        return b'{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key sk-ant-LEAK123 for account acct_SECRET"}}'
+
+    async def aiter_bytes(self):
+        if False:  # never reached on an error status
+            yield b""
+
+
+def test_stream_401_body_is_sanitized_before_client_and_record(monkeypatch):
+    """An expired-OAuth 401 on the streaming path must yield a SANITIZED terminal error — the raw
+    upstream body (which can echo key material/account detail) must never reach the client or the
+    usage record (stream_json). Mirrors the non-stream test_auth_error_body_is_sanitized."""
+    class _Client:
+        def __init__(self):
+            self.calls = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        def stream(self, *a, **k):
+            self.calls += 1
+            return _FakeStreamCtx(_FakeAuthErrStreamResp(401))
+
+    fake = _Client()
+    monkeypatch.setattr(ap.httpx, "AsyncClient", lambda **k: fake)
+    settings = Settings(mock_anthropic=False)
+    tracker = SSEUsageTracker()
+
+    async def run():
+        return [
+            c async for c in ap.stream_anthropic_messages(
+                {"model": "claude-haiku-4-5", "messages": [{"role": "user", "content": "hi"}]},
+                settings=settings, upstream_api_key=UpstreamAnthropicAuth("bearer", "oauth-token"),
+                prompt_cache_mode="off", tracker=tracker,
+            )
+        ]
+
+    joined = b"".join(asyncio.run(run()))
+    assert joined.count(b"event: error") == 1            # one clean terminal event, no hang
+    assert b"sk-ant-LEAK123" not in joined               # raw key material withheld
+    assert b"acct_SECRET" not in joined                  # raw account detail withheld
+    assert b"withheld" in joined                          # the sanitized message reached the client
+    assert b'"http_status":401' in joined                 # real status still carried for the client
+    assert fake.calls == 1                                # 401 is not retried
+
+
+def _models_or_count(monkeypatch, fn, statuses):
+    fake = _FakeAsyncClient(statuses)
+    # list_anthropic_models uses .get; count_tokens uses .post — _FakeAsyncClient.post covers post,
+    # add a matching .get so the same fake drives both.
+    async def _get(*a, **k):
+        fake.post_kwargs.append(k)
+        status = fake.statuses[min(fake.calls, len(fake.statuses) - 1)]
+        fake.calls += 1
+        return _Resp(status)
+    fake.get = _get
+    monkeypatch.setattr(ap.httpx, "AsyncClient", lambda **k: fake)
+    settings = Settings(mock_anthropic=False)
+    return asyncio.run(fn(settings)), fake
+
+
+def test_models_401_is_sanitized(monkeypatch):
+    result, _ = _models_or_count(
+        monkeypatch,
+        lambda s: ap.list_anthropic_models(settings=s, upstream_api_key="sk-test"),
+        [401],
+    )
+    assert result.status_code == 401
+    assert "withheld" in result.body["error"]["message"]
+    assert "ok" not in result.body                        # raw upstream body not forwarded
+    assert result.upstream_request_id == "req_upstream_123"
+
+
+def test_count_tokens_403_is_sanitized(monkeypatch):
+    result, _ = _models_or_count(
+        monkeypatch,
+        lambda s: ap.count_tokens({"model": "claude-haiku-4-5", "messages": []}, settings=s, upstream_api_key="sk-test"),
+        [403],
+    )
+    assert result.status_code == 403
+    assert "withheld" in result.body["error"]["message"]
+    assert "ok" not in result.body

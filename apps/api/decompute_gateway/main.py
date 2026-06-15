@@ -235,7 +235,7 @@ def _usage_from_result(result: ProviderResult) -> dict[str, int]:
     }
 
 
-async def _real_token_baseline(model: str | None, body: dict[str, Any], *, upstream_key: Any) -> int | None:
+async def _real_token_baseline(model: str | None, body: dict[str, Any], *, upstream_key: Any, extra_headers: dict[str, str] | None = None) -> int | None:
     """Anthropic's real-tokenizer count of the UNCOMPRESSED prompt — the honest savings
     denominator. The compressor's len/4 estimate undercounts ~5x vs Anthropic's tokenizer,
     so comparing billed (real) compressed tokens against an estimated raw baseline mixes
@@ -250,7 +250,9 @@ async def _real_token_baseline(model: str | None, body: dict[str, Any], *, upstr
             ct_body["system"] = body["system"]
         if body.get("tools"):
             ct_body["tools"] = body["tools"]
-        res = await count_tokens(ct_body, settings=settings, upstream_api_key=upstream_key)
+        # Forward the client's anthropic-beta so count_tokens is on the SAME tokenizer config as the
+        # billed request (e.g. interleaved-thinking betas change the count) — keeps the savings ratio honest.
+        res = await count_tokens(ct_body, settings=settings, upstream_api_key=upstream_key, extra_headers=extra_headers)
         if res.status_code < 400 and isinstance(res.body, dict):
             n = int(res.body.get("input_tokens") or 0)
             return n if n > 0 else None
@@ -1333,7 +1335,7 @@ async def anthropic_messages_proxy(request: Request, payload: MessagesRequest) -
         # Real-tokenizer baseline of the uncompressed prompt, fired concurrently with the stream
         # (which runs for seconds) so it is ready at completion and adds no latency. _safe_complete
         # awaits the async recorder in a shielded task, so this survives a client disconnect.
-        baseline_task = asyncio.create_task(_real_token_baseline(model, body, upstream_key=upstream_key))
+        baseline_task = asyncio.create_task(_real_token_baseline(model, body, upstream_key=upstream_key, extra_headers=dict(request.headers)))
 
         async def record_stream_usage(done: StreamUsageTracker) -> None:
             done.upstream_request_id = done.upstream_request_id or legacy.upstream_request_id

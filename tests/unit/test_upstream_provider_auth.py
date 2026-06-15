@@ -5,7 +5,7 @@ from pathlib import Path
 from starlette.requests import Request
 
 from decompute_gateway.anthropic_provider import upstream_headers
-from decompute_gateway.config import Settings
+from decompute_gateway.config import Settings, _default_data_dir
 from decompute_gateway.security import upstream_anthropic_auth, upstream_anthropic_key
 
 
@@ -76,6 +76,17 @@ def test_saved_byok_key_wins_over_client_bearer(tmp_path: Path):
     assert auth.value == "sk-ant-byok"
 
 
+def test_dc_platform_bearer_is_not_forwarded_as_provider_auth(tmp_path: Path):
+    """A Decompute platform key (dc_*) presented as a bearer is NOT a Claude provider credential — it
+    must never be forwarded upstream (Rule 8). Guards the `not bearer.startswith("dc_")` boundary in
+    both local (bearer allowed) and prod (bearer blocked) modes."""
+    local = Settings(data_dir=tmp_path / "l", anthropic_api_key=None, environment="local", allow_client_bearer_provider_auth_override=True)
+    prod = Settings(data_dir=tmp_path / "p", anthropic_api_key=None, environment="production")
+    for settings in (local, prod):
+        assert upstream_anthropic_auth(_request({"authorization": "Bearer dc_dev_local"}), settings) is None
+        assert upstream_anthropic_auth(_request({"authorization": "Bearer dc_prod_abc123"}), settings) is None
+
+
 def test_subscription_mode_ignores_saved_byok_key(tmp_path: Path):
     (tmp_path / "claude.key").write_text("sk-ant-byok\n", encoding="utf-8")
     (tmp_path / "config.toml").write_text('[claude]\nmode = "claude_subscription"\n', encoding="utf-8")
@@ -85,3 +96,15 @@ def test_subscription_mode_ignores_saved_byok_key(tmp_path: Path):
     assert auth is not None
     assert auth.kind == "bearer"
     assert auth.value == "oauth-token"
+
+
+def test_data_dir_falls_back_to_config_dir(tmp_path: Path, monkeypatch):
+    """The gateway's data_dir must honor DECOMPUTE_CONFIG_DIR (the CLI's dir) so it reads the SAME
+    config.toml the CLI wrote — otherwise subscription mode is silently missed. DATA_DIR/HOME win."""
+    monkeypatch.delenv("DECOMPUTE_DATA_DIR", raising=False)
+    monkeypatch.delenv("DECOMPUTE_HOME", raising=False)
+    monkeypatch.setenv("DECOMPUTE_CONFIG_DIR", str(tmp_path / "cli-cfg"))
+    assert _default_data_dir() == tmp_path / "cli-cfg"
+    # DATA_DIR still takes precedence when both are set.
+    monkeypatch.setenv("DECOMPUTE_DATA_DIR", str(tmp_path / "install"))
+    assert _default_data_dir() == tmp_path / "install"
