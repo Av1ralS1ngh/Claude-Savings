@@ -49,7 +49,11 @@ def _default_data_dir() -> Path:
     crashes before it binds and Claude Code — routed at a port nothing is listening on — appears to
     "think" forever. Anchor to the install dir (DECOMPUTE_HOME) or ~/.decompute so the path never
     depends on the launch cwd. (Dev runs from a writable cwd, which is why this was latent.)"""
-    raw = os.getenv("DECOMPUTE_DATA_DIR") or os.getenv("DECOMPUTE_HOME")
+    # DECOMPUTE_CONFIG_DIR is the CLI's knob for WHERE config.toml/claude.key live (sdk config.py).
+    # Honor it here too so the gateway reads the SAME dir the CLI wrote to — otherwise setting only
+    # CONFIG_DIR (without DATA_DIR/HOME) makes the gateway miss claude.mode=claude_subscription and
+    # silently fall back to BYOK. DATA_DIR/HOME still win when set (they pin the install dir).
+    raw = os.getenv("DECOMPUTE_DATA_DIR") or os.getenv("DECOMPUTE_HOME") or os.getenv("DECOMPUTE_CONFIG_DIR")
     return Path(raw).expanduser() if raw else Path.home() / ".decompute"
 
 
