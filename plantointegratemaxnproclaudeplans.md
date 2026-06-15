@@ -98,7 +98,7 @@ Exit criteria:
 
 ### Phase 2 - CLI Auth Modes
 
-Status: in progress
+Status: implemented; needs manual Claude-plan QA
 
 Add explicit auth modes to `decompute init`:
 
@@ -144,7 +144,7 @@ Recommended default:
 
 ### Phase 3 - VS Code Extension Setup Wizard
 
-Status: in progress
+Status: implemented; needs manual Claude-plan QA
 
 Add a setup mode picker before Step 2:
 
@@ -283,3 +283,10 @@ Answered 2026-06-15:
   - VS Code setup now asks "Use my existing Claude plan" vs "Use an API key"
   - existing-plan setup is local-gateway-only
   - setup helper no longer requires `claude.key` for subscription mode
+- 2026-06-15: Implemented explicit setup-command behavior:
+  - `decompute configure claude-code --auth-mode claude_subscription` records subscription mode
+  - CLI rejects subscription mode on hosted/custom non-local gateways
+  - extension copied setup commands include both auth mode and gateway URL explicitly
+  - copied setup command defaults to the local existing-Claude-plan path
+  - provider retry tests now prove bearer auth is serialized on unary and streaming upstream calls
+- 2026-06-15: Bumped VS Code extension to `0.1.16` for the Claude-plan support release candidate.
