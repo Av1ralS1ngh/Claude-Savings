@@ -45,6 +45,7 @@ test("nextSetupStep walks the funnel in order", () => {
   assert.equal(nextSetupStep(base), "install");
   assert.equal(nextSetupStep({ ...base, installed: true }), "connect-key");
   assert.equal(nextSetupStep({ ...base, installed: true, configured: true }), "connect-key"); // key still missing
+  assert.equal(nextSetupStep({ installed: true, configured: true, keyPresent: false, routed: false, authMode: "claude_subscription" }), "route");
   assert.equal(nextSetupStep({ installed: true, configured: true, keyPresent: true, routed: false }), "route");
   assert.equal(nextSetupStep({ installed: true, configured: true, keyPresent: true, routed: true }), "done");
 });

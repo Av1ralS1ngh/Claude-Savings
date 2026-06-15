@@ -329,6 +329,52 @@ function claudeKeyPresent(): boolean {
   }
 }
 
+type ClaudeAuthMode = "claude_subscription" | "anthropic_api" | "enterprise_gateway";
+
+interface ClaudeAuthPick extends vscode.QuickPickItem {
+  mode: ClaudeAuthMode;
+}
+
+function readClaudeMode(): ClaudeAuthMode | undefined {
+  for (const f of configFiles()) {
+    try {
+      const text = fs.readFileSync(f, "utf8");
+      const m = text.match(/^\s*mode\s*=\s*"([^"]+)"/m);
+      if (m && ["claude_subscription", "anthropic_api", "enterprise_gateway"].includes(m[1])) {
+        return m[1] as ClaudeAuthMode;
+      }
+    } catch {
+      // Missing/unreadable config is handled by the setup flow.
+    }
+  }
+  return undefined;
+}
+
+async function chooseClaudeAuthMode(current?: ClaudeAuthMode): Promise<ClaudeAuthMode | undefined> {
+  const picks: ClaudeAuthPick[] = [
+    {
+      mode: "claude_subscription",
+      label: "$(account) Use my existing Claude plan",
+      description: "Claude Pro, Max, Team, or Enterprise",
+      detail: "Best if Claude Code already signs in to your Claude account. Decompute will not ask for or store an API key.",
+      picked: current === "claude_subscription",
+    },
+    {
+      mode: "anthropic_api",
+      label: "$(key) Use an API key",
+      description: "Anthropic Console key",
+      detail: "Use this if you pay Anthropic through API billing. Your sk-ant-* key stays on this machine.",
+      picked: current === "anthropic_api" || current === "enterprise_gateway",
+    },
+  ];
+  const pick = await vscode.window.showQuickPick(picks, {
+    title: "How do you want Claude Code to connect?",
+    placeHolder: "Choose the Claude account source Decompute should route.",
+    ignoreFocusOut: true,
+  });
+  return pick?.mode;
+}
+
 /** Poll a predicate until true or timeout; honors a cancellation token. Used to detect when an
  *  interactive terminal step (install / init) has finished, since terminals give no completion event. */
 async function pollUntil(
@@ -504,45 +550,69 @@ async function runSetupWizard(): Promise<void> {
     vscode.window.showInformationMessage("✓ Decompute CLI installed.");
   }
 
-  // STEP 2 — connect the BYOK Claude key via the interactive `init` wizard, in its OWN terminal.
-  // We gate completion on config.toml (init writes it as part of finishing) and NEVER type anything
-  // into this terminal — `init` keeps prompting after the config write (start gateway? wrapper?),
-  // so any injected command would be eaten by its stdin. The remaining steps run in-process.
-  if (!cliConfigured()) {
-    const go = await vscode.window.showInformationMessage(
-      "Set up Decompute — Step 2 of 4: connect your Claude key (terminal wizard)",
-      {
-        modal: true,
-        detail:
-          "A terminal will run the Decompute setup wizard. Answer its prompts — just press Enter to accept each [recommended] default:\n\n" +
-          "  1. “Upstream Claude mode” → Enter for [1] Anthropic API key.\n" +
-          "  2. “Anthropic API key (sk-ant-…)” → paste your key (hidden) and press Enter. It stays on this machine.\n" +
-          "  3. “Privacy mode” → Enter for [1].\n" +
-          "  4. “CCR” → Enter for [1].\n" +
-          "  5. “Start gateway after setup?” → Enter for Yes.\n" +
-          "  6. “Configure Claude Code wrapper?” → Enter for Yes.\n\n" +
-          "When the terminal returns to your normal shell prompt, it's done — I'll take it from there.",
-      },
-      "Open Setup Wizard"
+  const currentMode = readClaudeMode();
+  const authMode = await chooseClaudeAuthMode(currentMode);
+  if (!authMode) return;
+  const usingClaudePlan = authMode === "claude_subscription";
+  if (usingClaudePlan && !isLoopbackGateway(gw)) {
+    const pick = await vscode.window.showWarningMessage(
+      "Using an existing Claude plan is supported through the local Decompute gateway only, so your Claude login stays on this machine.",
+      "Use Local Gateway",
+      "Set Gateway URL"
     );
+    if (pick === "Set Gateway URL") await configureGatewayUrl();
+    return;
+  }
+  if (usingClaudePlan && claudeKeyPresent()) {
+    vscode.window.showInformationMessage(
+      "I found a saved Anthropic API key from an earlier setup. This Claude-plan setup will ignore it and keep it in case you switch back later."
+    );
+  }
+
+  // STEP 2 — configure how Claude Code authenticates. API-key mode stays interactive so the secret
+  // is typed into the terminal; existing-plan mode is non-interactive and stores no Claude credential.
+  const needsInit = !cliConfigured() || readClaudeMode() !== authMode || (!usingClaudePlan && !claudeKeyPresent());
+  if (needsInit) {
+    const title = usingClaudePlan
+      ? "Set up Decompute — Step 2 of 4: use your Claude plan"
+      : "Set up Decompute — Step 2 of 4: use an API key";
+    const detail = usingClaudePlan
+      ? "This uses the Claude account that Claude Code is already signed into (Pro, Max, Team, or Enterprise). Decompute will not ask for an API key and will not store your Claude login."
+      : "A terminal will run the Decompute setup wizard. Choose “Use an API key”, paste your sk-ant-* key when prompted, then accept the recommended defaults. The key stays on this machine.";
+    const action = usingClaudePlan ? "Use Claude Plan" : "Open Setup Wizard";
+    const go = await vscode.window.showInformationMessage(title, { modal: true, detail }, action);
     if (!go) return;
     const initTerm = vscode.window.createTerminal({ name: "Decompute · Setup wizard" });
     initTerm.show();
-    initTerm.sendText(`${shQuote(bin)} init --base-url ${shQuote(gw)}`, true);
+    const initCmd = usingClaudePlan
+      ? `${shQuote(bin)} init --yes --auth-mode claude_subscription --base-url ${shQuote(gw)}`
+      : `${shQuote(bin)} init --auth-mode api_key --base-url ${shQuote(gw)}`;
+    initTerm.sendText(initCmd, true);
     const configured = await vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Notification, title: "Setup wizard running — paste your sk-ant-… key in the terminal…", cancellable: true },
-      async (_p, token) => pollUntil(() => cliConfigured(), 600_000, token)
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: usingClaudePlan
+          ? "Setting up Decompute for your Claude plan…"
+          : "Setup wizard running — paste your sk-ant-* key in the terminal…",
+        cancellable: true,
+      },
+      async (_p, token) => pollUntil(
+        () => cliConfigured() && readClaudeMode() === authMode && (usingClaudePlan || claudeKeyPresent()),
+        600_000,
+        token
+      )
     );
     if (!configured) {
       vscode.window.showWarningMessage(
-        "The setup wizard isn't finished yet. Complete it in the terminal (paste your sk-ant-… key, accept the defaults), then run “Decompute: Set Up” again."
+        usingClaudePlan
+          ? "The setup command hasn't finished yet. Check the Decompute setup terminal, then run “Decompute: Set Up” again."
+          : "The setup wizard isn't finished yet. Complete it in the terminal, then run “Decompute: Set Up” again."
       );
       return;
     }
-    // init finished, but it only writes a key if one was entered. No key ⇒ compression can't reach Claude.
-    if (!claudeKeyPresent()) {
+    if (!usingClaudePlan && !claudeKeyPresent()) {
       const pick = await vscode.window.showWarningMessage(
-        "Decompute is configured, but no Claude key was saved — compression can't reach Claude without it.",
+        "Decompute is configured, but no API key was saved.",
         "Add Key in Terminal",
         "Continue Anyway"
       );
@@ -550,12 +620,10 @@ async function runSetupWizard(): Promise<void> {
         const t = vscode.window.createTerminal({ name: "Decompute · Add key" });
         t.show();
         t.sendText(`${shQuote(bin)} claude --set-key`, true);
-        vscode.window.showInformationMessage("Paste your sk-ant-… key in the terminal, then run “Decompute: Set Up” again.");
+        vscode.window.showInformationMessage("Paste your sk-ant-* key in the terminal, then run “Decompute: Set Up” again.");
         return;
       }
       if (pick !== "Continue Anyway") return;
-    } else {
-      vscode.window.showInformationMessage("✓ Claude key connected.");
     }
   }
 

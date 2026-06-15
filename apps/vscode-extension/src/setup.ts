@@ -60,6 +60,7 @@ export interface SetupState {
   configured: boolean;
   keyPresent: boolean;
   routed: boolean;
+  authMode?: "anthropic_api" | "claude_subscription" | "enterprise_gateway";
 }
 
 export type SetupStep = "install" | "connect-key" | "route" | "verify" | "done";
@@ -68,7 +69,7 @@ export type SetupStep = "install" | "connect-key" | "route" | "verify" | "done";
  *  here and runs through to verify; "done" means everything is already in place. */
 export function nextSetupStep(s: SetupState): SetupStep {
   if (!s.installed) return "install";
-  if (!s.configured || !s.keyPresent) return "connect-key";
+  if (!s.configured || (s.authMode !== "claude_subscription" && !s.keyPresent)) return "connect-key";
   if (!s.routed) return "route";
   return "done";
 }

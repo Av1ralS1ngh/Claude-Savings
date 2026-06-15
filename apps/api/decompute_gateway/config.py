@@ -15,6 +15,13 @@ def _bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _bool_opt(name: str) -> bool | None:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def _csv(name: str, default: str = "") -> list[str]:
     raw = os.getenv(name, default)
     return [x.strip() for x in raw.split(",") if x.strip()]
@@ -65,6 +72,11 @@ class Settings:
     dev_api_key: str = os.getenv("DECOMPUTE_API_KEY", "dc_dev_local")
     dashboard_auth_required_env: bool = _bool("DECOMPUTE_DASHBOARD_AUTH_REQUIRED", False)
     allow_client_provider_key: bool = _bool("DECOMPUTE_ALLOW_CLIENT_PROVIDER_KEY", True)
+    # Local Claude Pro/Max/Team users authenticate Claude Code with OAuth. In that path the client
+    # sends a provider credential as Authorization: Bearer and the local gateway may pass it through
+    # to Anthropic. Hosted production gateways must not accept consumer subscription OAuth by default;
+    # enable explicitly only for self-managed/enterprise deployments that own the credential flow.
+    allow_client_bearer_provider_auth_override: bool | None = _bool_opt("DECOMPUTE_ALLOW_CLIENT_BEARER_PROVIDER_AUTH")
     api_key_hash_salt: str = os.getenv("DECOMPUTE_API_KEY_HASH_SALT", "local-dev-salt-change-me")
 
     anthropic_api_key: str | None = os.getenv("ANTHROPIC_API_KEY")
@@ -230,6 +242,12 @@ class Settings:
     @property
     def dashboard_auth_required(self) -> bool:
         return self.is_production or self.dashboard_auth_required_env
+
+    @property
+    def allow_client_bearer_provider_auth(self) -> bool:
+        if self.allow_client_bearer_provider_auth_override is not None:
+            return self.allow_client_bearer_provider_auth_override
+        return not self.is_production
 
     @property
     def uses_sqlite(self) -> bool:

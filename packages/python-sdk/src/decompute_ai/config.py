@@ -87,7 +87,7 @@ DEFAULTS: dict[str, Any] = {
     "gateway": {"base_url": DEFAULT_BASE_URL, "auto_start": True},
     "privacy": {"pii_mode": "tokenize", "secret_mode": "redact"},
     "ccr": {"enabled": True, "retention_days": 7},
-    "claude": {"mode": "anthropic_api"},  # anthropic_api (BYOK) | enterprise_gateway
+    "claude": {"mode": "anthropic_api"},  # anthropic_api (BYOK) | claude_subscription | enterprise_gateway
 }
 
 

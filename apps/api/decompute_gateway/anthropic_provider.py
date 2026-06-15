@@ -25,11 +25,12 @@ def _sanitize_auth_error(status_code: int) -> dict[str, Any]:
             "type": "authentication_error" if status_code == 401 else "permission_error",
             "message": f"Upstream provider rejected the credentials (HTTP {status_code}). "
             "The provider's error detail is withheld by the Decompute gateway; "
-            "check the configured ANTHROPIC_API_KEY or your client-supplied key.",
+            "check the configured Anthropic credentials or your client-supplied credentials.",
         },
     }
 
 from .config import Settings
+from .security import UpstreamAnthropicAuth
 from .sse import SSEUsageTracker
 from .yscompress import estimate_tokens
 
@@ -118,13 +119,23 @@ def clean_gateway_fields(body: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in body.items() if k not in {"decompute", "yellowstone"}}
 
 
-def upstream_headers(settings: Settings, upstream_api_key: str | None, incoming_headers: dict[str, str] | None = None, *, stream: bool = False) -> dict[str, str]:
+def _apply_upstream_auth(headers: dict[str, str], upstream_auth: UpstreamAnthropicAuth | str | None) -> None:
+    if isinstance(upstream_auth, UpstreamAnthropicAuth):
+        if upstream_auth.kind == "bearer":
+            headers["authorization"] = f"Bearer {upstream_auth.value}"
+        elif upstream_auth.kind == "api_key":
+            headers["x-api-key"] = upstream_auth.value
+        return
+    if upstream_auth:
+        headers["x-api-key"] = upstream_auth
+
+
+def upstream_headers(settings: Settings, upstream_api_key: UpstreamAnthropicAuth | str | None, incoming_headers: dict[str, str] | None = None, *, stream: bool = False) -> dict[str, str]:
     headers = {
         "anthropic-version": settings.anthropic_version,
         "content-type": "application/json",
     }
-    if upstream_api_key:
-        headers["x-api-key"] = upstream_api_key
+    _apply_upstream_auth(headers, upstream_api_key)
     if stream:
         headers["accept"] = "text/event-stream"
     incoming_headers = incoming_headers or {}
@@ -192,7 +203,7 @@ async def call_anthropic_messages(
     body: dict[str, Any],
     *,
     settings: Settings,
-    upstream_api_key: str | None,
+    upstream_api_key: UpstreamAnthropicAuth | str | None,
     prompt_cache_mode: str,
     extra_headers: dict[str, str] | None = None,
 ) -> ProviderResult:
@@ -217,7 +228,7 @@ async def call_anthropic_messages(
     return ProviderResult(status_code=resp.status_code, body=payload, headers=dict(resp.headers))
 
 
-async def list_anthropic_models(*, settings: Settings, upstream_api_key: str | None, extra_headers: dict[str, str] | None = None) -> ProviderResult:
+async def list_anthropic_models(*, settings: Settings, upstream_api_key: UpstreamAnthropicAuth | str | None, extra_headers: dict[str, str] | None = None) -> ProviderResult:
     if settings.mock_anthropic or not upstream_api_key:
         data = [
             {"id": "claude-sonnet-4-5", "type": "model", "display_name": "Claude Sonnet", "created_at": "2026-01-01T00:00:00Z"},
@@ -239,7 +250,7 @@ async def count_tokens(
     body: dict[str, Any],
     *,
     settings: Settings,
-    upstream_api_key: str | None,
+    upstream_api_key: UpstreamAnthropicAuth | str | None,
     extra_headers: dict[str, str] | None = None,
 ) -> ProviderResult:
     if settings.mock_anthropic or not upstream_api_key:
@@ -260,7 +271,7 @@ async def stream_anthropic_messages(
     body: dict[str, Any],
     *,
     settings: Settings,
-    upstream_api_key: str | None,
+    upstream_api_key: UpstreamAnthropicAuth | str | None,
     prompt_cache_mode: str,
     tracker: SSEUsageTracker,
     extra_headers: dict[str, str] | None = None,

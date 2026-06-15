@@ -45,6 +45,10 @@ app.add_typer(configure_app, name="configure")
 HOSTED_GATEWAY_URL = "https://gateway.decompute.run"
 CLAUDE_CONFIG_DIR = Path(os.getenv("DECOMPUTE_CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
 CLAUDE_SETTINGS = CLAUDE_CONFIG_DIR / "settings.json"
+AUTH_API_KEY = "anthropic_api"
+AUTH_SUBSCRIPTION = "claude_subscription"
+AUTH_ENTERPRISE = "enterprise_gateway"
+AUTH_MODES = {AUTH_API_KEY, AUTH_SUBSCRIPTION, AUTH_ENTERPRISE}
 
 
 def _client() -> Decompute:
@@ -96,6 +100,34 @@ def config_show():
 def _conn() -> tuple[str, str]:
     """(base_url, claude_key) — base from config.toml, key from the BYOK secret file (may be '')."""
     return cfg_base_url(), (load_claude_key() or "")
+
+
+def _claude_mode(cfg: dict | None = None) -> str:
+    mode = ((cfg or load_config()).get("claude", {}).get("mode") or AUTH_API_KEY).strip()
+    return mode if mode in AUTH_MODES else AUTH_API_KEY
+
+
+def _normalize_auth_mode(value: str | None) -> str | None:
+    if not value:
+        return None
+    v = value.strip().lower().replace("-", "_")
+    aliases = {
+        "api": AUTH_API_KEY,
+        "api_key": AUTH_API_KEY,
+        "anthropic": AUTH_API_KEY,
+        "anthropic_api": AUTH_API_KEY,
+        "byok": AUTH_API_KEY,
+        "plan": AUTH_SUBSCRIPTION,
+        "subscription": AUTH_SUBSCRIPTION,
+        "claude_plan": AUTH_SUBSCRIPTION,
+        "claude_subscription": AUTH_SUBSCRIPTION,
+        "pro": AUTH_SUBSCRIPTION,
+        "max": AUTH_SUBSCRIPTION,
+        "enterprise": AUTH_ENTERPRISE,
+        "enterprise_gateway": AUTH_ENTERPRISE,
+        "gateway": AUTH_ENTERPRISE,
+    }
+    return aliases.get(v)
 
 
 def _new_session_id() -> str:
@@ -321,27 +353,45 @@ def init(
     yes: bool = typer.Option(False, "--yes", "-y", help="non-interactive — accept all defaults (recommended)."),
     claude_key: Optional[str] = typer.Option(None, "--claude-key", envvar="DECOMPUTE_CLAUDE_KEY", help="Your Anthropic/Claude key (sk-ant-…); stored as a secret."),
     base_url: str = typer.Option(DEFAULT_BASE_URL, "--base-url", help="Decompute gateway URL."),
+    auth_mode: Optional[str] = typer.Option(None, "--auth-mode", help="Claude auth mode: claude_subscription, api_key, or enterprise_gateway."),
 ):
-    """Set up Decompute — BYOK (bring your own Claude key).
+    """Set up Decompute for Claude Code.
 
-    Writes non-secret settings to ~/.decompute/config.toml and your Claude key to
-    ~/.decompute/claude.key (chmod 600). Decompute issues no key of its own.
+    Subscription mode uses Claude Code's own Claude plan login and stores no Claude credential.
+    API-key mode stores your Anthropic key in ~/.decompute/claude.key (chmod 600).
     """
-    print("[bold]Decompute setup[/bold] — your Claude key stays on this machine; we never see it.\n")
+    print("[bold]Decompute setup[/bold] — routes Claude Code through the local compression gateway.\n")
 
     # 1. Upstream Claude mode.
-    mode = "anthropic_api"
+    mode = _normalize_auth_mode(auth_mode)
+    if auth_mode and not mode:
+        print("[red]✗[/red] --auth-mode must be one of: claude_subscription, api_key, enterprise_gateway")
+        raise typer.Exit(2)
+    if not mode:
+        mode = AUTH_API_KEY if yes else AUTH_SUBSCRIPTION
     upstream_base_url = ""
     if not yes:
         print("[dim]Tip: at each step, press [bold]Enter[/bold] to accept the recommended option shown in [brackets].[/dim]\n")
-        print("Upstream Claude mode:")
-        print("  [1] Anthropic API key   [dim](bring your own — recommended)[/dim]")
-        print("  [2] Enterprise Claude gateway URL")
-        if typer.prompt("Choose", default="1").strip() == "2":
-            mode = "enterprise_gateway"
+        if not auth_mode:
+            print("How should Claude Code connect?")
+            print("  [1] Use my existing Claude plan   [dim](Pro, Max, Team, or Enterprise — no API key)[/dim]")
+            print("  [2] Use an API key                [dim](Anthropic Console sk-ant-* key)[/dim]")
+            print("  [3] Enterprise/custom gateway")
+            choice = typer.prompt("Choose", default="1").strip()
+            if choice == "2":
+                mode = AUTH_API_KEY
+            elif choice == "3":
+                mode = AUTH_ENTERPRISE
 
     # 2. The key (BYOK) or the enterprise base URL.
-    if mode == "anthropic_api":
+    if mode == AUTH_SUBSCRIPTION:
+        print("[green]✓[/green] Using your existing Claude plan login.")
+        print("[dim]Decompute will not ask for, store, or manage your Claude login token.[/dim]")
+        if KEY_FILE.exists():
+            print(f"[yellow]⚠[/yellow] Found an existing API key at {KEY_FILE}. Subscription mode ignores it and keeps it for later.")
+        if os.getenv("ANTHROPIC_API_KEY") or os.getenv("DECOMPUTE_CLAUDE_KEY"):
+            print("[yellow]⚠[/yellow] Your shell currently exports an API key. Claude Code may prefer that over your Claude plan until you unset it.")
+    elif mode == AUTH_API_KEY:
         key = claude_key or os.getenv("ANTHROPIC_API_KEY")
         if not key and not yes:
             print("\n[bold]Paste your Anthropic API key[/bold] (it starts with [cyan]sk-ant-[/cyan]…).")
@@ -495,22 +545,23 @@ def claude(
     print_env: bool = typer.Option(False, "--print-env", help="print the export lines instead of launching Claude Code"),
     set_key: bool = typer.Option(False, "--set-key", help="prompt for and store your Claude key, then continue"),
 ):
-    """Launch Claude Code through the Decompute gateway (BYOK).
+    """Launch Claude Code through the Decompute gateway.
 
     Runs the launch sequence — load config → start gateway → readiness + engine checks →
-    set ANTHROPIC_BASE_URL + your Claude key in the child env → exec `claude`. Any extra args
-    are forwarded (e.g. `decompute claude --resume`). Each run mints a fresh
-    x-decompute-session-id so the session can be scoped in a support bundle.
+    set ANTHROPIC_BASE_URL (+ API key only in API-key mode) → exec `claude`. Any extra args are
+    forwarded (e.g. `decompute claude --resume`). Each run mints a fresh x-decompute-session-id so
+    the session can be scoped in a support bundle.
     """
     # 1. Load config.
     base_url = cfg_base_url()
     cfg = load_config()
+    auth_mode = _claude_mode(cfg)
     if set_key:
         key = typer.prompt("Anthropic API key (sk-ant-…)", hide_input=True).strip()
         if key:
             save_claude_key(key)
             print("[green]✓[/green] Claude key saved.")
-    claude_key = load_claude_key() or ""
+    claude_key = (load_claude_key() or "") if auth_mode != AUTH_SUBSCRIPTION else ""
 
     # 2. Start gateway if not running.
     if not _gateway_running(base_url):
@@ -531,10 +582,12 @@ def claude(
     # 6 + 7. Build the child env: route to the gateway and hand it the BYOK key safely.
     sid = session_id or _new_session_id()
     set_session_id(sid)
-    if not claude_key and cfg.get("claude", {}).get("mode") == "anthropic_api":
+    if not claude_key and auth_mode == AUTH_API_KEY:
         print("[yellow]⚠[/yellow] no Claude key stored — set one with [bold]decompute claude --set-key[/bold].")
         print("  (continuing; this only works if the gateway is in mock/local mode.)")
-    env_lines = _claude_env_lines(base_url, claude_key, sid)
+    if auth_mode == AUTH_SUBSCRIPTION and (os.getenv("ANTHROPIC_API_KEY") or os.getenv("DECOMPUTE_CLAUDE_KEY")):
+        print("[yellow]⚠[/yellow] subscription mode: removing API-key env vars for the Claude Code child process.")
+    env_lines = _claude_env_lines(base_url, claude_key, sid, include_key=auth_mode != AUTH_SUBSCRIPTION)
     print(f"[green]✓[/green] routing Claude Code → {base_url}  ·  session [cyan]{sid}[/cyan]")
 
     if print_env:
@@ -550,6 +603,9 @@ def claude(
         print("  Install it from https://claude.com/claude-code, then re-run [bold]decompute claude[/bold].")
         raise typer.Exit(127)
     child_env = {**os.environ, **env_lines}
+    if auth_mode == AUTH_SUBSCRIPTION:
+        child_env.pop("ANTHROPIC_API_KEY", None)
+        child_env.pop("DECOMPUTE_CLAUDE_KEY", None)
     print("[dim]launching `claude`…[/dim]\n")
     os.execve(claude_bin, [claude_bin, *ctx.args], child_env)
 
@@ -701,13 +757,21 @@ def uninstall(
 def doctor(json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON (used by `support bundle`).")):
     """Diagnose the gateway connection, auth, and capabilities."""
     client = _client()
+    cfg = load_config()
+    auth_mode = _claude_mode(cfg)
     checks: list[dict[str, object]] = []
 
     def add(name: str, ok: bool, detail: str = "") -> None:
         checks.append({"check": name, "ok": bool(ok), "detail": detail})
 
     add("base_url", True, client.base_url)
-    add("claude key (BYOK)", True, (client.api_key[:10] + "…") if client.api_key else "not set — local/mock only")
+    if auth_mode == AUTH_SUBSCRIPTION:
+        detail = "existing Claude plan login; no API key stored by Decompute"
+        if load_claude_key():
+            detail += " (local API key file exists but subscription mode ignores it)"
+        add("Claude auth", True, detail)
+    else:
+        add("Claude auth", True, (client.api_key[:10] + "…") if client.api_key else "API key not set — local/mock only")
 
     try:
         h = client.get("/health")
@@ -745,14 +809,20 @@ def doctor(json_output: bool = typer.Option(False, "--json", help="Emit machine-
 @app.command()
 def status():
     """One-glance health: config, routing, gateway, and your savings so far."""
-    base_url, claude_key = _conn()
+    base_url = cfg_base_url()
     cfg = load_config()
+    auth_mode = _claude_mode(cfg)
+    stored_key = load_claude_key() or ""
+    claude_key = stored_key if auth_mode != AUTH_SUBSCRIPTION else ""
     routed = os.environ.get("ANTHROPIC_BASE_URL", "").rstrip("/") == base_url.rstrip("/")
     t = Table(title="decompute status", show_header=False)
     t.add_column("k", style="bold"); t.add_column("v")
     t.add_row("gateway", base_url)
-    t.add_row("upstream mode", cfg.get("claude", {}).get("mode", "anthropic_api"))
-    t.add_row("claude key (BYOK)", (claude_key[:10] + "…") if claude_key else "[yellow]not set — `decompute claude --set-key`[/yellow]")
+    t.add_row("Claude auth", "existing Claude plan" if auth_mode == AUTH_SUBSCRIPTION else auth_mode)
+    if auth_mode == AUTH_SUBSCRIPTION:
+        t.add_row("API key", "[dim]ignored in subscription mode[/dim]" if stored_key else "[dim]not needed[/dim]")
+    else:
+        t.add_row("API key", (claude_key[:10] + "…") if claude_key else "[yellow]not set — `decompute claude --set-key`[/yellow]")
     t.add_row("session id", get_session_id() or "[dim]none — run `decompute claude`[/dim]")
     t.add_row("Claude Code routed (this shell)",
               "[green]yes[/green]" if routed else "[yellow]no — run `decompute claude`[/yellow]")
@@ -978,7 +1048,7 @@ app.add_typer(support_app, name="support")
 def _auth_headers(extra: dict | None = None) -> dict:
     """Auth header for gateway calls: BYOK x-api-key when set, else none (local_noauth)."""
     h = dict(extra or {})
-    _, claude_key = _conn()
+    claude_key = "" if _claude_mode() == AUTH_SUBSCRIPTION else (load_claude_key() or "")
     if claude_key:
         h["x-api-key"] = claude_key
     return h

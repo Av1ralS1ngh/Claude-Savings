@@ -1,0 +1,87 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+from starlette.requests import Request
+
+from decompute_gateway.anthropic_provider import upstream_headers
+from decompute_gateway.config import Settings
+from decompute_gateway.security import upstream_anthropic_auth, upstream_anthropic_key
+
+
+def _request(headers: dict[str, str]) -> Request:
+    raw_headers = [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in headers.items()]
+    return Request({"type": "http", "method": "POST", "path": "/v1/messages", "headers": raw_headers})
+
+
+def test_client_api_key_forwards_as_x_api_key(tmp_path: Path):
+    settings = Settings(data_dir=tmp_path, anthropic_api_key=None)
+    auth = upstream_anthropic_auth(_request({"x-api-key": "sk-ant-client"}), settings)
+
+    assert auth is not None
+    assert auth.kind == "api_key"
+    headers = upstream_headers(settings, auth, {})
+    assert headers["x-api-key"] == "sk-ant-client"
+    assert "authorization" not in headers
+    assert upstream_anthropic_key(_request({"x-api-key": "sk-ant-client"}), settings) == "sk-ant-client"
+
+
+def test_client_bearer_forwards_as_authorization_in_local_mode(tmp_path: Path):
+    settings = Settings(data_dir=tmp_path, anthropic_api_key=None, environment="local", allow_client_bearer_provider_auth_override=True)
+    auth = upstream_anthropic_auth(_request({"authorization": "Bearer oauth-token"}), settings)
+
+    assert auth is not None
+    assert auth.kind == "bearer"
+    headers = upstream_headers(settings, auth, {})
+    assert headers["authorization"] == "Bearer oauth-token"
+    assert "x-api-key" not in headers
+    assert upstream_anthropic_key(_request({"authorization": "Bearer oauth-token"}), settings) is None
+
+
+def test_client_bearer_is_blocked_when_disabled(tmp_path: Path):
+    settings = Settings(
+        data_dir=tmp_path,
+        anthropic_api_key=None,
+        environment="production",
+        allow_client_bearer_provider_auth_override=False,
+    )
+
+    assert upstream_anthropic_auth(_request({"authorization": "Bearer oauth-token"}), settings) is None
+
+
+def test_client_bearer_defaults_to_local_only(tmp_path: Path):
+    local = Settings(data_dir=tmp_path / "local", anthropic_api_key=None, environment="local")
+    prod = Settings(data_dir=tmp_path / "prod", anthropic_api_key=None, environment="production")
+
+    assert upstream_anthropic_auth(_request({"authorization": "Bearer oauth-token"}), local) is not None
+    assert upstream_anthropic_auth(_request({"authorization": "Bearer oauth-token"}), prod) is None
+
+
+def test_static_api_key_wins_over_client_bearer(tmp_path: Path):
+    settings = Settings(data_dir=tmp_path, anthropic_api_key="sk-ant-static", allow_client_bearer_provider_auth_override=True)
+    auth = upstream_anthropic_auth(_request({"authorization": "Bearer oauth-token"}), settings)
+
+    assert auth is not None
+    assert auth.kind == "api_key"
+    assert auth.value == "sk-ant-static"
+
+
+def test_saved_byok_key_wins_over_client_bearer(tmp_path: Path):
+    (tmp_path / "claude.key").write_text("sk-ant-byok\n", encoding="utf-8")
+    settings = Settings(data_dir=tmp_path, anthropic_api_key=None, allow_client_bearer_provider_auth_override=True)
+    auth = upstream_anthropic_auth(_request({"authorization": "Bearer oauth-token"}), settings)
+
+    assert auth is not None
+    assert auth.kind == "api_key"
+    assert auth.value == "sk-ant-byok"
+
+
+def test_subscription_mode_ignores_saved_byok_key(tmp_path: Path):
+    (tmp_path / "claude.key").write_text("sk-ant-byok\n", encoding="utf-8")
+    (tmp_path / "config.toml").write_text('[claude]\nmode = "claude_subscription"\n', encoding="utf-8")
+    settings = Settings(data_dir=tmp_path, anthropic_api_key=None, allow_client_bearer_provider_auth_override=True)
+    auth = upstream_anthropic_auth(_request({"authorization": "Bearer oauth-token"}), settings)
+
+    assert auth is not None
+    assert auth.kind == "bearer"
+    assert auth.value == "oauth-token"

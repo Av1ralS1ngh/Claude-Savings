@@ -101,6 +101,28 @@ def test_init_yes_writes_config_and_key(env):
     assert config.load_config()["claude"]["mode"] == "anthropic_api"
 
 
+def test_init_subscription_mode_writes_no_key_and_warns_about_old_key(env, monkeypatch):
+    config, cli, cfgdir = env
+    config.save_claude_key("sk-ant-existing")
+    monkeypatch.setattr(cli, "_gateway_running", lambda *_a, **_k: True)
+
+    res = runner.invoke(cli.app, ["init", "--yes", "--auth-mode", "claude_subscription", "--base-url", "http://127.0.0.1:8080"])
+
+    assert res.exit_code == 0, res.stdout
+    assert config.load_config()["claude"]["mode"] == "claude_subscription"
+    assert config.load_claude_key() == "sk-ant-existing"
+    assert "ignores it and keeps it for later" in res.stdout
+    assert "sk-ant-existing" not in (cfgdir / "config.toml").read_text()
+
+
+def test_subscription_mode_auth_headers_ignore_saved_api_key(env):
+    config, cli, _ = env
+    config.save_claude_key("sk-ant-existing")
+    config.save_config({"claude": {"mode": "claude_subscription"}})
+
+    assert "x-api-key" not in cli._auth_headers()
+
+
 def test_config_show_never_prints_the_key(env):
     config, cli, _ = env
     config.save_claude_key("sk-ant-TOPSECRET")

@@ -29,7 +29,7 @@ from .pricing import cost_usd, savings_usd
 from .billing import BillingError, BillingService
 from .rate_limits import RateLimitManager
 from .secret_scanner import SecretScanner
-from .security import AuthPrincipal, assert_csrf_for_browser_mutation, auth_context, upstream_anthropic_key
+from .security import AuthPrincipal, assert_csrf_for_browser_mutation, auth_context, upstream_anthropic_auth
 from .sse import SSEUsageTracker
 from .streaming_cleanup import StreamUsageTracker, proxy_sse_stream
 from .support_router import include_support_bundle_router
@@ -191,7 +191,7 @@ def _apply_license_headers(headers: dict[str, str], license_meta: dict[str, Any]
     headers.update(LicenseService.decision_headers(license_meta))
 
 
-async def _resolve_ccr_retrievals(result: ProviderResult, compressed_body: dict[str, Any], *, principal: AuthPrincipal, upstream_key: str | None, prompt_cache_mode: str, request: Request, max_rounds: int = 3) -> tuple[ProviderResult, int, int]:
+async def _resolve_ccr_retrievals(result: ProviderResult, compressed_body: dict[str, Any], *, principal: AuthPrincipal, upstream_key: Any, prompt_cache_mode: str, request: Request, max_rounds: int = 3) -> tuple[ProviderResult, int, int]:
     """If Claude calls ccr_retrieve, serve the stored original back and continue the
     conversation, so an elided reference never costs answer quality. Non-CCR tool
     calls are left untouched for the client.
@@ -235,7 +235,7 @@ def _usage_from_result(result: ProviderResult) -> dict[str, int]:
     }
 
 
-async def _real_token_baseline(model: str | None, body: dict[str, Any], *, upstream_key: str | None) -> int | None:
+async def _real_token_baseline(model: str | None, body: dict[str, Any], *, upstream_key: Any) -> int | None:
     """Anthropic's real-tokenizer count of the UNCOMPRESSED prompt — the honest savings
     denominator. The compressor's len/4 estimate undercounts ~5x vs Anthropic's tokenizer,
     so comparing billed (real) compressed tokens against an estimated raw baseline mixes
@@ -1202,7 +1202,7 @@ def usage_export(request: Request, format: str = "csv", start: str | None = None
 @app.get("/v1/models")
 async def models(request: Request) -> JSONResponse:
     _auth(request, "messages:write")
-    result = await list_anthropic_models(settings=settings, upstream_api_key=upstream_anthropic_key(request, settings), extra_headers=dict(request.headers))
+    result = await list_anthropic_models(settings=settings, upstream_api_key=upstream_anthropic_auth(request, settings), extra_headers=dict(request.headers))
     return JSONResponse(result.body, status_code=result.status_code, headers=_response_headers(request_id=current_request_id(), upstream_request_id=result.upstream_request_id))
 
 
@@ -1210,7 +1210,7 @@ async def models(request: Request) -> JSONResponse:
 async def messages_count_tokens(request: Request) -> JSONResponse:
     _auth(request, "messages:write")
     body = await request.json()
-    result = await count_tokens(body, settings=settings, upstream_api_key=upstream_anthropic_key(request, settings), extra_headers=dict(request.headers))
+    result = await count_tokens(body, settings=settings, upstream_api_key=upstream_anthropic_auth(request, settings), extra_headers=dict(request.headers))
     return JSONResponse(result.body, status_code=result.status_code, headers=_response_headers(request_id=current_request_id(), upstream_request_id=result.upstream_request_id))
 
 
@@ -1317,7 +1317,7 @@ async def anthropic_messages_proxy(request: Request, payload: MessagesRequest) -
     prompt_cache_mode = decompute_cfg.get("prompt_cache", settings.prompt_cache_mode)
     planner = YellowstonePlanner(scan_local_devices(), planner_version=settings.yellowstone_planner_version, policy_version=settings.yellowstone_policy_version, local_preprocess_enabled=settings.local_preprocess_enabled, local_student_enabled=settings.local_student_enabled)
     plan = planner.plan(model=model, traffic=TrafficProfile(comp.tokens_before, comp.tokens_after, comp.tokens_after, p95_output_tokens=body.get("max_tokens", 1024), workload_class=decompute_cfg.get("workload_class", "interactive")), compression_mode=mode, prompt_cache_mode=prompt_cache_mode)
-    upstream_key = upstream_anthropic_key(request, settings)
+    upstream_key = upstream_anthropic_auth(request, settings)
     headers = _response_headers(request_id=request_id, comp=comp, plan=plan)
     _apply_license_headers(headers, license_meta)
     if cache_preserved:
@@ -1475,7 +1475,7 @@ async def openai_chat_proxy(request: Request) -> JSONResponse:
     planner = YellowstonePlanner(scan_local_devices(), planner_version=settings.yellowstone_planner_version, policy_version=settings.yellowstone_policy_version)
     plan = planner.plan(model=model, traffic=TrafficProfile(comp.tokens_before, comp.tokens_after, comp.tokens_after, p95_output_tokens=body.get("max_tokens", 1024)), compression_mode=mode, prompt_cache_mode=settings.prompt_cache_mode)
     upstream_body = {"model": model, "max_tokens": body.get("max_tokens", 1024), "system": "\n".join(str(s) for s in system_parts if s), "messages": comp.messages}
-    result = await call_anthropic_messages(upstream_body, settings=settings, upstream_api_key=upstream_anthropic_key(request, settings), prompt_cache_mode=settings.prompt_cache_mode, extra_headers=dict(request.headers))
+    result = await call_anthropic_messages(upstream_body, settings=settings, upstream_api_key=upstream_anthropic_auth(request, settings), prompt_cache_mode=settings.prompt_cache_mode, extra_headers=dict(request.headers))
     text_out = ""
     if isinstance(result.body, dict):
         for block in result.body.get("content", []) or []:

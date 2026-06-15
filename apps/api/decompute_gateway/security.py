@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import secrets
-from typing import Iterable
+import tomllib
+from typing import Iterable, Literal
 
 from fastapi import HTTPException, Request
 
@@ -27,6 +28,12 @@ class AuthPrincipal:
         missing = [s for s in scopes if not self.has_scope(s)]
         if missing:
             raise HTTPException(status_code=403, detail={"error": "missing_scope", "required": missing})
+
+
+@dataclass(frozen=True)
+class UpstreamAnthropicAuth:
+    kind: Literal["api_key", "bearer"]
+    value: str
 
 
 def extract_bearer(authorization: str | None) -> str | None:
@@ -98,12 +105,9 @@ def auth_context(request: Request, store: Store, settings: Settings, *, required
 def _read_byok_key(settings: Settings) -> str | None:
     """The BYOK Claude key the user connected via `decompute init` (~/.decompute/claude.key).
 
-    Read it here so a routed Claude Code on a claude.ai SUBSCRIPTION — which sends an OAuth bearer,
-    not an sk-ant key — still authenticates UPSTREAM with the funded key. Without this the gateway
-    forwards the client's OAuth token, Anthropic returns 401, and the client retries the 401 forever,
-    which looks exactly like Claude Code "thinking" with no reply. Read per-request so a key connected
-    after the gateway started is picked up without a restart; the file is tiny and OS-cached, and the
-    key never leaves ~/.decompute (it is NOT written into ~/.claude/settings.json)."""
+    Read per-request so a key connected after the gateway started is picked up without a restart;
+    the file is tiny and OS-cached, and the key never leaves ~/.decompute (it is NOT written into
+    ~/.claude/settings.json)."""
     try:
         p = Path(settings.data_dir) / "claude.key"
         if p.is_file():
@@ -113,24 +117,45 @@ def _read_byok_key(settings: Settings) -> str | None:
     return None
 
 
-def upstream_anthropic_key(request: Request, settings: Settings) -> str | None:
+def _local_claude_mode(settings: Settings) -> str:
+    try:
+        cfg = tomllib.loads((Path(settings.data_dir) / "config.toml").read_text(encoding="utf-8"))
+        mode = ((cfg.get("claude") or {}).get("mode") or "").strip()
+        return mode or "anthropic_api"
+    except Exception:
+        return "anthropic_api"
+
+
+def upstream_anthropic_auth(request: Request, settings: Settings) -> UpstreamAnthropicAuth | None:
     if settings.anthropic_api_key:
-        return settings.anthropic_api_key
-    # Local BYOK: the key connected via `decompute init`. Preferred over the client's credential so a
-    # subscription client's OAuth bearer isn't forwarded upstream (→ 401 → the client retries forever).
-    # A hosted/teams gateway has no local claude.key, so this is None and the client's key is used.
-    byok = _read_byok_key(settings)
-    if byok:
-        return byok
+        return UpstreamAnthropicAuth("api_key", settings.anthropic_api_key)
+    # Local BYOK: the key connected via `decompute init`. Keep this ahead of client credentials so
+    # existing API-key setups remain stable. The CLI/extension subscription mode will make this
+    # precedence explicit to users instead of silently mixing auth modes.
+    if _local_claude_mode(settings) != "claude_subscription":
+        byok = _read_byok_key(settings)
+        if byok:
+            return UpstreamAnthropicAuth("api_key", byok)
     if not settings.allow_client_provider_key:
         return None
-    # x-api-key is reserved for Anthropic/Claude clients. Bearer is used only if it is not a Decompute dc_* key.
+    # x-api-key is reserved for Anthropic/Claude clients.
     api_key = request.headers.get("x-api-key")
     if api_key:
-        return api_key
+        return UpstreamAnthropicAuth("api_key", api_key)
+    # Bearer is a provider credential only when it is not a Decompute dc_* platform key. Local Claude
+    # subscription users need this passthrough; hosted production gateways block it by default.
     bearer = extract_bearer(request.headers.get("authorization"))
     if bearer and not bearer.startswith("dc_"):
-        return bearer
+        if settings.allow_client_bearer_provider_auth:
+            return UpstreamAnthropicAuth("bearer", bearer)
+    return None
+
+
+def upstream_anthropic_key(request: Request, settings: Settings) -> str | None:
+    """Legacy helper for API-key-only call sites."""
+    auth = upstream_anthropic_auth(request, settings)
+    if auth and auth.kind == "api_key":
+        return auth.value
     return None
 
 
