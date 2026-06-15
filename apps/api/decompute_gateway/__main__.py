@@ -7,9 +7,10 @@ _find_gateway_launcher) and launches it. This replaces the dev-only scripts/run_
 hardcodes an absolute interpreter path and binds the repo working tree — neither works once the
 gateway is pip-installed on a user's machine.
 
-It loads ~/.decompute/gateway.env (then ~/.decompute/.env) BEFORE importing the app, so config.py —
+It loads the install config dir's gateway.env (then .env) BEFORE importing the app, so config.py —
 which reads os.getenv at import time — picks up settings like DECOMPUTE_LICENSE_PUBLIC_KEYS that the
-installer writes. Production defaults: loopback only, single worker, no --reload.
+installer writes. Defaults to ~/.decompute. Production defaults: loopback only, single worker, no
+--reload.
 """
 
 import os
@@ -42,17 +43,31 @@ def _gateway_alive(host: str, port: int) -> bool:
         return False
 
 
+def _env_dirs() -> list[Path]:
+    out: list[Path] = []
+    seen: set[Path] = set()
+    for raw in (os.getenv("DECOMPUTE_HOME"), os.getenv("DECOMPUTE_CONFIG_DIR"), str(Path.home() / ".decompute")):
+        if not raw:
+            continue
+        p = Path(raw).expanduser()
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
 def _load_env() -> None:
     try:
         from dotenv import load_dotenv
     except Exception:
         return
-    for p in (Path.home() / ".decompute" / "gateway.env", Path.home() / ".decompute" / ".env"):
-        try:
-            if p.exists():
-                load_dotenv(p, override=False)
-        except OSError:
-            pass
+    for base in _env_dirs():
+        for p in (base / "gateway.env", base / ".env"):
+            try:
+                if p.exists():
+                    load_dotenv(p, override=False)
+            except OSError:
+                pass
 
 
 def _prewarm_engine() -> None:

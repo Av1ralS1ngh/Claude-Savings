@@ -26,6 +26,10 @@ function Get-EnvOr([string]$name, [string]$default) {
   if ([string]::IsNullOrWhiteSpace($v)) { return $default } else { return $v }
 }
 
+function Quote-PowerShellString([string]$value) {
+  return "'" + $value.Replace("'", "''") + "'"
+}
+
 $DecomputeHome = Get-EnvOr "DECOMPUTE_HOME" (Join-Path $HOME ".decompute")
 $Venv          = Join-Path $DecomputeHome "venv"
 $Scripts       = Join-Path $Venv "Scripts"
@@ -53,14 +57,17 @@ function Find-Python {
   return $null
 }
 
-$PyCmd = Find-Python
-if (-not $PyCmd) {
+$PyCmd = @(Find-Python | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+if ($PyCmd.Count -eq 0) {
   Write-Host "error: Python 3.12 or 3.13 is required but was not found." -ForegroundColor Red
   Write-Host "       Install it with:  winget install Python.Python.3.12" -ForegroundColor Yellow
   Write-Host "       (or from https://www.python.org/downloads/), then re-run this installer." -ForegroundColor Yellow
   exit 1
 }
-Write-Host ("  python : " + ($PyCmd -join " "))
+$PyExe = [string]$PyCmd[0]
+$PyArgs = @()
+if ($PyCmd.Count -gt 1) { $PyArgs = @($PyCmd[1..($PyCmd.Count - 1)]) }
+Write-Host ("  python : " + (($PyExe, $PyArgs) -join " "))
 Write-Host ("  venv   : " + $Venv)
 
 # 2. Resolve each package source: env override > local repo checkout > the R2 dist bucket.
@@ -81,7 +88,7 @@ Write-Host ("  gateway: " + $GwSpec)
 
 # Engine: optional on Windows. Use it only if the user set DECOMPUTE_ENGINE_SPEC or a win_amd64 wheel is
 # fetchable at the dist URL. Otherwise the gateway runs pure-Python fallback compression.
-$PyTag = (& $PyCmd[0] $PyCmd[1..($PyCmd.Length-1)] -c "import sys;print(f'cp{sys.version_info.major}{sys.version_info.minor}')") 2>$null
+$PyTag = (& $PyExe @PyArgs -c "import sys;print(f'cp{sys.version_info.major}{sys.version_info.minor}')") 2>$null
 $EngineSpec = [Environment]::GetEnvironmentVariable("DECOMPUTE_ENGINE_SPEC")
 if ([string]::IsNullOrWhiteSpace($EngineSpec)) {
   $candidate = "$DistUrl/yscompress-0.22.4-$PyTag-$PyTag-win_amd64.whl"
@@ -100,7 +107,7 @@ $idx = [Environment]::GetEnvironmentVariable("DECOMPUTE_INDEX_URL")
 if (-not [string]::IsNullOrWhiteSpace($idx)) { $IndexArgs = @("--extra-index-url", $idx) }
 
 # 3. Create the venv and upgrade pip.
-& $PyCmd[0] $PyCmd[1..($PyCmd.Length-1)] -m venv $Venv
+& $PyExe @PyArgs -m venv $Venv
 $VenvPy = Join-Path $Scripts "python.exe"
 & $VenvPy -m pip install --quiet --upgrade pip
 
@@ -144,9 +151,12 @@ if (($userPath -split ";") -notcontains $BinDir) {
 
 # 8. Auto-start + self-heal via Task Scheduler (the launchd KeepAlive equivalent), per-user, no admin.
 $gwExe = Join-Path $Scripts "decompute-gateway.exe"
+$gwLog = Join-Path $DecomputeHome "gateway.log"
 $taskName = "DecomputeGateway"
 try {
-  $action  = New-ScheduledTaskAction -Execute $gwExe
+  $taskCommand = "`$env:DECOMPUTE_HOME = $(Quote-PowerShellString $DecomputeHome); `$env:DECOMPUTE_DATA_DIR = $(Quote-PowerShellString $DecomputeHome); & $(Quote-PowerShellString $gwExe) *>> $(Quote-PowerShellString $gwLog)"
+  $taskArgs = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command `"$taskCommand`""
+  $action  = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $taskArgs
   $trigger = New-ScheduledTaskTrigger -AtLogOn
   # RestartCount/Interval = self-heal on crash, mirroring launchd KeepAlive+ThrottleInterval.
   $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
@@ -168,7 +178,7 @@ if ($ok) {
   Write-Host "ok gateway is up on http://127.0.0.1:$GwPort" -ForegroundColor Green
 } else {
   Write-Host "warn: the gateway did not respond within 20s - it may still be warming up." -ForegroundColor Yellow
-  Write-Host ("    Logs:          Get-Content -Tail 40 '" + (Join-Path $DecomputeHome "gateway.log") + "'")
+  Write-Host ("    Logs:          Get-Content -Tail 40 '" + $gwLog + "'")
   Write-Host ("    Start by hand: & '" + $gwExe + "'")
 }
 

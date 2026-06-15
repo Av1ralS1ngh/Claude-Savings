@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import {
   cliBinCandidates, configFiles, claudeKeyFile, configDir, resolveInstallCommand,
   DEFAULT_INSTALL_COMMAND, DEFAULT_INSTALL_COMMAND_WINDOWS, shQuote, shQuoteWin, shQuoteFor,
-  detectEnv, nextSetupStep, stepLabel,
+  shellCommandFor, detectEnv, nextSetupStep, stepLabel,
 } from "../dist/setup.mjs";
 
 test("cliBinCandidates: PATH shim first, venv fallback second", () => {
@@ -70,6 +70,12 @@ test("shQuoteWin: PowerShell single-quote escaping (doubled quote), safe tokens 
 test("shQuoteFor: picks PowerShell quoting on win32, POSIX elsewhere", () => {
   assert.equal(shQuoteFor("it's", "win32"), "'it''s'");
   assert.equal(shQuoteFor("it's", "darwin"), "'it'\\''s'");
+});
+
+test("shellCommandFor: PowerShell uses call operator for quoted executable paths", () => {
+  assert.equal(shellCommandFor("C:\\Users\\A B\\.decompute\\venv\\Scripts\\decompute.exe", "win32"), "& 'C:\\Users\\A B\\.decompute\\venv\\Scripts\\decompute.exe'");
+  assert.equal(shellCommandFor("C:\\Users\\a\\.decompute\\venv\\Scripts\\decompute.exe", "win32"), "& C:\\Users\\a\\.decompute\\venv\\Scripts\\decompute.exe");
+  assert.equal(shellCommandFor("/Users/A B/.local/bin/decompute", "darwin"), "'/Users/A B/.local/bin/decompute'");
 });
 
 test("detectEnv: native windows / WSL / macOS / linux", () => {

@@ -98,6 +98,13 @@ export function shQuoteFor(value: string, platform?: Platform): string {
   return isWin ? shQuoteWin(value) : shQuote(value);
 }
 
+/** Quote a command path for invocation in the terminal shell. PowerShell needs `&` before a quoted
+ *  executable path; without it, `'C:\Users\A B\...\decompute.exe' init` is just a string expression. */
+export function shellCommandFor(value: string, platform?: Platform): string {
+  const isWin = (platform || (process.platform as Platform)) === "win32";
+  return isWin ? `& ${shQuoteWin(value)}` : shQuote(value);
+}
+
 // ── OS / environment detection ────────────────────────────────────────────────
 // The extension must tell three setups apart, because each has a DIFFERENT install path:
 //   - windows  : native Windows (process.platform === 'win32') -> PowerShell install.ps1

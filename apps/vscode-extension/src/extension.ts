@@ -12,7 +12,7 @@ import {
   validateGatewayInput,
 } from "./url";
 import { planWire, planUnwire, readFileOrNull, writeFileAtomic, backupOnce } from "./settings";
-import { cliBinCandidates, configFiles, claudeKeyFile, resolveInstallCommand, shQuoteFor, detectEnv } from "./setup";
+import { cliBinCandidates, configFiles, claudeKeyFile, resolveInstallCommand, shQuoteFor, shellCommandFor, detectEnv } from "./setup";
 
 const IS_WINDOWS = process.platform === "win32";
 /** The detected environment (windows / wsl / macOS / linux). vscode.env.remoteName distinguishes a
@@ -54,6 +54,11 @@ function decomputeTerminal(name: string): vscode.Terminal {
 /** Quote a CLI arg for the terminal we'll send it to (PowerShell on Windows, POSIX sh elsewhere). */
 function q(value: string): string {
   return shQuoteFor(value, process.platform as any);
+}
+
+/** Quote an executable path at command position for the terminal shell. */
+function cmd(value: string): string {
+  return shellCommandFor(value, process.platform as any);
 }
 
 function optionalConfigUrl(key: string): string {
@@ -633,8 +638,8 @@ async function runSetupWizard(): Promise<void> {
     const initTerm = decomputeTerminal("Decompute · Setup wizard");
     initTerm.show();
     const initCmd = usingClaudePlan
-      ? `${q(bin)} init --yes --auth-mode claude_subscription --base-url ${q(gw)}`
-      : `${q(bin)} init --auth-mode api_key --base-url ${q(gw)}`;
+      ? `${cmd(bin)} init --yes --auth-mode claude_subscription --base-url ${q(gw)}`
+      : `${cmd(bin)} init --auth-mode api_key --base-url ${q(gw)}`;
     initTerm.sendText(initCmd, true);
     const configured = await vscode.window.withProgress(
       {
@@ -667,7 +672,7 @@ async function runSetupWizard(): Promise<void> {
       if (pick === "Add Key in Terminal") {
         const t = decomputeTerminal("Decompute · Add key");
         t.show();
-        t.sendText(`${q(bin)} claude --set-key`, true);
+        t.sendText(`${cmd(bin)} claude --set-key`, true);
         vscode.window.showInformationMessage("Paste your sk-ant-* key in the terminal, then run “Decompute: Set Up” again.");
         return;
       }
@@ -697,7 +702,7 @@ async function runSetupWizard(): Promise<void> {
     // Show doctor in a fresh terminal so the user sees the green checks — safe now (gateway up, no init in flight).
     const t = decomputeTerminal("Decompute · Verify");
     t.show();
-    t.sendText(`${q(bin)} doctor`, true);
+    t.sendText(`${cmd(bin)} doctor`, true);
     await offerReload("✓ Decompute is set up and the gateway is reachable. Claude Code in this window will route through it after a reload.");
   } else {
     const pick = await vscode.window.showWarningMessage(
