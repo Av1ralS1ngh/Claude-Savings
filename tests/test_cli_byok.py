@@ -163,6 +163,39 @@ def test_configure_claude_code_defaults_to_hosted_without_provider_key(env):
     assert config.base_url() == "https://gateway.decompute.run"
 
 
+def test_configure_claude_code_subscription_mode_is_local_and_no_key(env):
+    config, cli, _ = env
+    config.save_claude_key("sk-ant-existing")
+    res = runner.invoke(cli.app, [
+        "configure", "claude-code",
+        "--yes",
+        "--auth-mode", "claude_subscription",
+        "--gateway-url", "http://127.0.0.1:8080",
+    ])
+    assert res.exit_code == 0, res.stdout
+    settings_path = Path(os.environ["DECOMPUTE_CLAUDE_CONFIG_DIR"]) / "settings.json"
+    settings_text = settings_path.read_text()
+    settings = json.loads(settings_text)
+    assert settings["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8080"
+    assert "ANTHROPIC_API_KEY" not in settings_text
+    assert "sk-ant-existing" not in settings_text
+    assert config.load_config()["claude"]["mode"] == "claude_subscription"
+    assert config.load_claude_key() == "sk-ant-existing"
+    assert "Existing API key credentials will be ignored in subscription mode" in res.stdout
+
+
+def test_configure_claude_code_subscription_rejects_hosted_gateway(env):
+    _, cli, _ = env
+    res = runner.invoke(cli.app, [
+        "configure", "claude-code",
+        "--yes",
+        "--auth-mode", "claude_subscription",
+        "--gateway-url", "https://gateway.decompute.run",
+    ])
+    assert res.exit_code == 2
+    assert "local-only" in res.stdout
+
+
 # ── uninstall: safe by default, destructive only on --purge ─────────────────────
 
 def test_uninstall_yes_keeps_config_and_key(env, monkeypatch):

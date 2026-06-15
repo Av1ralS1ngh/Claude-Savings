@@ -142,6 +142,16 @@ def _safe_gateway_url(value: str) -> str:
     return url
 
 
+def _is_loopback_gateway(value: str) -> bool:
+    from urllib.parse import urlparse
+
+    try:
+        host = urlparse(value).hostname or ""
+    except Exception:
+        return False
+    return host in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+
+
 def _read_json_object(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
@@ -196,7 +206,8 @@ def _write_claude_code_settings(env_block: dict[str, str]) -> None:
 
 @configure_app.command("claude-code")
 def configure_claude_code(
-    gateway_url: Optional[str] = typer.Option(None, "--gateway-url", help="Decompute Gateway URL. Defaults to the hosted gateway."),
+    gateway_url: Optional[str] = typer.Option(None, "--gateway-url", help="Decompute Gateway URL. Defaults to hosted, or local for Claude-plan auth."),
+    auth_mode: Optional[str] = typer.Option(None, "--auth-mode", help="Claude auth mode: claude_subscription or api_key."),
     local: bool = typer.Option(False, "--local", help="Use the locally configured gateway URL instead of the hosted gateway."),
     decompute_api_key: Optional[str] = typer.Option(None, "--decompute-api-key", envvar="DECOMPUTE_API_KEY", help="Optional Decompute platform key for hosted gateways."),
     print_env: bool = typer.Option(False, "--print-env", help="Print the Claude Code env block instead of writing settings."),
@@ -207,7 +218,16 @@ def configure_claude_code(
     This command belongs in the CLI/native installer path, not in the VS Code extension. It writes
     gateway routing and Decompute headers only; it never asks for provider credentials.
     """
-    base_url = _safe_gateway_url(gateway_url or (cfg_base_url() if local else HOSTED_GATEWAY_URL))
+    mode = _normalize_auth_mode(auth_mode)
+    if auth_mode and not mode:
+        print("[red]✗[/red] --auth-mode must be one of: claude_subscription, api_key")
+        raise typer.Exit(2)
+    if mode == AUTH_ENTERPRISE:
+        mode = AUTH_API_KEY
+    base_url = _safe_gateway_url(gateway_url or (cfg_base_url() if local or mode == AUTH_SUBSCRIPTION else HOSTED_GATEWAY_URL))
+    if mode == AUTH_SUBSCRIPTION and not _is_loopback_gateway(base_url):
+        print("[red]✗[/red] Existing Claude plan auth is local-only. Use a local gateway URL, or choose --auth-mode api_key.")
+        raise typer.Exit(2)
     sid = _new_session_id()
     env_block = _claude_code_env(base_url, decompute_api_key=decompute_api_key, session_id=sid)
 
@@ -228,9 +248,18 @@ def configure_claude_code(
         print(f"[red]✗[/red] {exc}")
         raise typer.Exit(1)
 
-    save_config({"gateway": {"base_url": base_url}})
+    cfg_update: dict[str, Any] = {"gateway": {"base_url": base_url}}
+    if mode:
+        cfg_update["claude"] = {"mode": mode}
+    save_config(cfg_update)
     set_session_id(sid)
     print(f"[green]✓[/green] Claude Code configured for Decompute Gateway: [cyan]{base_url}[/cyan]")
+    if mode == AUTH_SUBSCRIPTION:
+        print("[green]✓[/green] Claude auth: existing Claude plan (no API key stored by Decompute)")
+        if load_claude_key():
+            print("[yellow]⚠[/yellow] Existing API key credentials will be ignored in subscription mode.")
+    elif mode == AUTH_API_KEY:
+        print("[green]✓[/green] Claude auth: API key")
     print(f"  Settings: [cyan]{CLAUDE_SETTINGS}[/cyan]")
     print("  Restart Claude Code or open a new session for the change to take effect.")
 

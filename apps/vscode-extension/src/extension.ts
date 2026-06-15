@@ -339,9 +339,18 @@ function readClaudeMode(): ClaudeAuthMode | undefined {
   for (const f of configFiles()) {
     try {
       const text = fs.readFileSync(f, "utf8");
-      const m = text.match(/^\s*mode\s*=\s*"([^"]+)"/m);
-      if (m && ["claude_subscription", "anthropic_api", "enterprise_gateway"].includes(m[1])) {
-        return m[1] as ClaudeAuthMode;
+      let inClaude = false;
+      for (const line of text.split(/\r?\n/)) {
+        const section = line.match(/^\s*\[([^\]]+)\]\s*$/);
+        if (section) {
+          inClaude = section[1] === "claude";
+          continue;
+        }
+        if (!inClaude) continue;
+        const m = line.match(/^\s*mode\s*=\s*"([^"]+)"/);
+        if (m && ["claude_subscription", "anthropic_api", "enterprise_gateway"].includes(m[1])) {
+          return m[1] as ClaudeAuthMode;
+        }
       }
     } catch {
       // Missing/unreadable config is handled by the setup flow.
@@ -700,7 +709,19 @@ async function configureGatewayUrl(): Promise<void> {
 }
 
 async function copyClaudeSetupCommand(): Promise<void> {
-  const command = setupCommandForGateway(gatewayUrl());
+  const mode = readClaudeMode() || "claude_subscription";
+  if (mode === "claude_subscription" && !isLoopbackGateway(gatewayUrl())) {
+    vscode.window.showWarningMessage(
+      "Existing Claude plan setup is local-only. Set the gateway URL to the local gateway, or run setup and choose “Use an API key”.",
+      "Set Gateway URL",
+      "Run Setup"
+    ).then((pick) => {
+      if (pick === "Set Gateway URL") void configureGatewayUrl();
+      else if (pick === "Run Setup") void runSetupWizard();
+    });
+    return;
+  }
+  const command = setupCommandForGateway(gatewayUrl(), mode);
   await vscode.env.clipboard.writeText(command);
   const pick = await vscode.window.showInformationMessage(`Copied: ${command}`, "Open Terminal", "Open Dashboard");
   if (pick === "Open Terminal") {

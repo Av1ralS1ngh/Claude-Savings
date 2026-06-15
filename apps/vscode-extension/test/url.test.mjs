@@ -31,13 +31,20 @@ test("validateGatewayInput requires a valid URL", () => {
   assert.match(validateGatewayInput("example") || "", /valid/);
 });
 
-test("setupCommandForGateway keeps hosted setup command clean", () => {
+test("setupCommandForGateway is explicit for the local Claude-plan path", () => {
   assert.equal(setupCommandForGateway(DEFAULT_GATEWAY_URL), CLAUDE_SETUP_COMMAND);
 });
 
 test("setupCommandForGateway includes non-default gateway explicitly", () => {
   assert.equal(
     setupCommandForGateway("https://staging.decompute.run/"),
-    `${CLAUDE_SETUP_COMMAND} --gateway-url https://staging.decompute.run`
+    "decompute configure claude-code --yes --auth-mode claude_subscription --gateway-url https://staging.decompute.run"
+  );
+});
+
+test("setupCommandForGateway can build API-key setup commands", () => {
+  assert.equal(
+    setupCommandForGateway("https://staging.decompute.run/", "anthropic_api"),
+    "decompute configure claude-code --yes --auth-mode api_key --gateway-url https://staging.decompute.run"
   );
 });

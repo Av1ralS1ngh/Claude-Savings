@@ -1,7 +1,9 @@
 // Local-first: the setup wizard installs a gateway on the user's machine that listens here, and
 // compression runs locally (BYOK). A hosted/self-managed gateway is an opt-in override.
 export const DEFAULT_GATEWAY_URL = "http://127.0.0.1:8080";
-export const CLAUDE_SETUP_COMMAND = "decompute configure claude-code";
+export type ClaudeAuthMode = "anthropic_api" | "claude_subscription" | "enterprise_gateway";
+export const CLAUDE_SETUP_COMMAND =
+  `decompute configure claude-code --yes --auth-mode claude_subscription --gateway-url ${DEFAULT_GATEWAY_URL}`;
 
 export function normalizeGatewayUrl(value: string | null | undefined, fallback = DEFAULT_GATEWAY_URL): string {
   const raw = String(value ?? "").trim();
@@ -32,8 +34,8 @@ function shellQuote(value: string): string {
   return "'" + value.replace(/'/g, "'\\''") + "'";
 }
 
-export function setupCommandForGateway(value: string | null | undefined): string {
+export function setupCommandForGateway(value: string | null | undefined, authMode: ClaudeAuthMode = "claude_subscription"): string {
   const gateway = normalizeGatewayUrl(value);
-  if (gateway === DEFAULT_GATEWAY_URL) return CLAUDE_SETUP_COMMAND;
-  return `${CLAUDE_SETUP_COMMAND} --gateway-url ${shellQuote(gateway)}`;
+  const mode = authMode === "claude_subscription" ? "claude_subscription" : "api_key";
+  return `decompute configure claude-code --yes --auth-mode ${mode} --gateway-url ${shellQuote(gateway)}`;
 }
