@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -314,30 +315,43 @@ def _gateway_running(base_url: str, *, timeout: float = 2.0) -> bool:
         return False
 
 
+_IS_WINDOWS = sys.platform == "win32"
+# The console-script name differs by OS: pip writes decompute-gateway.exe into the venv Scripts dir on
+# Windows, decompute-gateway into venv/bin on POSIX. shutil.which resolves both (it honors PATHEXT on
+# Windows), but the PATH-independent dir probe below must know the exact basename + subdir.
+_GATEWAY_EXE = "decompute-gateway.exe" if _IS_WINDOWS else "decompute-gateway"
+_VENV_BINDIR = "Scripts" if _IS_WINDOWS else "bin"
+
+
 def _find_gateway_launcher() -> Optional[list[str]]:
-    """Locate a way to start the gateway: $DECOMPUTE_GATEWAY_CMD, a bundled binary, or run_gateway.sh."""
+    """Locate a way to start the gateway: $DECOMPUTE_GATEWAY_CMD, the installed console-script, or
+    (dev only, POSIX) scripts/run_gateway.sh. Cross-OS: the venv bin dir is `Scripts` on Windows and the
+    entry point is decompute-gateway.exe there."""
     env_cmd = os.getenv("DECOMPUTE_GATEWAY_CMD")
     if env_cmd:
         import shlex
-        return shlex.split(env_cmd)
-    binary = shutil.which("decompute-gateway")
+        # shlex.split with POSIX rules mangles Windows backslashes; use the platform-native lexer.
+        return shlex.split(env_cmd, posix=not _IS_WINDOWS)
+    binary = shutil.which("decompute-gateway")  # honors PATHEXT on Windows -> finds the .exe
     if binary:
         return [binary]
     # PATH-independent fallback: `decompute` and `decompute-gateway` are pip console-scripts installed
-    # side-by-side in the SAME venv bin (and symlinked together into DECOMPUTE_BIN). If the caller's PATH
-    # lacks ~/.local/bin (e.g. an absolute-path invocation or the VS Code wizard), `which` misses the
-    # gateway even though it exists next to us. Resolve the invoked CLI and check its sibling + the
-    # installer's known dirs, so the gateway is found whenever the CLI itself was.
-    import sys
+    # side-by-side in the SAME venv bin/Scripts dir. If the caller's PATH lacks the install dir (e.g. an
+    # absolute-path invocation or the VS Code wizard), `which` misses the gateway even though it exists
+    # next to us. Resolve the invoked CLI and check its sibling + the installer's known dirs.
     cli = shutil.which("decompute") or sys.argv[0]
     home = Path.home()
     dchome = Path(os.getenv("DECOMPUTE_HOME") or (home / ".decompute"))
+    candidates = [
+        Path(cli).resolve().parent / _GATEWAY_EXE,            # next to the resolved CLI (the venv bin/Scripts)
+        dchome / "venv" / _VENV_BINDIR / _GATEWAY_EXE,        # installer venv default
+    ]
+    if not _IS_WINDOWS:
+        # POSIX-only: the installer also links a shim into ~/.local/bin (DECOMPUTE_BIN default). On
+        # Windows there's no shim dir — the venv Scripts dir goes on PATH directly.
+        candidates.insert(1, home / ".local" / "bin" / _GATEWAY_EXE)
     seen: set[Path] = set()
-    for cand in (
-        Path(cli).resolve().parent / "decompute-gateway",   # next to the resolved CLI (the venv bin)
-        home / ".local" / "bin" / "decompute-gateway",       # DECOMPUTE_BIN default (installer shim dir)
-        dchome / "venv" / "bin" / "decompute-gateway",        # installer venv default
-    ):
+    for cand in candidates:
         try:
             rp = cand.resolve()
         except Exception:
@@ -347,11 +361,13 @@ def _find_gateway_launcher() -> Optional[list[str]]:
         seen.add(rp)
         if cand.exists():
             return [str(cand)]
-    # Dev: walk up from CWD looking for scripts/run_gateway.sh.
-    for base in (Path.cwd(), *Path.cwd().parents):
-        cand = base / "scripts" / "run_gateway.sh"
-        if cand.exists():
-            return ["bash", str(cand)]
+    # Dev fallback (POSIX only): walk up from CWD looking for scripts/run_gateway.sh (a bash script).
+    # On Windows there is no run_gateway.sh equivalent; rely on the installed decompute-gateway.exe.
+    if not _IS_WINDOWS:
+        for base in (Path.cwd(), *Path.cwd().parents):
+            cand = base / "scripts" / "run_gateway.sh"
+            if cand.exists():
+                return ["bash", str(cand)]
     return None
 
 
@@ -365,9 +381,22 @@ def _start_gateway(base_url: str, *, wait_s: float = 25.0) -> bool:
     log_path = CONFIG_DIR / "gateway.log"
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     print(f"[dim]Starting gateway: {' '.join(launcher)}  (logs → {log_path})[/dim]")
+    # Detach the gateway so it outlives this CLI process. POSIX: start_new_session puts it in its own
+    # session (no controlling terminal). Windows has no sessions — use DETACHED_PROCESS (no console) +
+    # CREATE_NEW_PROCESS_GROUP (survives this console's Ctrl-C / close), the equivalent idiom.
+    popen_kwargs: dict[str, Any] = {"stdout": None, "stderr": None, "stdin": subprocess.DEVNULL}
+    if _IS_WINDOWS:
+        popen_kwargs["creationflags"] = (
+            getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        )
+    else:
+        popen_kwargs["start_new_session"] = True
     try:
         with open(log_path, "ab") as logf:
-            subprocess.Popen(launcher, stdout=logf, stderr=logf, stdin=subprocess.DEVNULL, start_new_session=True)
+            popen_kwargs["stdout"] = logf
+            popen_kwargs["stderr"] = logf
+            subprocess.Popen(launcher, **popen_kwargs)
     except Exception as exc:
         print(f"[red]✗[/red] failed to launch the gateway: {exc}")
         return False
@@ -663,6 +692,16 @@ def claude(
         child_env.pop("ANTHROPIC_API_KEY", None)
         child_env.pop("DECOMPUTE_CLAUDE_KEY", None)
     print("[dim]launching `claude`…[/dim]\n")
+    if _IS_WINDOWS:
+        # os.execve on Windows can't reliably exec a .cmd/.bat launcher (claude ships as claude.cmd) and
+        # doesn't truly replace the process. Run it as a child and exit with its code instead — same UX
+        # (this CLI blocks until claude exits, then returns its status). shutil.which already resolved
+        # the .cmd/.exe via PATHEXT above.
+        try:
+            rc = subprocess.run([claude_bin, *ctx.args], env=child_env).returncode
+        except KeyboardInterrupt:
+            rc = 130
+        raise typer.Exit(rc)
     os.execve(claude_bin, [claude_bin, *ctx.args], child_env)
 
 
@@ -703,12 +742,40 @@ def vscode(
     print("or export [bold]ANTHROPIC_API_KEY[/bold] in your shell. Then `claude` routes through the gateway.")
 
 
+def _stop_gateway_windows(port: int) -> bool:
+    """Windows: find the PID LISTENING on the gateway port via `netstat -ano`, then `taskkill /F`.
+    Windows has no lsof/pkill/SIGTERM; this is the standard equivalent and needs no extra deps."""
+    killed = False
+    try:
+        out = subprocess.run(["netstat", "-ano", "-p", "TCP"], capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        out = ""
+    pids: set[str] = set()
+    needle = f":{port}"
+    for line in out.splitlines():
+        parts = line.split()
+        # Columns: Proto  Local-Address  Foreign-Address  State  PID. We want LISTENING sockets whose
+        # local address ends with :PORT, and the trailing numeric PID.
+        if len(parts) >= 5 and parts[3].upper() == "LISTENING" and parts[1].endswith(needle) and parts[-1].isdigit():
+            pids.add(parts[-1])
+    for pid in pids:
+        try:
+            subprocess.run(["taskkill", "/PID", pid, "/F", "/T"], capture_output=True, timeout=5)
+            killed = True
+        except Exception:
+            pass
+    return killed
+
+
 def _stop_gateway(base_url: str) -> bool:
-    """Best-effort stop: SIGTERM whatever is listening on the gateway port, then the uvicorn app."""
-    import signal
+    """Best-effort stop: terminate whatever is listening on the gateway port, then the uvicorn app."""
     from urllib.parse import urlparse
 
     port = urlparse(base_url).port or 8080
+    if _IS_WINDOWS:
+        return _stop_gateway_windows(port)
+
+    import signal
     killed = False
     try:
         out = subprocess.run(["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
