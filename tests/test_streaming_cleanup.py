@@ -299,6 +299,27 @@ def test_dashboard_badge_reflects_stream_status(monkeypatch):
     assert _stream_status_badge({"stream_status": "completed"}) == ""
 
 
+def test_dashboard_marks_cache_preserved_turn_not_zero(monkeypatch):
+    """A cache-preserved turn compresses ~0% on purpose (the prompt cache does the saving), so the
+    feed must show a 'cache-kept' badge + a 'cache' saved-cell — NOT a bare 0.0% that reads as the
+    compressor failing. A genuine 0% turn (cache_mode != 'preserved') still shows 0.0%."""
+    monkeypatch.setenv("DECOMPUTE_ENV", "local")
+    from decompute_gateway.main import _dashboard_request_rows, _cache_preserved_badge
+
+    preserved = {"id": "req_aaaa", "workload_class": "interactive", "raw_input_tokens": 1200,
+                 "yellowstone_final_input_tokens": 1200, "cache_mode": "preserved", "created_at": None}
+    genuine_zero = {"id": "req_bbbb", "workload_class": "interactive", "raw_input_tokens": 300,
+                    "yellowstone_final_input_tokens": 300, "cache_mode": "auto", "created_at": None}
+
+    assert "cache-kept" in _cache_preserved_badge(preserved)
+    assert _cache_preserved_badge(genuine_zero) == ""
+
+    html = _dashboard_request_rows([preserved, genuine_zero])
+    assert html.count("cache-kept") == 1          # only the preserved turn gets the badge
+    assert ">cache</span>" in html                # preserved saved-cell relabelled
+    assert "0.0%" in html                          # the genuine 0% turn still shows 0.0%
+
+
 class RaisingAsyncIter:
     """Async byte iterator that yields some chunks then RAISES — simulates a mid-stream
     upstream drop/stall (e.g. httpx ReadTimeout/RemoteProtocolError) after HTTP 200."""

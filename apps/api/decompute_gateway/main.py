@@ -443,6 +443,22 @@ def _dashboard_cap_cards(caps: dict[str, dict[str, Any]]) -> str:
     return "".join(cards)
 
 
+def _is_cache_preserved(r: dict[str, Any]) -> bool:
+    """The turn skipped compression to keep the client's prompt cache (a deliberate cost win on a
+    large cache-controlled request), so its ~0% compression is NOT the compressor doing nothing."""
+    return (r.get("cache_mode") or "") == "preserved"
+
+
+def _cache_preserved_badge(r: dict[str, Any]) -> str:
+    """Badge that explains a cache-preserved turn's 0% — so it doesn't read as 'compression broken'."""
+    if not _is_cache_preserved(r):
+        return ""
+    return ('<span title="Compression skipped to keep Claude\'s prompt cache — you save via the '
+            'cache discount (~90% off repeated input) on this large request, which beats compressing it." '
+            'style="margin-left:6px;font-family:var(--mono);font-size:9.5px;color:#2b6cb0;'
+            'background:#e7f0fb;border-radius:4px;padding:1px 5px">cache-kept</span>')
+
+
 def _stream_status_badge(r: dict[str, Any]) -> str:
     """Inline-styled badge surfacing a cancelled / errored stream in the request feed."""
     if r.get("stream_cancelled"):
@@ -470,11 +486,17 @@ def _dashboard_request_rows(recent: list[dict[str, Any]]) -> str:
         sent = r.get("yellowstone_final_input_tokens") or 0
         rid = (r.get("id") or "")[-4:]
         cost = r.get("estimated_cost_usd") or 0.0
+        # A cache-preserved turn legitimately compresses ~0% (the prompt cache does the saving), so
+        # show "cache" there instead of "0.0%", which would read as the compressor failing.
+        saved_cell = ('<span class="req-saved" title="saving via prompt cache, not compression" '
+                      'style="color:#2b6cb0">cache</span>'
+                      if _is_cache_preserved(r) else
+                      f'<span class="req-saved">{_row_saved_pct(r):.1f}%</span>')
         rows.append(
             f'<div class="req-row"><span class="req-id">#{html.escape(rid)}</span>'
-            f'<div class="req-wl"><span class="d" style="background:{colors[wl]}"></span>{html.escape(wl)}{_stream_status_badge(r)}</div>'
+            f'<div class="req-wl"><span class="d" style="background:{colors[wl]}"></span>{html.escape(wl)}{_cache_preserved_badge(r)}{_stream_status_badge(r)}</div>'
             f'<div class="req-tokens"><span class="a">{raw:,}</span><span class="arr">&#8594;</span><span class="b">{sent:,}</span></div>'
-            f'<span class="req-saved">{_row_saved_pct(r):.1f}%</span>'
+            f'{saved_cell}'
             f'<span class="req-cost">${cost:.4f}</span>'
             f'<span class="req-time">{_ago(r.get("created_at"))}</span></div>'
         )
@@ -1317,6 +1339,10 @@ async def anthropic_messages_proxy(request: Request, payload: MessagesRequest) -
             existing_tools.append(CCR_RETRIEVE_TOOL)
         compressed_body["tools"] = existing_tools
     prompt_cache_mode = decompute_cfg.get("prompt_cache", settings.prompt_cache_mode)
+    # Recorded cache_mode the dashboard reads: mark a cache-preserved turn explicitly so its 0%
+    # compression renders as "cache-kept" (saving via the client's prompt cache) instead of looking
+    # like the compressor did nothing. Normal turns record the real prompt-cache mode.
+    recorded_cache_mode = "preserved" if cache_preserved else prompt_cache_mode
     planner = YellowstonePlanner(scan_local_devices(), planner_version=settings.yellowstone_planner_version, policy_version=settings.yellowstone_policy_version, local_preprocess_enabled=settings.local_preprocess_enabled, local_student_enabled=settings.local_student_enabled)
     plan = planner.plan(model=model, traffic=TrafficProfile(comp.tokens_before, comp.tokens_after, comp.tokens_after, p95_output_tokens=body.get("max_tokens", 1024), workload_class=decompute_cfg.get("workload_class", "interactive")), compression_mode=mode, prompt_cache_mode=prompt_cache_mode)
     upstream_key = upstream_anthropic_auth(request, settings)
@@ -1368,7 +1394,7 @@ async def anthropic_messages_proxy(request: Request, payload: MessagesRequest) -
                 output_tokens=done.output_tokens,
                 cache_creation_input_tokens=done.cache_creation_input_tokens,
                 cache_read_input_tokens=done.cache_read_input_tokens,
-                prompt_cache_mode=prompt_cache_mode, plan=plan, request_id=request_id,
+                prompt_cache_mode=recorded_cache_mode, plan=plan, request_id=request_id,
                 upstream_request_id=done.upstream_request_id, status_code=status_code,
                 start_time=start, workload_class=workload, session_id=session_id,
                 stream_status=done.status, stream_cancelled=done.cancelled,
@@ -1428,7 +1454,7 @@ async def anthropic_messages_proxy(request: Request, payload: MessagesRequest) -
             real_raw = None
     else:
         baseline_task.cancel()  # CCR-with-retrieval / error / empty body -> keep the estimate
-    _record_usage(principal=principal, endpoint="/v1/messages", model=model, raw_input_tokens=comp.tokens_before, yscompress_input_tokens=comp.tokens_after, yellowstone_final_input_tokens=final_input_tokens, output_tokens=usage["output_tokens"], cache_creation_input_tokens=usage["cache_creation_input_tokens"], cache_read_input_tokens=usage["cache_read_input_tokens"], prompt_cache_mode=prompt_cache_mode, plan=plan, request_id=request_id, upstream_request_id=result.upstream_request_id, status_code=result.status_code, start_time=start, workload_class=workload, session_id=session_id, billed_input_tokens=billed_input, real_raw_input_tokens=real_raw)
+    _record_usage(principal=principal, endpoint="/v1/messages", model=model, raw_input_tokens=comp.tokens_before, yscompress_input_tokens=comp.tokens_after, yellowstone_final_input_tokens=final_input_tokens, output_tokens=usage["output_tokens"], cache_creation_input_tokens=usage["cache_creation_input_tokens"], cache_read_input_tokens=usage["cache_read_input_tokens"], prompt_cache_mode=recorded_cache_mode, plan=plan, request_id=request_id, upstream_request_id=result.upstream_request_id, status_code=result.status_code, start_time=start, workload_class=workload, session_id=session_id, billed_input_tokens=billed_input, real_raw_input_tokens=real_raw)
     body_out = result.body
     if (settings.return_proxy_metadata or request.headers.get("x-decompute-metadata", "false").lower() == "true") and isinstance(body_out, dict):
         body_out = dict(body_out)
