@@ -16,7 +16,7 @@ from sqlalchemy.pool import StaticPool
 
 from .config import Settings
 from .crypto import CCRCrypto
-from .models import ApiKey, AuditLog, Base, CCRItem, Deployment, Device, DeviceQuota, License, Membership, Org, Project, StripeEvent, UsageEvent, User, utcnow
+from .models import CLIENT_BUCKETS, ApiKey, AuditLog, Base, CCRItem, Deployment, Device, DeviceQuota, License, Membership, Org, Project, StripeEvent, UsageEvent, User, utcnow
 from .secret_scanner import SecretScanner
 
 log = logging.getLogger("decompute.gateway.db")
@@ -773,7 +773,9 @@ class Store:
             estimated_savings_usd=float(event.get("estimated_savings_usd", 0.0)),
             compression_ratio=float(event.get("compression_ratio", 1.0)),
             workload_class=event.get("workload_class"),
-            client=event.get("client"),
+            # Storage-boundary guard: only an allowlisted bucket is persisted; anything
+            # else (e.g. a raw User-Agent from a future direct caller) becomes NULL.
+            client=(event.get("client") if event.get("client") in CLIENT_BUCKETS else None),
             cache_mode=event.get("cache_mode"),
             route_json=event.get("route"),
             optimization_steps_json=event.get("optimization_steps"),
@@ -842,6 +844,18 @@ class Store:
                 func.coalesce(func.sum(UsageEvent.tokens_saved), 0),
             )).group_by(UsageEvent.workload_class).all()
 
+            # By-client (harness) aggregation — splits savings across claude_code /
+            # openclaw / sdk / other / unknown. Carries cost + $ saved so a reader can
+            # see which harness drives spend, not just request volume.
+            by_client_rows = scope(s.query(
+                UsageEvent.client,
+                func.count(UsageEvent.id),
+                func.coalesce(func.sum(UsageEvent.raw_input_tokens), 0),
+                func.coalesce(func.sum(UsageEvent.yellowstone_final_input_tokens), 0),
+                func.coalesce(func.sum(UsageEvent.tokens_saved), 0),
+                func.coalesce(func.sum(UsageEvent.estimated_savings_usd), 0.0),
+            )).group_by(UsageEvent.client).all()
+
         requests, raw, ys, final, out, saved, cost, savings = row
         raw = int(raw or 0); final = int(final or 0); ys = int(ys or 0)
 
@@ -861,6 +875,20 @@ class Store:
                 "savings_percent": self._row_savings_pct(wraw, wfinal),
             })
         by_workload.sort(key=lambda x: x["tokens_saved"], reverse=True)
+
+        by_client = []
+        for cl, c, craw, cfinal, csaved, cusd in by_client_rows:
+            craw = int(craw or 0); cfinal = int(cfinal or 0)
+            by_client.append({
+                "client": cl or "unknown",   # NULL (pre-tagging / no UA) reads as 'unknown'
+                "requests": int(c),
+                "raw_input_tokens": craw,
+                "sent_input_tokens": cfinal,
+                "tokens_saved": int(csaved or 0),
+                "estimated_savings_usd": round(float(cusd or 0.0), 6),
+                "savings_percent": self._row_savings_pct(craw, cfinal),
+            })
+        by_client.sort(key=lambda x: x["tokens_saved"], reverse=True)
 
         return {
             "requests": int(requests or 0),
@@ -883,6 +911,7 @@ class Store:
             "estimated_savings_usd": round(float(savings or 0.0), 6),
             "by_model": [{"model": m, "requests": int(c), "estimated_cost_usd": round(float(v or 0.0), 6)} for m, c, v in by_model],
             "by_workload": by_workload,
+            "by_client": by_client,
         }
 
     def recent_usage(self, *, project_id: str, limit: int = 8, since: datetime | None = None) -> list[dict[str, Any]]:
@@ -988,6 +1017,7 @@ class Store:
             "estimated_savings_usd": u.estimated_savings_usd,
             "compression_ratio": u.compression_ratio,
             "workload_class": u.workload_class,
+            "client": u.client,
             "cache_mode": u.cache_mode,
             "route": u.route_json,
             "optimization_steps": u.optimization_steps_json,

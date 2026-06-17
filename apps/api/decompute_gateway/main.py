@@ -170,7 +170,7 @@ def detect_client(request: Request) -> str | None:
     ua = (request.headers.get("user-agent") or "").lower()
     if not ua:
         return None
-    if "claude-code" in ua or "claude code" in ua:
+    if "claude-code" in ua or "claude code" in ua or "claude_code" in ua or "claudecode" in ua:
         return "claude_code"
     if "openclaw" in ua or "clawdbot" in ua or "acpx" in ua:
         return "openclaw"

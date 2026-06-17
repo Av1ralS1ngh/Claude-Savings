@@ -14,6 +14,12 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# Closed set of harness buckets allowed in UsageEvent.client. Enforced at the storage
+# boundary (db.record_usage) so a raw User-Agent can never be persisted, even if a future
+# caller bypasses detect_client(). Anything outside this set is normalized to NULL.
+CLIENT_BUCKETS = frozenset({"claude_code", "openclaw", "sdk", "other"})
+
+
 class Base(DeclarativeBase):
     pass
 
