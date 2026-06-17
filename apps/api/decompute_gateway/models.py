@@ -144,6 +144,10 @@ class UsageEvent(Base):
     estimated_savings_usd: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     compression_ratio: Mapped[float] = mapped_column(Float, default=1.0, nullable=False)
     workload_class: Mapped[str | None] = mapped_column(String(32), index=True)
+    # Which harness drove the request, derived from User-Agent: 'claude_code',
+    # 'openclaw', 'sdk', 'other', or NULL (unknown). Lets the dashboard split savings
+    # by client without storing the raw UA. See detect_client() in main.py.
+    client: Mapped[str | None] = mapped_column(String(32), index=True)
     cache_mode: Mapped[str | None] = mapped_column(String(32))
     route_json: Mapped[dict[str, Any] | None] = mapped_column(JSONField)
     optimization_steps_json: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONField)

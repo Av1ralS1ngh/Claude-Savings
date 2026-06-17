@@ -162,6 +162,23 @@ def _auth(request: Request, scope: str | None = None) -> AuthPrincipal:
     return principal
 
 
+def detect_client(request: Request) -> str | None:
+    """Classify the calling harness from the User-Agent into a small known set so the
+    dashboard can split savings by client (Claude Code vs OpenClaw vs SDK). We store
+    only the bucket, never the raw UA. Anthropic-compatible harnesses all set a UA;
+    an absent/unknown one returns 'other' (present but unrecognized) or None (absent)."""
+    ua = (request.headers.get("user-agent") or "").lower()
+    if not ua:
+        return None
+    if "claude-code" in ua or "claude code" in ua:
+        return "claude_code"
+    if "openclaw" in ua or "clawdbot" in ua or "acpx" in ua:
+        return "openclaw"
+    if "anthropic" in ua or "decompute" in ua or "python-sdk" in ua or "httpx" in ua:
+        return "sdk"
+    return "other"
+
+
 def _response_headers(*, request_id: str, comp: Any | None = None, plan: Any | None = None, upstream_request_id: str | None = None) -> dict[str, str]:
     headers = {"x-decompute-request-id": request_id}
     if upstream_request_id:
@@ -278,7 +295,7 @@ def _clean_session_id(raw: str | None) -> str | None:
     return cleaned or None
 
 
-def _record_usage(*, principal: AuthPrincipal, endpoint: str, model: str | None, raw_input_tokens: int, yscompress_input_tokens: int, yellowstone_final_input_tokens: int, output_tokens: int, cache_creation_input_tokens: int, cache_read_input_tokens: int, prompt_cache_mode: str, plan: Any, request_id: str, upstream_request_id: str | None, status_code: int, start_time: float, workload_class: str | None = None, optimization_steps: list[dict[str, Any]] | None = None, stream_status: str | None = None, stream_cancelled: bool = False, stream_cancel_reason: str | None = None, stream_json: dict[str, Any] | None = None, session_id: str | None = None, billed_input_tokens: int | None = None, real_raw_input_tokens: int | None = None) -> None:
+def _record_usage(*, principal: AuthPrincipal, endpoint: str, model: str | None, raw_input_tokens: int, yscompress_input_tokens: int, yellowstone_final_input_tokens: int, output_tokens: int, cache_creation_input_tokens: int, cache_read_input_tokens: int, prompt_cache_mode: str, plan: Any, request_id: str, upstream_request_id: str | None, status_code: int, start_time: float, workload_class: str | None = None, optimization_steps: list[dict[str, Any]] | None = None, stream_status: str | None = None, stream_cancelled: bool = False, stream_cancel_reason: str | None = None, stream_json: dict[str, Any] | None = None, session_id: str | None = None, billed_input_tokens: int | None = None, real_raw_input_tokens: int | None = None, client: str | None = None) -> None:
     elapsed_ms = int((time.perf_counter() - start_time) * 1000)
     # Honest savings: measure BOTH sides on Anthropic's real tokenizer. real_raw_input_tokens
     # is count_tokens() of the uncompressed prompt; billed_input_tokens is what Anthropic actually
@@ -314,6 +331,7 @@ def _record_usage(*, principal: AuthPrincipal, endpoint: str, model: str | None,
                 "estimated_savings_usd": saved,
                 "compression_ratio": min(1.0, eff_final / max(eff_raw, 1)),
                 "workload_class": workload_class,
+                "client": client,
                 "cache_mode": prompt_cache_mode,
                 "route": plan.to_dict() if plan else None,
                 "optimization_steps": optimization_steps or [],
@@ -1266,6 +1284,7 @@ def _check_model_allowed(model: str, principal: AuthPrincipal) -> None:
 async def anthropic_messages_proxy(request: Request, payload: MessagesRequest) -> Response:
     request_id = current_request_id()
     session_id = _clean_session_id(request.headers.get("x-decompute-session-id"))
+    client = detect_client(request)
     principal = _auth(request, "messages:write")
     start = time.perf_counter()
     body = payload.model_dump(exclude_none=True, mode="python")
@@ -1407,6 +1426,7 @@ async def anthropic_messages_proxy(request: Request, payload: MessagesRequest) -
                 stream_status=done.status, stream_cancelled=done.cancelled,
                 stream_cancel_reason=done.cancel_reason, stream_json=done.to_dict(),
                 billed_input_tokens=billed_input, real_raw_input_tokens=real_raw,
+                client=client,
             )
 
         async def body_iter(release_slot):
@@ -1461,7 +1481,7 @@ async def anthropic_messages_proxy(request: Request, payload: MessagesRequest) -
             real_raw = None
     else:
         baseline_task.cancel()  # CCR-with-retrieval / error / empty body -> keep the estimate
-    _record_usage(principal=principal, endpoint="/v1/messages", model=model, raw_input_tokens=comp.tokens_before, yscompress_input_tokens=comp.tokens_after, yellowstone_final_input_tokens=final_input_tokens, output_tokens=usage["output_tokens"], cache_creation_input_tokens=usage["cache_creation_input_tokens"], cache_read_input_tokens=usage["cache_read_input_tokens"], prompt_cache_mode=recorded_cache_mode, plan=plan, request_id=request_id, upstream_request_id=result.upstream_request_id, status_code=result.status_code, start_time=start, workload_class=workload, session_id=session_id, billed_input_tokens=billed_input, real_raw_input_tokens=real_raw)
+    _record_usage(principal=principal, endpoint="/v1/messages", model=model, raw_input_tokens=comp.tokens_before, yscompress_input_tokens=comp.tokens_after, yellowstone_final_input_tokens=final_input_tokens, output_tokens=usage["output_tokens"], cache_creation_input_tokens=usage["cache_creation_input_tokens"], cache_read_input_tokens=usage["cache_read_input_tokens"], prompt_cache_mode=recorded_cache_mode, plan=plan, request_id=request_id, upstream_request_id=result.upstream_request_id, status_code=result.status_code, start_time=start, workload_class=workload, session_id=session_id, billed_input_tokens=billed_input, real_raw_input_tokens=real_raw, client=client)
     body_out = result.body
     if (settings.return_proxy_metadata or request.headers.get("x-decompute-metadata", "false").lower() == "true") and isinstance(body_out, dict):
         body_out = dict(body_out)
@@ -1517,7 +1537,7 @@ async def openai_chat_proxy(request: Request) -> JSONResponse:
             if isinstance(block, dict) and block.get("type") == "text":
                 text_out += block.get("text", "")
     usage = _usage_from_result(result)
-    _record_usage(principal=principal, endpoint="/v1/chat/completions", model=model, raw_input_tokens=comp.tokens_before, yscompress_input_tokens=comp.tokens_after, yellowstone_final_input_tokens=plan.yellowstone_final_input_tokens, output_tokens=usage["output_tokens"] or estimate_tokens(text_out), cache_creation_input_tokens=usage["cache_creation_input_tokens"], cache_read_input_tokens=usage["cache_read_input_tokens"], prompt_cache_mode=settings.prompt_cache_mode, plan=plan, request_id=current_request_id(), upstream_request_id=result.upstream_request_id, status_code=result.status_code, start_time=start, workload_class=workload, session_id=session_id)
+    _record_usage(principal=principal, endpoint="/v1/chat/completions", model=model, raw_input_tokens=comp.tokens_before, yscompress_input_tokens=comp.tokens_after, yellowstone_final_input_tokens=plan.yellowstone_final_input_tokens, output_tokens=usage["output_tokens"] or estimate_tokens(text_out), cache_creation_input_tokens=usage["cache_creation_input_tokens"], cache_read_input_tokens=usage["cache_read_input_tokens"], prompt_cache_mode=settings.prompt_cache_mode, plan=plan, request_id=current_request_id(), upstream_request_id=result.upstream_request_id, status_code=result.status_code, start_time=start, workload_class=workload, session_id=session_id, client=detect_client(request))
     if result.status_code >= 400:
         return JSONResponse(result.body, status_code=result.status_code)
     return JSONResponse({"id": result.body.get("id", "chatcmpl_mock"), "object": "chat.completion", "model": model, "choices": [{"index": 0, "message": {"role": "assistant", "content": text_out}, "finish_reason": result.body.get("stop_reason", "stop")}], "usage": {"prompt_tokens": comp.tokens_after, "completion_tokens": usage["output_tokens"], "total_tokens": comp.tokens_after + usage["output_tokens"], "raw_prompt_tokens": comp.tokens_before, "tokens_saved": comp.tokens_saved}, "yellowstone": plan.to_dict(), "yscompress": comp.to_dict()}, status_code=200)

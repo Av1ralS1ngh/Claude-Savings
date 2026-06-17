@@ -259,3 +259,69 @@ echo "Next:"
 echo "  decompute init        # set gateway URL + paste your Claude (sk-ant-…) key"
 echo "  decompute claude      # route Claude Code through the gateway (auto-starts it)"
 echo "  decompute doctor      # verify the connection"
+
+# ── anonymous install beacon (counts only) ────────────────────────────────────
+# Counts that an install happened. Sends ONLY: the anonymous dev-... id (so this download joins to
+# this device's savings), a coarse os, a CI flag, and the version. NEVER prompts/files/IP/UA/email.
+# Honors DO_NOT_TRACK and DECOMPUTE_NO_TELEMETRY. Best-effort: a telemetry failure NEVER breaks the
+# install (set +e subshell + curl --fail swallowed). Only SUCCESSFUL installs reach this line, so the
+# download count is "successful installs", not "install attempts".
+decompute_install_beacon() {
+  if [ -n "${DO_NOT_TRACK:-}" ] || [ -n "${DECOMPUTE_NO_TELEMETRY:-}" ]; then
+    return 0
+  fi
+
+  # Reuse the SAME anonymous device id the gateway/CLI use, minting it the exact same way
+  # (dev- + uuid hex, chmod 600) if this is a first-ever install. Send the value TRIMMED of all
+  # whitespace/newline so sha256 server-side matches savings.device_hash byte-for-byte.
+  id_file="$DECOMPUTE_HOME/device.id"
+  install_id=""
+  if [ -f "$id_file" ]; then
+    install_id="$(tr -d '[:space:]' < "$id_file" 2>/dev/null || true)"
+  fi
+  if [ -z "$install_id" ]; then
+    hex="$("$PY" -c 'import uuid; print(uuid.uuid4().hex)' 2>/dev/null || true)"
+    [ -z "$hex" ] && hex="$(uuidgen 2>/dev/null | tr -d - | tr 'A-Z' 'a-z' || true)"
+    [ -z "$hex" ] && return 0   # no way to mint an id -> skip silently (fail-open)
+    install_id="dev-$hex"
+    ( umask 177; printf '%s\n' "$install_id" > "$id_file" ) 2>/dev/null || true
+  fi
+  # Only beacon a well-formed id (matches the Worker's ^dev-[0-9a-f]{32}$ join contract).
+  case "$install_id" in
+    dev-*) : ;;
+    *) return 0 ;;
+  esac
+
+  # Coarse os family only.
+  case "$(uname -s 2>/dev/null || echo unknown)" in
+    Darwin) bos="darwin" ;;
+    Linux)  bos="linux" ;;
+    CYGWIN*|MINGW*|MSYS*|Windows_NT) bos="win32" ;;
+    *)      bos="unknown" ;;
+  esac
+
+  # CI / non-interactive detection. Explicit CI markers win; otherwise treat "neither stdin nor
+  # stdout is a tty" as CI/headless (a real person running the one-liner has a tty on stdout even
+  # though `curl | bash` pipes stdin). Extra markers catch matrices that don't set bare $CI.
+  bci="false"
+  if [ -n "${CI:-}" ] || [ -n "${GITHUB_ACTIONS:-}" ] || [ -n "${GITLAB_CI:-}" ] \
+     || [ -n "${JENKINS_URL:-}" ] || [ -n "${BUILDKITE:-}" ] || [ -n "${RUNNER_OS:-}" ]; then
+    bci="true"
+  elif [ ! -t 0 ] && [ ! -t 1 ]; then
+    bci="true"
+  fi
+
+  ver="${DECOMPUTE_VERSION:-0.1.0}"
+  url="${DECOMPUTE_TELEMETRY_URL:-https://decompute-telemetry.xcomp-decompute.workers.dev}"
+  payload="$(printf '{"install_id":"%s","os":"%s","ci":%s,"version":"%s"}' \
+              "$install_id" "$bos" "$bci" "$ver")"
+
+  # Fire-and-forget; short timeouts; all output/errors discarded; never fails the install.
+  curl -fsS -m 5 -X POST \
+    -H 'content-type: application/json' \
+    -H 'x-decompute-install: 1' \
+    --data "$payload" \
+    "$url/v1/event" >/dev/null 2>&1 || true
+}
+# Run the WHOLE function with set +e in a subshell so no internal line can trip set -e / pipefail.
+( set +e; decompute_install_beacon ) >/dev/null 2>&1 || true

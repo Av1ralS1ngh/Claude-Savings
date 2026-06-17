@@ -27,3 +27,6 @@ CCsetup.md
 *.whl
 *.pyarmor
 pyarmor.bug.log
+
+# Cloudflare Wrangler local state
+.wrangler/

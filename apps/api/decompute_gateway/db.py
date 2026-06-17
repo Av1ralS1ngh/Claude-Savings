@@ -773,6 +773,7 @@ class Store:
             estimated_savings_usd=float(event.get("estimated_savings_usd", 0.0)),
             compression_ratio=float(event.get("compression_ratio", 1.0)),
             workload_class=event.get("workload_class"),
+            client=event.get("client"),
             cache_mode=event.get("cache_mode"),
             route_json=event.get("route"),
             optimization_steps_json=event.get("optimization_steps"),

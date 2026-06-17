@@ -2,10 +2,45 @@ name = "decompute-telemetry"
 main = "src/index.js"
 compatibility_date = "2024-11-01"
 
-# Anonymous, counts-only savings rollups. Create the D1 database once, then paste its id:
+# PRIVACY: keep Workers Logs OFF. This worker must not retain client IP / User-Agent
+# (it reads them only transiently to derive the cookieless visit hash, then drops them).
+# Workers Logs would capture request metadata at the edge, so we pin it off here.
+# Also ensure NO Logpush job exports this worker's logs (checked in the dashboard).
+[observability]
+enabled = false
+
+# Anonymous, counts-only telemetry. Create the D1 database once, then paste its id:
 #   wrangler d1 create decompute-telemetry
 #   wrangler d1 execute decompute-telemetry --file schema.sql --remote
 [[d1_databases]]
 binding = "DB"
 database_name = "decompute-telemetry"
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
+database_id = "1bf2c5af-bc31-427a-a6b0-bc8a30be250f"
+
+# Ephemeral per-UTC-day salt for the cookieless visitor hash (forward secrecy: the random
+# per-day value auto-expires, so stored visit hashes are not brute-forceable after the day).
+[[kv_namespaces]]
+binding = "VISIT_SALT_KV"
+id = "4af442bb58274df98ede6bc29d4bfc45"
+
+# Native per-IP rate limiting for the UNAUTHENTICATED ingest endpoints (/v1/event,
+# /v1/download, /v1/visit). The IP is used ONLY as the transient rate-limit key — it is
+# never stored. period must be 10 or 60. 30 posts / 60s per IP is generous for a real
+# install or page load but throttles scripted flooding of the anonymous counters.
+[[ratelimits]]
+name = "INGEST_RL"
+namespace_id = "1001"
+
+  [ratelimits.simple]
+  limit = 30
+  period = 60
+
+[vars]
+# Exact marketing/app origin allowed to POST /v1/visit (no wildcard CORS).
+# This is the deployed Claude compressor site (Vercel). If you add www. or another
+# host, list it too (the Worker matches the exact Origin header).
+SITE_ORIGIN = "https://claude.decompute.run"
+
+# Secrets (NOT in this file — set with `wrangler secret put`):
+#   STATS_TOKEN        gates GET /v1/stats          (openssl rand -hex 32)
+#   VISIT_SALT_SECRET  long-lived visitor-hash key  (openssl rand -hex 32)

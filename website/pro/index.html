@@ -76,5 +76,49 @@
     }
   });
 </script>
+<script>
+  // ── Decompute privacy-first visit beacon (counts only) ──────────────────────
+  // Sends NOTHING under DNT/GPC. Sends ONLY a normalized pathname + a per-pageload nonce.
+  // Never sends ids, email, query, hash, or referrer. Failures never affect the page.
+  (function () {
+    // Honor Do-Not-Track and Global Privacy Control — if ANY is set, send nothing at all.
+    var dnt = navigator.doNotTrack === "1" || window.doNotTrack === "1" || navigator.msDoNotTrack === "1";
+    var gpc = navigator.globalPrivacyControl === true;
+    if (dnt || gpc) return;
+
+    // Strip query + hash client-side; send only the bare pathname. The Worker re-validates.
+    var path = location.pathname || "/";
+    if (path.length > 64) return;
+    if (/[?#%@\\]|:\/\/|\.\./.test(path)) return; // mirror server rejects; bail rather than send junk
+
+    // Per-pageload nonce: dedupes the sendBeacon/fetch double-fire; a genuine new load = new visit.
+    var nonce = (window.crypto && crypto.randomUUID) ? crypto.randomUUID()
+              : (Date.now().toString(36) + Math.random().toString(36).slice(2));
+
+    // POINT THIS AT THE DEPLOYED WORKER (not the gateway):
+    var TELEMETRY = "https://decompute-telemetry.xcomp-decompute.workers.dev";
+    var url = TELEMETRY + "/v1/visit";
+    var payload = JSON.stringify({ path: path, nonce: nonce });
+
+    try {
+      // sendBeacon survives the page navigating away. application/json triggers a CORS preflight,
+      // which the Worker handles for /v1/visit via corsForVisit().
+      var blob = new Blob([payload], { type: "application/json" });
+      if (navigator.sendBeacon && navigator.sendBeacon(url, blob)) return;
+    } catch (e) { /* fall through */ }
+
+    // Fallback for browsers without sendBeacon: keepalive fetch, no cookies/credentials.
+    try {
+      fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: payload,
+        keepalive: true,
+        credentials: "omit",
+        mode: "cors",
+      }).catch(function () {});
+    } catch (e) { /* never let analytics break the page */ }
+  })();
+</script>
 </body>
 </html>
