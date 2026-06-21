@@ -564,6 +564,9 @@ def init(
         print("For a VS Code project: [bold]decompute vscode .[/bold]")
     else:
         print("Next: [bold]decompute claude[/bold] when you're ready.")
+    # Point first-time users straight at the dashboard — this is the #1 thing people couldn't find.
+    print(f"\n[bold]Your savings dashboard:[/bold] [bold cyan]{base_url.rstrip('/')}/dashboard[/bold cyan]")
+    print("  Open it any time with [bold]decompute dashboard[/bold].")
 
 
 def _check_anthropic_key(key: str) -> str:
@@ -677,6 +680,7 @@ def claude(
         print("[yellow]⚠[/yellow] subscription mode: removing API-key env vars for the Claude Code child process.")
     env_lines = _claude_env_lines(base_url, claude_key, sid, include_key=auth_mode != AUTH_SUBSCRIPTION)
     print(f"[green]✓[/green] routing Claude Code → {base_url}  ·  session [cyan]{sid}[/cyan]")
+    print(f"  [bold]Dashboard:[/bold] [cyan]{_dashboard_url()}[/cyan]  [dim]· `decompute dashboard` opens it[/dim]")
 
     if print_env:
         for k, v in env_lines.items():
@@ -880,7 +884,10 @@ def uninstall(
 
 
 @app.command()
-def doctor(json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON (used by `support bundle`).")):
+def doctor(
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON (used by `support bundle`)."),
+    open_dashboard: bool = typer.Option(False, "--open", help="Open the savings dashboard in your browser when the gateway is healthy."),
+):
     """Diagnose the gateway connection, auth, and capabilities."""
     client = _client()
     cfg = load_config()
@@ -921,14 +928,22 @@ def doctor(json_output: bool = typer.Option(False, "--json", help="Emit machine-
         add("auth (/v1/usage)", False, str(exc))
 
     ok_all = all(c["ok"] for c in checks)
+    gateway_ok = any(c["check"] == "gateway /health" and c["ok"] for c in checks)
     if json_output:
-        print(json.dumps({"ok": ok_all, "checks": checks}, indent=2))
+        print(json.dumps({"ok": ok_all, "checks": checks, "dashboard_url": _dashboard_url()}, indent=2))
     else:
         table = Table(title="decompute doctor", show_header=True, header_style="bold")
         table.add_column("check"); table.add_column("status"); table.add_column("detail")
         for c in checks:
             table.add_row(str(c["check"]), "[green]ok[/green]" if c["ok"] else "[red]FAIL[/red]", str(c["detail"]))
         print(table)
+        # Always surface the dashboard URL — first-time users often can't find it otherwise.
+        if gateway_ok:
+            print(f"\n[bold]Dashboard:[/bold] [bold cyan]{_dashboard_url()}[/bold cyan]  "
+                  "[dim](open it with `decompute dashboard`)[/dim]")
+            if open_dashboard:
+                print("[dim]opening dashboard in your browser…[/dim]")
+                _open(_dashboard_url())
     raise typer.Exit(code=0 if ok_all else 1)
 
 
@@ -977,6 +992,7 @@ def status():
                            f"${u.get('estimated_savings_usd', 0.0):.4f} saved")
     except DecomputeError:
         pass
+    t.add_row("dashboard", f"{_dashboard_url()}  [dim](open with `decompute dashboard`)[/dim]")
     print(t)
 
 
@@ -1078,6 +1094,41 @@ def _open(url: str) -> None:
         webbrowser.open(url)
     except Exception:
         pass
+
+
+def _dashboard_url() -> str:
+    """The savings dashboard URL for the configured gateway (e.g. http://127.0.0.1:8080/dashboard)."""
+    return cfg_base_url().rstrip("/") + "/dashboard"
+
+
+@app.command()
+def dashboard(
+    no_open: bool = typer.Option(False, "--no-open", help="Print the dashboard URL but don't open a browser."),
+):
+    """Open the Decompute savings dashboard in your browser.
+
+    Starts the gateway first if it isn't running (when auto-start is enabled).
+    """
+    base_url = cfg_base_url()
+    url = _dashboard_url()
+
+    # Make sure the gateway is up so the page actually loads, mirroring `decompute claude`.
+    if not _gateway_running(base_url):
+        cfg = load_config()
+        if not (cfg.get("gateway", {}).get("auto_start", True)):
+            print(f"[yellow]⚠[/yellow] gateway isn't running at [cyan]{base_url}[/cyan] and auto-start is off.")
+            print(f"  Start it, then open the dashboard:  [bold]{url}[/bold]")
+            raise typer.Exit(1)
+        print("Gateway not running — starting it…")
+        if not _start_gateway(base_url):
+            print(f"[red]✗[/red] couldn't start the gateway. Once it's up, open:  [bold]{url}[/bold]")
+            raise typer.Exit(1)
+
+    print(f"[green]✓[/green] Dashboard:  [bold cyan]{url}[/bold cyan]")
+    if no_open:
+        return
+    print("[dim]opening in your browser…[/dim]")
+    _open(url)
 
 
 @app.command()

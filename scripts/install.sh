@@ -259,6 +259,7 @@ echo "Next:"
 echo "  decompute init        # set gateway URL + paste your Claude (sk-ant-…) key"
 echo "  decompute claude      # route Claude Code through the gateway (auto-starts it)"
 echo "  decompute doctor      # verify the connection"
+echo "  decompute dashboard   # open your savings dashboard ( http://127.0.0.1:${GW_PORT}/dashboard )"
 
 # ── anonymous install beacon (counts only) ────────────────────────────────────
 # Counts that an install happened. Sends ONLY: the anonymous dev-... id (so this download joins to
