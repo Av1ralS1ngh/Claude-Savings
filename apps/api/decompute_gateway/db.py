@@ -16,7 +16,31 @@ from sqlalchemy.pool import StaticPool
 
 from .config import Settings
 from .crypto import CCRCrypto
-from .models import CLIENT_BUCKETS, ApiKey, AuditLog, Base, CCRItem, Deployment, Device, DeviceQuota, License, Membership, Org, Project, StripeEvent, UsageEvent, User, utcnow
+from .models import (
+    CLIENT_BUCKETS,
+    TS_DECISIONS,
+    TS_GOVERNANCE_MODES,
+    TS_MODES,
+    TS_ROUTES,
+    ApiKey,
+    AuditLog,
+    Base,
+    CCRItem,
+    Deployment,
+    Device,
+    DeviceQuota,
+    License,
+    Membership,
+    Org,
+    Project,
+    StripeEvent,
+    TeacherStudentCase,
+    TeacherStudentRun,
+    TeacherStudentVerdict,
+    UsageEvent,
+    User,
+    utcnow,
+)
 from .secret_scanner import SecretScanner
 
 log = logging.getLogger("decompute.gateway.db")
@@ -40,6 +64,12 @@ ALL_SCOPES = [
     "dashboard:read",
     "support:read",
     "support:write",
+    # Teacher-student / distillation. `messages:write` permits CREATING a run; it does NOT imply
+    # listing stored cases or exporting records — those need these dedicated scopes (plan §Privacy).
+    "teacher_student:read",
+    "teacher_student:admin",
+    "distill:read",
+    "distill:admin",
     "admin",
 ]
 
@@ -787,6 +817,306 @@ class Store:
         with self.session() as s:
             s.add(row)
             return self.usage_to_dict(row)
+
+    # ── Teacher-student persistence (plan §"Governance At Store Boundary") ─────
+    # The store is the privacy boundary: enum-like values are clamped to closed sets, and in the
+    # default metadata_only mode NO prompt/answer/test content is written — only hashes, counts,
+    # features, and route/verdict metadata. Content is persisted ONLY when capture is explicitly
+    # enabled AND the resolved storage mode permits it.
+
+    @staticmethod
+    def _clamp(value: Any, allowed: frozenset[str], default: str) -> str:
+        return value if value in allowed else default
+
+    def effective_capture_mode(self, project_id: str) -> str:
+        """Resolve the storage mode for a project (server AND project must allow; capture_locked forces
+        metadata_only). Defaults to metadata_only (no content)."""
+        return self._project_capture_policy(project_id)[0]
+
+    def purge_expired_teacher_student_cases(self, *, now: datetime | None = None) -> int:
+        """Hard-delete captured TS content whose retention window has passed (H2). Returns the count
+        of rows whose content was cleared. Idempotent; safe to call from startup/maintenance."""
+        cutoff = now or utcnow()
+        cleared = 0
+        with self.session() as s:
+            rows = s.query(TeacherStudentCase).filter(TeacherStudentCase.expires_at.isnot(None)).all()
+            for c in rows:
+                exp = c.expires_at
+                if exp is not None and exp.tzinfo is None:
+                    exp = exp.replace(tzinfo=timezone.utc)
+                if exp is not None and exp < cutoff:
+                    if c.student_answer is not None or c.teacher_answer is not None or c.final_answer is not None or c.tests_json is not None:
+                        c.student_answer = c.teacher_answer = c.final_answer = c.tests_json = None
+                        c.storage_mode = "metadata_only"
+                        c.expires_at = None
+                        cleared += 1
+        return cleared
+
+    def create_teacher_student_run(
+        self, *, project_id: str, name: str | None = None, mode: str = "student_first",
+        student_model: str | None = None, teacher_model: str | None = None,
+        governance_mode: str = "metadata_only", metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        row = TeacherStudentRun(
+            id=self._id("tsrun"),
+            project_id=project_id,
+            name=(name or None),
+            mode=self._clamp(mode, TS_MODES, "student_first"),
+            status="open",
+            student_model=student_model,
+            teacher_model=teacher_model,
+            governance_mode=self._clamp(governance_mode, TS_GOVERNANCE_MODES, "metadata_only"),
+            metadata_json=metadata,
+        )
+        with self.session() as s:
+            s.add(row)
+            return self.ts_run_to_dict(row)
+
+    def _project_capture_policy(self, project_id: str) -> tuple[str, int]:
+        """Return (effective_storage_mode, retention_days) resolved from server + project policy.
+        capture_locked or server-disabled forces metadata_only; retention comes from the PROJECT
+        column (falling back to the server default) so per-project retention is honored (H2)."""
+        if not self.settings.teacher_student_capture_enabled:
+            return "metadata_only", int(self.settings.teacher_student_capture_retention_days)
+        with self.session() as s:
+            proj = s.get(Project, project_id)
+            if proj is None or proj.teacher_student_capture_locked or not proj.teacher_student_capture_enabled:
+                return "metadata_only", int(self.settings.teacher_student_capture_retention_days)
+            mode = self._clamp(proj.teacher_student_governance_mode, TS_GOVERNANCE_MODES, "metadata_only")
+            retention = int(proj.teacher_student_capture_retention_days or self.settings.teacher_student_capture_retention_days)
+            return mode, max(1, retention)
+
+    def _scrub_for_storage(self, text: str | None) -> tuple[str | None, str]:
+        """Scrub secrets/PII from content before it is persisted (H1). Returns (scrubbed, scan_status).
+        Mirrors the CCR scan-before-store pattern."""
+        if text is None:
+            return None, "no_content"
+        scanner = SecretScanner(mode="redact")
+        findings = scanner.scan(text)
+        scrubbed = scanner.scrub(text)
+        return scrubbed, ("redacted_secret_detected" if findings else "passed")
+
+    def record_teacher_student_case(
+        self, case: dict[str, Any], *, project_id: str, run_id: str | None = None, request_capture: bool = False,
+    ) -> dict[str, Any]:
+        """Persist a case + its verdict, enforcing storage mode at the boundary.
+
+        Content (prompt/answers/tests) is stored ONLY when THREE gates all allow it (H1):
+          1. server capture enabled, 2. project capture enabled (and not locked) with mode='redacted',
+          3. the request itself opted in (request_capture=True).
+        When stored, content is scrubbed of secrets/PII first and a scan status is recorded. In every
+        other case content is dropped here, so a caller may pass content freely and the store
+        guarantees it is never persisted by accident."""
+        mode, retention_days = self._project_capture_policy(project_id)
+        # The request-level opt-in is a required third gate: capture:false means metadata-only even if
+        # server+project allow it.
+        store_content = mode == "redacted" and bool(request_capture)
+        effective_mode = mode if store_content else ("regulated" if mode == "regulated" else "metadata_only")
+        expires_at = utcnow() + timedelta(days=retention_days) if store_content else None
+
+        scan_status = "no_content"
+        if store_content:
+            student_a, ss1 = self._scrub_for_storage(case.get("student_answer"))
+            teacher_a, ss2 = self._scrub_for_storage(case.get("teacher_answer"))
+            final_a, ss3 = self._scrub_for_storage(case.get("final_answer"))
+            tests_j = case.get("tests_json")  # tests are user-authored asserts; kept as-is under redacted
+            scan_status = "redacted_secret_detected" if "redacted_secret_detected" in {ss1, ss2, ss3} else "passed"
+        else:
+            student_a = teacher_a = final_a = tests_j = None
+
+        # Salted prompt hash (M4): a raw SHA-256 of short prompts is dictionary-attackable. HMAC with
+        # the project-hash pepper makes the digest a non-reversible correlator. Omitted in regulated mode.
+        prompt_sha = None
+        raw_sha = case.get("prompt_sha256")
+        if raw_sha and effective_mode != "regulated":
+            prompt_sha = hmac.new(self.settings.api_key_hash_salt.encode(), raw_sha.encode(), hashlib.sha256).hexdigest()
+
+        verdict = case.get("verdict") or {}
+        feature = dict(case.get("feature_json") or {})
+        feature["secret_scan_status"] = scan_status
+        row = TeacherStudentCase(
+            id=self._id("tscase"),
+            run_id=run_id,
+            project_id=project_id,
+            usage_event_id=case.get("usage_event_id"),
+            request_id=case.get("request_id"),
+            session_id=case.get("session_id"),
+            client=(case.get("client") if case.get("client") in CLIENT_BUCKETS else None),
+            route=self._clamp(case.get("route"), TS_ROUTES, "student_unavailable"),
+            workload_class=case.get("workload_class"),
+            coding_intent=case.get("coding_intent"),
+            escalation_reason=case.get("escalation_reason"),
+            storage_mode=effective_mode,
+            prompt_sha256=prompt_sha,
+            feature_json=feature,
+            # Content is gated by all three gates AND scrubbed — never trust the caller alone.
+            student_answer=student_a,
+            teacher_answer=teacher_a,
+            final_answer=final_a,
+            tests_json=tests_j,
+            input_tokens=int(case.get("input_tokens", 0)),
+            student_output_tokens=int(case.get("student_output_tokens", 0)),
+            teacher_output_tokens=int(case.get("teacher_output_tokens", 0)),
+            student_latency_ms=int(case.get("student_latency_ms", 0)),
+            teacher_latency_ms=int(case.get("teacher_latency_ms", 0)),
+            expires_at=expires_at,
+        )
+        with self.session() as s:
+            s.add(row)
+            s.flush()
+            vrow = TeacherStudentVerdict(
+                id=self._id("tsverd"),
+                case_id=row.id,
+                verifier_version=verdict.get("verifier_version"),
+                decision=self._clamp(verdict.get("decision"), TS_DECISIONS, "escalate"),
+                confidence=float(verdict.get("confidence", 0.0)),
+                threshold=float(verdict.get("threshold", 0.0)),
+                escalated=bool(verdict.get("escalated", verdict.get("decision") == "escalate")),
+                escalation_reason=verdict.get("escalation_reason"),
+                tests_ran=bool(verdict.get("tests_ran", False)),
+                tests_passed=verdict.get("tests_passed"),
+                sandbox_backend=verdict.get("sandbox_backend"),
+                judge_model=verdict.get("judge_model"),
+                layers_json=verdict.get("layers"),
+            )
+            s.add(vrow)
+            if run_id is not None:
+                run = s.get(TeacherStudentRun, run_id)
+                if run is not None:
+                    run.case_count = (run.case_count or 0) + 1
+                    if case.get("route") in {"teacher_corrected", "teacher_only"}:
+                        run.teacher_call_count = (run.teacher_call_count or 0) + 1
+            s.flush()
+            return self.ts_case_to_dict(row, vrow)
+
+    def list_teacher_student_runs(self, *, project_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        with self.session() as s:
+            rows = (
+                s.query(TeacherStudentRun)
+                .filter(TeacherStudentRun.project_id == project_id)
+                .order_by(TeacherStudentRun.created_at.desc())
+                .limit(limit)
+                .all()
+            )
+            return [self.ts_run_to_dict(r) for r in rows]
+
+    def teacher_student_summary(self, *, project_id: str) -> dict[str, Any]:
+        """Counts-only deflection summary for the dashboard (no content)."""
+        with self.session() as s:
+            cases = s.query(TeacherStudentCase).filter(TeacherStudentCase.project_id == project_id).all()
+            total = len(cases)
+            by_route: dict[str, int] = {}
+            teacher_calls = 0
+            for c in cases:
+                by_route[c.route] = by_route.get(c.route, 0) + 1
+                if c.route in {"teacher_corrected", "teacher_only"}:
+                    teacher_calls += 1
+            accepted = by_route.get("student_only", 0)
+            return {
+                "cases": total,
+                "student_accepted": accepted,
+                "teacher_called": teacher_calls,
+                "escalation_rate": round((total - accepted) / total, 4) if total else 0.0,
+                "by_route": by_route,
+            }
+
+    def export_distillation_records(
+        self, *, project_id: str, target: str = "sft", limit: int = 1000,
+        allow_claude_targets: bool = False, claude_targets_signoff: bool = False,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Build distillation export records from STORED cases (Phase 7). Returns (records, meta).
+
+        Hard governance rules enforced here:
+          * Only cases that actually have stored content are exportable. Metadata-only / regulated
+            cases have no content and are silently excluded (reported in meta.skipped_no_content).
+          * `target="sft"` exports the FINAL accepted answer as the label. When the final answer came
+            from the Claude TEACHER (route teacher_*), it is a Claude output — excluded unless BOTH the
+            allow flag AND the legal/product sign-off are set (M3). Enforcing both AT THE DATA BOUNDARY
+            means even a direct store caller (script/test) cannot exfiltrate Claude labels without the
+            sign-off — production validation is no longer the only gate.
+          * Expired cases (past retention) are excluded.
+        """
+        from .models import TeacherStudentCase
+
+        claude_targets_ok = bool(allow_claude_targets and claude_targets_signoff)
+        records: list[dict[str, Any]] = []
+        skipped_no_content = 0
+        skipped_claude_target = 0
+        skipped_expired = 0
+        now = utcnow()
+        with self.session() as s:
+            rows = (
+                s.query(TeacherStudentCase)
+                .filter(TeacherStudentCase.project_id == project_id)
+                .order_by(TeacherStudentCase.created_at.desc())
+                .limit(limit)
+                .all()
+            )
+            for c in rows:
+                # SQLite returns naive datetimes; Postgres returns tz-aware. Normalize before compare
+                # so the same code path works on both (mirrors support_router.parse_timestamp).
+                exp = c.expires_at
+                if exp is not None and exp.tzinfo is None:
+                    exp = exp.replace(tzinfo=timezone.utc)
+                if exp is not None and exp < now:
+                    skipped_expired += 1
+                    continue
+                if c.final_answer is None and c.student_answer is None:
+                    skipped_no_content += 1
+                    continue
+                # Is the exportable label a Claude (teacher) output?
+                is_claude_label = c.route in {"teacher_corrected", "teacher_only"}
+                if is_claude_label and not claude_targets_ok:
+                    skipped_claude_target += 1
+                    continue
+                label = c.final_answer or c.student_answer
+                records.append({
+                    "id": c.id,
+                    "prompt_sha256": c.prompt_sha256,
+                    "completion": label,
+                    "route": c.route,
+                    "label_source": "teacher" if is_claude_label else "student",
+                })
+        meta = {
+            "target": target,
+            "exported": len(records),
+            "skipped_no_content": skipped_no_content,
+            "skipped_claude_target": skipped_claude_target,
+            "skipped_expired": skipped_expired,
+            "allow_claude_targets": allow_claude_targets,
+            "claude_targets_signoff": claude_targets_signoff,
+            "claude_targets_exported": claude_targets_ok,
+        }
+        return records, meta
+
+    @staticmethod
+    def ts_run_to_dict(r: TeacherStudentRun) -> dict[str, Any]:
+        return {
+            "id": r.id, "project_id": r.project_id, "name": r.name, "mode": r.mode, "status": r.status,
+            "student_model": r.student_model, "teacher_model": r.teacher_model,
+            "governance_mode": r.governance_mode, "case_count": r.case_count,
+            "teacher_call_count": r.teacher_call_count, "metadata": r.metadata_json,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        }
+
+    @staticmethod
+    def ts_case_to_dict(c: TeacherStudentCase, v: TeacherStudentVerdict | None = None) -> dict[str, Any]:
+        out = {
+            "id": c.id, "run_id": c.run_id, "project_id": c.project_id, "route": c.route,
+            "storage_mode": c.storage_mode, "escalation_reason": c.escalation_reason,
+            "coding_intent": c.coding_intent, "prompt_sha256": c.prompt_sha256,
+            "input_tokens": c.input_tokens, "student_output_tokens": c.student_output_tokens,
+            "teacher_output_tokens": c.teacher_output_tokens,
+            "has_content": c.student_answer is not None or c.final_answer is not None,
+            "expires_at": c.expires_at.isoformat() if c.expires_at else None,
+        }
+        if v is not None:
+            out["verdict"] = {
+                "decision": v.decision, "confidence": v.confidence, "threshold": v.threshold,
+                "escalated": v.escalated, "escalation_reason": v.escalation_reason,
+                "tests_ran": v.tests_ran, "tests_passed": v.tests_passed,
+            }
+        return out
 
     @staticmethod
     def _row_savings_pct(raw_tokens: int, final_tokens: int) -> float:

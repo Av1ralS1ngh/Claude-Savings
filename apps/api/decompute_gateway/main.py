@@ -33,6 +33,7 @@ from .security import AuthPrincipal, assert_csrf_for_browser_mutation, auth_cont
 from .sse import SSEUsageTracker
 from .streaming_cleanup import StreamUsageTracker, proxy_sse_stream
 from .support_router import include_support_bundle_router
+from .teacher_student.router import include_teacher_student_router
 from . import telemetry
 from .workload import classify_workload
 from .yscompress import CCR_RETRIEVE_TOOL, YSCompressClient, estimate_tokens
@@ -160,6 +161,21 @@ def _auth(request: Request, scope: str | None = None) -> AuthPrincipal:
     principal = auth_context(request, store, settings, required_scope=scope)
     project_id_var.set(principal.project_id)
     return principal
+
+
+def _last_user_text(messages: list[dict[str, Any]]) -> str:
+    """The most recent user turn's text, flattened. Used only for cheap teacher-student observe-mode
+    intent classification on /v1/messages; never sent anywhere."""
+    for m in reversed(messages or []):
+        if not isinstance(m, dict) or m.get("role") != "user":
+            continue
+        content = m.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = [b["text"] for b in content if isinstance(b, dict) and isinstance(b.get("text"), str)]
+            return "\n".join(parts)
+    return ""
 
 
 def detect_client(request: Request) -> str | None:
@@ -360,6 +376,13 @@ def startup() -> None:
     purged = store.purge_expired_ccr()
     if purged:
         log.info("purged expired CCR items", extra={"extra": {"purged": purged}})
+    # Enforce teacher-student capture retention: clear content past its window (H2). Best-effort.
+    try:
+        ts_purged = store.purge_expired_teacher_student_cases()
+        if ts_purged:
+            log.info("purged expired teacher-student content", extra={"extra": {"purged": ts_purged}})
+    except Exception:
+        pass
     # Anonymous, counts-only weekly savings beacon. Daemon threads; honors the opt-outs and the weekly
     # cadence internally, beacons at boot then re-checks daily (for a long-running gateway), never raises.
     try:
@@ -1370,7 +1393,16 @@ async def anthropic_messages_proxy(request: Request, payload: MessagesRequest) -
     # like the compressor did nothing. Normal turns record the real prompt-cache mode.
     recorded_cache_mode = "preserved" if cache_preserved else prompt_cache_mode
     planner = YellowstonePlanner(scan_local_devices(), planner_version=settings.yellowstone_planner_version, policy_version=settings.yellowstone_policy_version, local_preprocess_enabled=settings.local_preprocess_enabled, local_student_enabled=settings.local_student_enabled)
-    plan = planner.plan(model=model, traffic=TrafficProfile(comp.tokens_before, comp.tokens_after, comp.tokens_after, p95_output_tokens=body.get("max_tokens", 1024), workload_class=decompute_cfg.get("workload_class", "interactive")), compression_mode=mode, prompt_cache_mode=prompt_cache_mode)
+    # Teacher-student OBSERVE mode (plan §"Yellowstone And Routing"): when the local student is
+    # enabled, classify the coding intent cheaply so the planner can record a "would have tried the
+    # student" candidate in route metadata. This NEVER calls the student or changes the response —
+    # it's analytics only. Skipped entirely (zero overhead) when the feature is off.
+    observe_intent = None
+    observe_has_tools = bool(body.get("tools"))
+    if settings.local_student_enabled:
+        from .teacher_student.intent import classify_coding_intent
+        observe_intent = classify_coding_intent(_last_user_text(body.get("messages") or []))
+    plan = planner.plan(model=model, traffic=TrafficProfile(comp.tokens_before, comp.tokens_after, comp.tokens_after, p95_output_tokens=body.get("max_tokens", 1024), workload_class=decompute_cfg.get("workload_class", "interactive")), compression_mode=mode, prompt_cache_mode=prompt_cache_mode, coding_intent=observe_intent, has_tools=observe_has_tools)
     upstream_key = upstream_anthropic_auth(request, settings)
     headers = _response_headers(request_id=request_id, comp=comp, plan=plan)
     _apply_license_headers(headers, license_meta)
@@ -1589,4 +1621,15 @@ include_support_bundle_router(
     capabilities_func=lambda: capabilities_dict(settings),
     health_func=health,
     user_auth_func=_support_user_ctx,
+)
+
+# Command-gated local-student API. main.py only mounts the router and injects existing deps (auth,
+# settings, the one Anthropic client); the feature stays isolated behind its own route prefix.
+include_teacher_student_router(
+    app,
+    settings=settings,
+    auth_func=_auth,
+    teacher_call_func=call_anthropic_messages,
+    upstream_auth_func=lambda request: upstream_anthropic_auth(request, settings),
+    store=store,
 )

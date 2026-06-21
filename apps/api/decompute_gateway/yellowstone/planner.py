@@ -23,7 +23,16 @@ class YellowstonePlanner:
         self.local_preprocess_enabled = local_preprocess_enabled
         self.local_student_enabled = local_student_enabled
 
-    def plan(self, model: str, traffic: TrafficProfile, compression_mode: str = "safe", prompt_cache_mode: str = "auto", force_route: str | None = None, optimization_steps: list[OptimizationStep] | None = None) -> InferencePlan:
+    def _student_feasible(self) -> bool:
+        """Cheap device-feasibility check for the OBSERVE route: can a local device run the configured
+        student model? Uses the registry's local-student profile + scanned devices, loads nothing."""
+        from .student_capability import assess_local_student
+
+        profile = get_model_profile("local-student-coder")
+        local_dev = next((d for d in self.devices if d.kind in {"cpu", "apple_silicon", "gpu"}), None)
+        return assess_local_student(device=local_dev, model=profile).feasible
+
+    def plan(self, model: str, traffic: TrafficProfile, compression_mode: str = "safe", prompt_cache_mode: str = "auto", force_route: str | None = None, optimization_steps: list[OptimizationStep] | None = None, coding_intent: str | None = None, has_tools: bool = False) -> InferencePlan:
         final_tokens = traffic.final_input_tokens
         ys_tokens = traffic.yscompress_input_tokens
         raw_tokens = traffic.raw_input_tokens
@@ -44,6 +53,9 @@ class YellowstonePlanner:
             local_preprocess_enabled=self.local_preprocess_enabled,
             local_student_enabled=self.local_student_enabled,
             force_route=force_route,
+            coding_intent=coding_intent,
+            student_feasible=self._student_feasible() if (self.local_student_enabled and coding_intent) else False,
+            has_tools=has_tools,
         )
         warnings.extend(decision.warnings)
         remote = next((d for d in self.devices if "anthropic_proxy" in d.runtimes), None) or DeviceProfile(id="dev_anthropic_remote", name="Anthropic Claude API", kind="remote_provider", memory_gb=10_000, compute_score=100, runtimes=["anthropic_proxy"])

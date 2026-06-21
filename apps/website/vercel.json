@@ -1,0 +1,11 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "cleanUrls": true,
+  "trailingSlash": false,
+  "rewrites": [
+    {
+      "source": "/install.sh",
+      "destination": "https://pub-1093626231534fd593c5355928f4074d.r2.dev/install.sh"
+    }
+  ]
+}

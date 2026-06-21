@@ -26,6 +26,7 @@ EXPECTED_TABLES = {
     "orgs", "users", "memberships", "projects",
     "api_keys", "devices", "deployments",
     "ccr_items", "usage_events", "audit_logs",
+    "teacher_student_runs", "teacher_student_cases", "teacher_student_verdicts",
 }
 
 NEW_CCR_COLUMNS = {

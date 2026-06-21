@@ -61,6 +61,255 @@ def health():
     print(_client().get("/health"))
 
 
+def _read_tests_arg(tests: str | None) -> str | None:
+    """`--tests` may be inline assertions or a path to a test file."""
+    if not tests:
+        return None
+    p = Path(tests).expanduser()
+    if p.is_file():
+        return p.read_text()
+    return tests
+
+
+def _print_route_summary(resp: dict) -> None:
+    """Print the compact route line + verifier info (plan §"Output style")."""
+    route = resp.get("route")
+    color = {"student_only": "green", "teacher_corrected": "yellow", "teacher_only": "cyan", "student_unavailable": "red", "disabled": "red"}.get(route, "white")
+    print(f"\n[{color}]● route: {route}[/{color}]")
+    verdict = resp.get("verdict") or {}
+    if verdict:
+        conf = verdict.get("confidence")
+        reason = verdict.get("escalation_reason")
+        line = f"  verifier: {verdict.get('decision')} (confidence {conf})"
+        if reason:
+            line += f" — {reason}"
+        print(line)
+    usage = resp.get("usage") or {}
+    if usage.get("teacher_called"):
+        print(f"  teacher called: yes (latency {usage.get('teacher_latency_ms')}ms)")
+    else:
+        avoided = usage.get("estimated_teacher_cost_avoided_usd")
+        print(f"  teacher called: no — est. teacher cost avoided ${avoided}")
+
+
+@app.command("ts-run")
+def ts_run(
+    task: str = typer.Argument(..., help="The coding task for the local student."),
+    tests: Optional[str] = typer.Option(None, "--tests", help="Inline assertions or a path to a test file."),
+    require_teacher: bool = typer.Option(False, "--require-teacher", help="Always get Claude review/correction."),
+    execute_tests: bool = typer.Option(False, "--execute-tests", help="Run tests in the sandbox (only if server policy allows)."),
+    max_tokens: int = typer.Option(2048, "--max-tokens"),
+):
+    """Run one teacher-student coding task (local student, verified, escalates to Claude if risky)."""
+    try:
+        resp = _client().teacher_student.run(
+            task,
+            tests=_read_tests_arg(tests),
+            require_teacher=require_teacher,
+            execute_tests=execute_tests,
+            max_tokens=max_tokens,
+        )
+    except DecomputeError as exc:
+        print(f"[red]teacher-student run failed:[/red] {exc}")
+        raise typer.Exit(1)
+    answer = resp.get("final_answer")
+    if answer:
+        print(answer)
+    else:
+        print("[red](no answer — the student was unavailable and no teacher was configured)[/red]")
+    _print_route_summary(resp)
+
+
+@app.command("ts-export")
+def ts_export(
+    out: Optional[str] = typer.Option(None, "--out", help="Write the SFT JSONL here (default: stdout)."),
+):
+    """Export accepted teacher-student cases as SFT training data (requires the distill:read scope).
+
+    Governed: only works when capture is enabled and the project's governance mode stores content;
+    metadata-only/regulated projects return nothing (409 surfaced as a clear message)."""
+    try:
+        data = _client().teacher_student.export_sft()
+    except DecomputeError as exc:
+        print(f"[red]ts-export failed:[/red] {exc}")
+        raise typer.Exit(1)
+    text = data if isinstance(data, str) else str(data)
+    if out:
+        Path(out).expanduser().write_text(text)
+        n = len([ln for ln in text.splitlines() if ln.strip()])
+        print(f"[green]wrote {n} records[/green] to {out}")
+    else:
+        print(text or "[yellow](no exportable records)[/yellow]")
+
+
+@app.command("ts-health")
+def ts_health():
+    """Show local student / teacher readiness."""
+    try:
+        h = _client().teacher_student.health()
+    except DecomputeError as exc:
+        print(f"[red]ts-health failed:[/red] {exc}")
+        raise typer.Exit(1)
+    enabled = h.get("enabled")
+    sh = h.get("student_health") or {}
+    ok = sh.get("ok")
+    color = "green" if (enabled and ok) else ("yellow" if enabled else "red")
+    print(f"[{color}]teacher-student: enabled={enabled} student_ok={ok}[/{color}]")
+    student = h.get("student") or {}
+    print(f"  backend: {student.get('backend')}  model: {student.get('model')}  url: {student.get('base_url')}")
+    print(f"  verifier threshold: {(h.get('verifier') or {}).get('threshold')}  judge: {(h.get('verifier') or {}).get('judge_enabled')}")
+    print(f"  sandbox: {(h.get('sandbox') or {}).get('backend')}  governance: {(h.get('governance') or {}).get('mode')}")
+
+
+@app.command("local-chat")
+def local_chat(
+    prompt: str = typer.Argument(..., help="Prompt for the local student (DIRECT, UNVERIFIED debug path)."),
+    max_tokens: int = typer.Option(2048, "--max-tokens"),
+):
+    """Call the configured local student directly for debugging. NOT a verified teacher-student run."""
+    try:
+        resp = _client().teacher_student.local_chat(prompt, max_tokens=max_tokens)
+    except DecomputeError as exc:
+        print(f"[red]local-chat failed:[/red] {exc}")
+        raise typer.Exit(1)
+    print(resp.get("answer") or "[red](no answer)[/red]")
+    print(f"\n[dim]● unverified local student — model {resp.get('model')}, {resp.get('latency_ms')}ms[/dim]")
+
+
+# ── Local student runtime lifecycle (Phase 6) ─────────────────────────────────
+# Manage a user-controlled llama-server process exposing the OpenAI-compatible student endpoint.
+# The gateway NEVER downloads weights or starts this itself; these commands are explicit.
+
+student_app = typer.Typer(help="Manage the local coding-student runtime (llama.cpp).")
+app.add_typer(student_app, name="student")
+
+
+def _student_base_url() -> str:
+    return os.getenv("DECOMPUTE_LOCAL_STUDENT_BASE_URL", "http://127.0.0.1:18080/v1")
+
+
+def _student_pidfile() -> Path:
+    from .config import CONFIG_DIR
+
+    return Path(CONFIG_DIR) / "student.pid"
+
+
+def _student_alive() -> bool:
+    import httpx
+
+    try:
+        return httpx.get(f"{_student_base_url().rstrip('/')}/models", timeout=2.0).status_code < 400
+    except Exception:
+        return False
+
+
+@student_app.command("status")
+def student_status():
+    """Show whether the local student endpoint is reachable."""
+    url = _student_base_url()
+    if _student_alive():
+        print(f"[green]● local student: reachable[/green] at {url}")
+    else:
+        print(f"[red]● local student: not reachable[/red] at {url}")
+        print("  start it with [bold]decompute student start[/bold] (or scripts/start_student_llama_cpp.sh)")
+
+
+@student_app.command("start")
+def student_start(
+    model: Optional[str] = typer.Option(None, "--model", help="hf repo:quant (default: DECOMPUTE_LOCAL_STUDENT_MODEL)."),
+    port: int = typer.Option(18080, "--port"),
+    weight_gb: float = typer.Option(0.0, "--weight-gb", help="Model file size in GB for the RAM feasibility check."),
+    force: bool = typer.Option(False, "--force", help="Bypass the RAM feasibility check (risk: swap thrash)."),
+):
+    """Start the local student via scripts/start_student_llama_cpp.sh (user-managed, no auto-download)."""
+    if _student_alive():
+        print("[yellow]local student already reachable; nothing to do.[/yellow]")
+        return
+    script = Path(__file__).resolve().parents[4] / "scripts" / "start_student_llama_cpp.sh"
+    if not script.is_file():
+        print(f"[red]launcher not found:[/red] {script}")
+        raise typer.Exit(3)
+    env = {**os.environ, "PORT": str(port), "WEIGHT_GB": str(weight_gb), "FORCE": "1" if force else "0"}
+    if model:
+        env["MODEL"] = model
+    pidfile = _student_pidfile()
+    pidfile.parent.mkdir(parents=True, exist_ok=True)
+    log = pidfile.with_suffix(".log")
+    with open(log, "ab") as lf:
+        proc = subprocess.Popen(["bash", str(script)], env=env, stdout=lf, stderr=lf, start_new_session=True)
+    pidfile.write_text(str(proc.pid))
+    print(f"[green]started llama-server (pid {proc.pid})[/green]; logs: {log}")
+    print("  run [bold]decompute student status[/bold] in a few seconds to confirm readiness.")
+
+
+@student_app.command("stop")
+def student_stop():
+    """Stop the student process started by `decompute student start`."""
+    import signal
+
+    pidfile = _student_pidfile()
+    if not pidfile.is_file():
+        print("[yellow]no managed student process (pidfile missing).[/yellow]")
+        return
+    try:
+        pid = int(pidfile.read_text().strip())
+        os.kill(pid, signal.SIGTERM)
+        print(f"[green]sent SIGTERM to pid {pid}[/green]")
+    except (ValueError, ProcessLookupError):
+        print("[yellow]process not running.[/yellow]")
+    finally:
+        pidfile.unlink(missing_ok=True)
+
+
+@student_app.command("smoke")
+def student_smoke(prompt: str = typer.Argument("Write a Python add(a, b) function.")):
+    """Send one prompt straight to the local student endpoint (bypasses the gateway)."""
+    import httpx
+
+    if not _student_alive():
+        print("[red]local student not reachable.[/red] start it first.")
+        raise typer.Exit(1)
+    model = os.getenv("DECOMPUTE_LOCAL_STUDENT_MODEL", "local-student-coder")
+    try:
+        r = httpx.post(
+            f"{_student_base_url().rstrip('/')}/chat/completions",
+            json={"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 256},
+            timeout=60.0,
+        )
+        r.raise_for_status()
+        text = (((r.json().get("choices") or [{}])[0]).get("message") or {}).get("content") or ""
+        print(text or "[yellow](empty response)[/yellow]")
+    except Exception as exc:
+        print(f"[red]smoke failed:[/red] {exc}")
+        raise typer.Exit(1)
+
+
+@student_app.command("install")
+def student_install(target: str = typer.Argument("gemma-coder")):
+    """Print instructions to install a local backend + model (no automatic download)."""
+    print("[bold]Local student install (manual — nothing is downloaded for you):[/bold]")
+    print("  1. Install llama.cpp:  brew install llama.cpp   (or build from source)")
+    print("  2. Pick a model that FITS your RAM. On a 16 GB Mac, a 12B coder will NOT fit;")
+    print("     use a small coder (~3-4 GB quant) or route coding tasks to Claude.")
+    print("  3. Start it:  decompute student start --model <hf-repo:quant> --weight-gb <size>")
+    print(f"  4. Point the gateway at it:  export DECOMPUTE_LOCAL_STUDENT_BASE_URL={_student_base_url()}")
+    print("  5. Enable the feature:  export DECOMPUTE_LOCAL_STUDENT_ENABLED=true")
+
+
+@student_app.command("pull")
+def student_pull(model: str = typer.Argument(...), size_gb: float = typer.Option(0.0, "--size-gb")):
+    """Download a model with confirmation (shows name + size first; never silent)."""
+    print(f"about to pull model: [bold]{model}[/bold]" + (f"  (~{size_gb} GB)" if size_gb else ""))
+    if not typer.confirm("download now?"):
+        print("aborted.")
+        raise typer.Exit(0)
+    if shutil.which("llama-server") is None:
+        print("[red]llama-server not found; install llama.cpp first.[/red]")
+        raise typer.Exit(3)
+    # llama.cpp downloads on first -hf use; we just confirm and hand off to `start`.
+    print("run: [bold]decompute student start --model " + model + "[/bold] to fetch + launch.")
+
+
 def _set_dotted(updates: dict, dotted: str, value) -> dict:
     """Build a nested update dict from a 'section.key' path, e.g. 'gateway.base_url'."""
     parts = dotted.split(".")

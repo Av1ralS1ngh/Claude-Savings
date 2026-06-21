@@ -1,0 +1,9 @@
+name = "decompute-checkout"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+
+# Stores each device's signed license (key "lic:<rawDeviceId>"). Create it once, then paste the id:
+#   wrangler kv namespace create LICENSES
+[[kv_namespaces]]
+binding = "LICENSES"
+id = "d4f388b336a34bd2a648dc156fa00192"
