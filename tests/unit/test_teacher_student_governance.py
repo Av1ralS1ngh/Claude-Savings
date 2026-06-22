@@ -105,6 +105,49 @@ def test_redacted_mode_stores_content_with_expiry(tmp_path):
         assert row.expires_at is not None  # retention clock set
 
 
+def test_purge_clears_expired_content_but_keeps_metadata(tmp_path):
+    """Retention enforcement (H2): purge hard-deletes captured content past its window, downgrades the
+    row to metadata_only, and clears the retention clock — but the case ROW (metadata) survives. This
+    pins db.purge_expired_teacher_student_cases, which startup/maintenance relies on and was untested."""
+    from datetime import datetime, timedelta, timezone
+
+    from decompute_gateway.models import TeacherStudentCase
+
+    s = Settings(
+        database_url=f"sqlite+pysqlite:///{tmp_path}/purge.db",
+        teacher_student_capture_enabled=True,
+        teacher_student_capture_retention_days=7,
+    )
+    store = Store(s)
+    store.create_schema_for_local_dev()
+    pid = store.create_project("cap")["id"]
+    with store.session() as sess:
+        from decompute_gateway.models import Project
+        proj = sess.get(Project, pid)
+        proj.teacher_student_capture_enabled = True
+        proj.teacher_student_governance_mode = "redacted"
+    rec = store.record_teacher_student_case(_case_payload(), project_id=pid, request_capture=True)
+
+    # Not yet expired -> purge is a no-op.
+    assert store.purge_expired_teacher_student_cases(now=datetime.now(timezone.utc)) == 0
+    with store.session() as sess:
+        row = sess.query(TeacherStudentCase).filter_by(id=rec["id"]).one()
+        assert row.student_answer == "SECRET STUDENT CODE"  # still present before expiry
+
+    # Well past the 7-day window -> content cleared, metadata row preserved.
+    future = datetime.now(timezone.utc) + timedelta(days=30)
+    cleared = store.purge_expired_teacher_student_cases(now=future)
+    assert cleared == 1
+    with store.session() as sess:
+        row = sess.query(TeacherStudentCase).filter_by(id=rec["id"]).one()
+        assert row is not None  # the metadata row survives
+        assert row.student_answer is None and row.teacher_answer is None and row.final_answer is None
+        assert row.storage_mode == "metadata_only"
+        assert row.expires_at is None  # retention clock cleared
+    # Idempotent: a second purge clears nothing more.
+    assert store.purge_expired_teacher_student_cases(now=future) == 0
+
+
 def test_capture_locked_forces_metadata_only(tmp_path):
     s = Settings(
         database_url=f"sqlite+pysqlite:///{tmp_path}/lock.db",

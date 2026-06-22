@@ -129,6 +129,46 @@ def test_teacher_routes_report_nonzero_input_tokens():
     assert r3.usage.input_tokens == 20
 
 
+def test_judge_pass_serves_student_with_no_tests():
+    """The PROXY serve path: no user tests, but an independent judge passes -> student_only, no teacher.
+
+    This is the exact behavior that goes live on /v1/messages when DECOMPUTE_TS_JUDGE_ENABLED is on,
+    and it was previously only covered at the verifier layer — pin it end-to-end through the service."""
+    async def passing_judge(*, task_text, answer, tests):
+        from decompute_gateway.teacher_student.verifier import JudgeResult
+        return JudgeResult(passed=True, model="claude-judge", severity=0, detail="looks correct")
+
+    svc = S.TeacherStudentService(
+        settings=_settings(teacher_student_judge_enabled=True),
+        provider=_StubProvider(answer="```python\ndef add(a,b):\n    return a+b\n```"),
+        teacher_caller=_teacher,
+        judge_fn=passing_judge,
+    )
+    resp = _run(svc)  # no tests supplied
+    assert resp.route == "student_only"
+    assert resp.usage.teacher_called is False
+    assert resp.verdict is not None
+    assert resp.verdict.decision == "accept_student"
+    assert resp.verdict.confidence >= 0.82  # judge-passed cap (0.85) cleared the 0.82 threshold
+
+
+def test_judge_fail_escalates_with_no_tests():
+    """Counterpart: judge flags the answer -> escalate to the teacher, never serve the student."""
+    async def failing_judge(*, task_text, answer, tests):
+        from decompute_gateway.teacher_student.verifier import JudgeResult
+        return JudgeResult(passed=False, model="claude-judge", severity=3, detail="off-by-one")
+
+    svc = S.TeacherStudentService(
+        settings=_settings(teacher_student_judge_enabled=True),
+        provider=_StubProvider(answer="```python\ndef add(a,b):\n    return a-b\n```"),
+        teacher_caller=_teacher,
+        judge_fn=failing_judge,
+    )
+    resp = _run(svc)
+    assert resp.route == "teacher_corrected"
+    assert resp.usage.teacher_called is True
+
+
 def test_teacher_only_when_tools_present():
     svc = S.TeacherStudentService(settings=_settings(), provider=_StubProvider(answer="x"), teacher_caller=_teacher)
     req = TeacherStudentRunRequest(messages=[{"role": "user", "content": [{"type": "tool_result", "content": "x"}]}])
