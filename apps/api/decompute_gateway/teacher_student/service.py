@@ -361,5 +361,9 @@ def _to_verdict(vres: verifier.VerifierResult) -> Verdict:
         confidence=vres.confidence,
         threshold=vres.threshold,
         escalation_reason=vres.escalation_reason,
+        tests_ran=vres.tests_ran,
+        tests_passed=vres.tests_passed,
+        sandbox_backend=vres.sandbox_backend,
+        judge_model=vres.judge_model,
         layers=[VerdictLayer(name=layer.name, passed=layer.passed, detail=layer.detail, severity=layer.severity) for layer in vres.layers],
     )

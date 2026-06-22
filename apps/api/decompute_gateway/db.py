@@ -1001,23 +1001,70 @@ class Store:
             return [self.ts_run_to_dict(r) for r in rows]
 
     def teacher_student_summary(self, *, project_id: str) -> dict[str, Any]:
-        """Counts-only deflection summary for the dashboard (no content)."""
+        """Counts-only deflection summary for the dashboard (no content).
+
+        Beyond the route breakdown, this surfaces the VERIFICATION-SIGNAL breakdown of accepted
+        (student_only) cases — needed for the serve-canary: a tests-backed accept (executed sandbox
+        tests, the strongest 1.0 evidence tier) is more trustworthy than a judge-only accept (0.85,
+        no executed tests), and an operator must be able to watch the judge-only rate during ramp."""
         with self.session() as s:
             cases = s.query(TeacherStudentCase).filter(TeacherStudentCase.project_id == project_id).all()
             total = len(cases)
             by_route: dict[str, int] = {}
             teacher_calls = 0
+            case_ids: list[str] = []
             for c in cases:
                 by_route[c.route] = by_route.get(c.route, 0) + 1
                 if c.route in {"teacher_corrected", "teacher_only"}:
                     teacher_calls += 1
+                case_ids.append(c.id)
             accepted = by_route.get("student_only", 0)
+
+            # Join verdicts to classify HOW each accept was verified + the judge pass-rate.
+            tests_backed = judge_only = no_evidence_accepts = judge_consulted = judge_passed = 0
+            confidences: list[float] = []
+            if case_ids:
+                verdicts = (
+                    s.query(TeacherStudentVerdict)
+                    .filter(TeacherStudentVerdict.case_id.in_(case_ids))
+                    .all()
+                )
+                # Map case_id -> route for accept classification.
+                route_by_case = {c.id: c.route for c in cases}
+                for v in verdicts:
+                    if v.judge_model is not None:
+                        judge_consulted += 1
+                        if not v.escalated:
+                            judge_passed += 1
+                    if route_by_case.get(v.case_id) == "student_only":
+                        confidences.append(v.confidence)
+                        if v.tests_ran and v.tests_passed:
+                            tests_backed += 1
+                        elif v.judge_model is not None:
+                            judge_only += 1
+                        else:
+                            # Should be unreachable (no-evidence cap can't clear threshold); track it.
+                            no_evidence_accepts += 1
+
+            avg_conf = round(sum(confidences) / len(confidences), 4) if confidences else 0.0
             return {
                 "cases": total,
                 "student_accepted": accepted,
                 "teacher_called": teacher_calls,
                 "escalation_rate": round((total - accepted) / total, 4) if total else 0.0,
                 "by_route": by_route,
+                # Verification-signal breakdown of the accepts (serve-canary observability).
+                "accept_evidence": {
+                    "tests_backed": tests_backed,      # executed sandbox tests passed (cap 1.0)
+                    "judge_only": judge_only,          # independent judge passed, no tests (cap 0.85)
+                    "no_evidence": no_evidence_accepts,  # invariant guard: should always be 0
+                    "avg_confidence": avg_conf,
+                },
+                "judge": {
+                    "consulted": judge_consulted,
+                    "passed": judge_passed,
+                    "pass_rate": round(judge_passed / judge_consulted, 4) if judge_consulted else 0.0,
+                },
             }
 
     def export_distillation_records(

@@ -84,6 +84,12 @@ def test_student_only_when_tests_pass_in_sandbox():
     assert resp.route == "student_only"
     assert resp.usage.teacher_called is False
     assert resp.usage.estimated_teacher_cost_avoided_usd > 0
+    # The evidence tier must survive onto the response verdict (so it persists + the summary can
+    # classify a tests-backed accept vs a judge-only one). Regression: _to_verdict used to drop these.
+    assert resp.verdict.tests_ran is True
+    assert resp.verdict.tests_passed is True
+    assert resp.verdict.sandbox_backend == "container"
+    assert resp.verdict.judge_model is None  # tests, not judge
 
 
 def test_teacher_corrected_when_verifier_escalates():

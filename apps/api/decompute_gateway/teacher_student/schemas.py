@@ -99,6 +99,13 @@ class Verdict(BaseModel):
     threshold: float
     escalation_reason: str | None = None
     layers: list[VerdictLayer] = Field(default_factory=list)
+    # Which evidence tier produced this verdict. Carried on the response AND persisted with the case
+    # (db.record_teacher_student_case reads these) so an operator can tell a tests-backed accept (cap
+    # 1.0) from a judge-only accept (cap 0.85) — the serve-canary's key signal.
+    tests_ran: bool = False
+    tests_passed: bool | None = None
+    sandbox_backend: str | None = None
+    judge_model: str | None = None
 
 
 class RunUsage(BaseModel):
