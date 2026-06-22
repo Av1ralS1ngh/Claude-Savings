@@ -45,7 +45,7 @@ class _StubProvider:
 
 
 async def _teacher(*, messages, system):
-    return S.TeacherResult(text="```python\ndef add(a,b):\n    return a+b\n```  (teacher)", output_tokens=12, model="claude-sonnet", upstream_request_id="req_teacher", latency_ms=200)
+    return S.TeacherResult(text="```python\ndef add(a,b):\n    return a+b\n```  (teacher)", input_tokens=37, output_tokens=12, model="claude-sonnet", upstream_request_id="req_teacher", latency_ms=200)
 
 
 def _settings(**kw) -> Settings:
@@ -98,6 +98,35 @@ def test_teacher_corrected_when_verifier_escalates():
     assert resp.usage.teacher_called is True
     assert "teacher" in resp.final_answer
     assert resp.student_answer is not None  # the student's attempt is preserved
+
+
+def test_teacher_routes_report_nonzero_input_tokens():
+    """Regression: teacher-involved routes must record the teacher's billed input_tokens, not 0.
+
+    Three paths: teacher_only (tools -> no student), require_teacher (no student), and
+    teacher_corrected (student ran). All must surface non-zero input on the usage ledger so cost
+    accounting is correct."""
+    # teacher_only: a tool-bearing request -> no student -> input must come from the teacher (37).
+    svc = S.TeacherStudentService(settings=_settings(), provider=_StubProvider(answer="x"), teacher_caller=_teacher)
+    r1 = asyncio.run(svc.run(TeacherStudentRunRequest(task="add", tools=[{"name": "search"}])))
+    assert r1.route == "teacher_only"
+    assert r1.usage.input_tokens == 37
+
+    # require_teacher: forces the teacher with no student -> input must fall back to the teacher's.
+    svc2 = S.TeacherStudentService(settings=_settings(), provider=_StubProvider(answer="x"), teacher_caller=_teacher)
+    r2 = asyncio.run(svc2.run(TeacherStudentRunRequest(task="add", require_teacher=True)))
+    assert r2.route == "teacher_corrected"
+    assert r2.usage.input_tokens == 37
+
+    # teacher_corrected with a student: input from the student (20, per _StubProvider's _result).
+    svc3 = S.TeacherStudentService(
+        settings=_settings(),
+        provider=_StubProvider(answer="```python\ndef add(a,b):\n    return a+b\n```"),
+        teacher_caller=_teacher,
+    )
+    r3 = _run(svc3)
+    assert r3.route == "teacher_corrected"
+    assert r3.usage.input_tokens == 20
 
 
 def test_teacher_only_when_tools_present():

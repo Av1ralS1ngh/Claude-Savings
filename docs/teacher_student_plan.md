@@ -616,11 +616,15 @@ Initial threshold is conservative, for example `0.82`.
 Confidence caps:
 
 - tests passed in sandbox: cap 1.0
-- no tests but judge passed: cap 0.80
+- no tests but judge passed: cap 0.85 (= base_confidence; a passing independent skeptical judge is the
+  serve signal on the `/v1/messages` proxy path, where requests carry no user tests, so this cap must
+  clear the threshold. Kept strictly below the tests-passed cap so executed tests always outrank a
+  judge opinion.)
 - tests provided but sandbox unavailable: cap 0.60
 - no tests and no judge: cap 0.55
 
-This means "no tests, no judge" almost always escalates. That is intentional until calibration data exists.
+This means "no tests, no judge" always escalates (0.55 < 0.82). That is intentional. "No tests but an
+independent judge approves" now serves, which is what makes inline serving on the proxy path viable.
 
 ## Yellowstone And Routing
 

@@ -269,6 +269,92 @@ def _usage_from_result(result: ProviderResult) -> dict[str, int]:
     }
 
 
+async def _try_serve_with_student(
+    request: Request,
+    *,
+    body: dict[str, Any],
+    model: str | None,
+    streaming: bool,
+    principal: AuthPrincipal,
+    comp: Any,
+    plan: Any,
+    request_id: str,
+    headers: dict[str, str],
+    recorded_cache_mode: str,
+    start: float,
+    workload: str | None,
+    session_id: str | None,
+    client: str | None,
+) -> "JSONResponse | StreamingResponse | None":
+    """Attempt to serve an eligible /v1/messages coding turn with the local student (opt-in serve path).
+
+    Returns a Claude-shaped response — JSON for a non-streaming request, Anthropic SSE for a streaming
+    one (Claude Code streams) — when the verifier ACCEPTS the student answer (served locally, no
+    upstream Claude call). Returns None to fall through to the normal Claude call. NEVER raises into the
+    request: any student/verifier failure returns None so the proxy degrades to plain Claude — the
+    student can only ever ADD a local fast-path, never break the request."""
+    from .anthropic_provider import mock_claude_stream_chunks
+    from .teacher_student.router import build_teacher_student_service
+    from .teacher_student.schemas import TeacherStudentRunRequest
+
+    try:
+        service = build_teacher_student_service(
+            request,
+            settings=settings,
+            teacher_call_func=call_anthropic_messages,
+            upstream_auth_func=lambda req: upstream_anthropic_auth(req, settings),
+            store=store,
+            principal=principal,
+        )
+        ts_req = TeacherStudentRunRequest(messages=body.get("messages") or [])
+        resp = await service.run(ts_req)
+    except Exception:
+        log.warning("student-serve attempt failed; falling through to Claude", extra={"extra": {"request_id": request_id}}, exc_info=True)
+        return None
+
+    # Only short-circuit when the student answer was accepted on its own. Any escalation
+    # (teacher_corrected/teacher_only) or unavailability falls through so the request takes the normal
+    # Claude path with the request's own auth — never a degraded answer.
+    if resp.route != "student_only" or not resp.final_answer:
+        return None
+
+    out_tokens = int(getattr(resp.usage, "student_output_tokens", 0) or 0)
+    _record_usage(
+        principal=principal, endpoint="/v1/messages:stream" if streaming else "/v1/messages", model=model,
+        raw_input_tokens=comp.tokens_before, yscompress_input_tokens=comp.tokens_after,
+        yellowstone_final_input_tokens=0,  # nothing was sent upstream — full input saved
+        output_tokens=out_tokens, cache_creation_input_tokens=0, cache_read_input_tokens=0,
+        prompt_cache_mode=recorded_cache_mode, plan=plan, request_id=request_id,
+        upstream_request_id=None, status_code=200, start_time=start, workload_class=workload,
+        session_id=session_id, client=client,
+    )
+    payload = {
+        "id": resp.id,
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [{"type": "text", "text": resp.final_answer}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {"input_tokens": comp.tokens_before, "output_tokens": out_tokens},
+    }
+    headers["x-decompute-served-by"] = "local-student"
+    if resp.verdict is not None:
+        headers["x-decompute-student-confidence"] = str(getattr(resp.verdict, "confidence", ""))
+    if streaming:
+        # Emit the accepted student answer as Anthropic-shaped SSE so a streaming client (Claude Code)
+        # receives a normal stream. mock_claude_stream_chunks is the same helper the local/mock
+        # provider uses; reusing it keeps the SSE envelope identical to what the client already accepts.
+        chunks = mock_claude_stream_chunks(payload)
+
+        async def _student_sse():
+            for chunk in chunks:
+                yield chunk
+
+        return StreamingResponse(_student_sse(), media_type="text/event-stream", headers=headers)
+    return JSONResponse(payload, status_code=200, headers=headers)
+
+
 async def _real_token_baseline(model: str | None, body: dict[str, Any], *, upstream_key: Any, extra_headers: dict[str, str] | None = None) -> int | None:
     """Anthropic's real-tokenizer count of the UNCOMPRESSED prompt — the honest savings
     denominator. The compressor's len/4 estimate undercounts ~5x vs Anthropic's tokenizer,
@@ -1408,6 +1494,21 @@ async def anthropic_messages_proxy(request: Request, payload: MessagesRequest) -
     _apply_license_headers(headers, license_meta)
     if cache_preserved:
         headers["x-decompute-prompt-cache-preserved"] = "true"  # compression skipped to keep the client's cache hits
+    # OPT-IN student-first serving (DECOMPUTE_LOCAL_STUDENT_SERVE), BEFORE the stream/non-stream split so
+    # it covers both — Claude Code streams, so a non-streaming-only serve would never fire in real use.
+    # On a verifier ACCEPT the student answer is returned (as JSON or Anthropic SSE, matching the
+    # request); otherwise this returns None and the request falls through to the normal Claude call,
+    # which uses the SAME upstream_key — so escalation reuses the request's own auth. Strictly gated:
+    # feature off, tools present, or non-coding intent -> skipped entirely (zero overhead).
+    if settings.local_student_serve and settings.local_student_enabled and observe_intent and not observe_has_tools:
+        student_served = await _try_serve_with_student(
+            request, body=body, model=model, streaming=bool(body.get("stream")),
+            principal=principal, comp=comp, plan=plan, request_id=request_id, headers=headers,
+            recorded_cache_mode=recorded_cache_mode, start=start, workload=workload,
+            session_id=session_id, client=client,
+        )
+        if student_served is not None:
+            return student_served
     if bool(body.get("stream")):
         # Streaming with client-disconnect cleanup. proxy_sse_stream polls the
         # downstream client; on disconnect/cancel it closes the upstream Anthropic

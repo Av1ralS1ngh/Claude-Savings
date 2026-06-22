@@ -41,6 +41,71 @@ def anthropic_text(body: dict[str, Any]) -> str:
     return "".join(parts)
 
 
+def build_teacher_student_service(
+    request: Request,
+    *,
+    settings: Any,
+    teacher_call_func: Callable[..., Any],
+    upstream_auth_func: Callable[[Request], Any],
+    store: Any | None = None,
+    principal: Any | None = None,
+) -> TeacherStudentService:
+    """Construct a TeacherStudentService whose teacher_caller reuses THIS request's upstream Anthropic
+    credential (the same one the /v1/messages proxy uses), so the teacher call needs no separate auth.
+
+    Shared by the command-gated router AND the inline /v1/messages serve path so both wire the service
+    identically (one teacher client, same sandbox/judge construction)."""
+
+    async def teacher_caller(*, messages, system) -> TeacherResult:
+        upstream_key = upstream_auth_func(request)
+        body = {
+            "model": getattr(settings, "teacher_student_teacher_model", "claude-sonnet-4-5"),
+            "max_tokens": settings.local_student_max_output_tokens,
+            "system": system,
+            "messages": messages,
+        }
+        started = time.perf_counter()
+        result: ProviderResult = await teacher_call_func(
+            body,
+            settings=settings,
+            upstream_api_key=upstream_key,
+            prompt_cache_mode="off",
+            extra_headers=dict(request.headers),
+        )
+        if result.status_code >= 400:
+            raise HTTPException(status_code=502, detail={"error": "teacher_upstream_error", "status": result.status_code})
+        text = anthropic_text(result.body)
+        usage = result.body.get("usage") or {}
+        output_tokens = int(usage.get("output_tokens") or 0)
+        input_tokens = int(usage.get("input_tokens") or 0)
+        return TeacherResult(
+            text=text,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            model=str(result.body.get("model") or "claude-sonnet"),
+            upstream_request_id=result.upstream_request_id,
+            latency_ms=int((time.perf_counter() - started) * 1000),
+        )
+
+    recorder = None
+    project_id = getattr(principal, "project_id", None)
+    if store is not None and project_id is not None:
+        recorder = store.record_teacher_student_case
+    # Sandbox (Layer 1) and judge (Layer 2) are built from config; both return None when disabled,
+    # which makes the verifier apply the missing-evidence confidence caps.
+    from .judge import make_judge
+    from .sandbox import make_test_runner
+
+    return TeacherStudentService(
+        settings=settings,
+        teacher_caller=teacher_caller,
+        run_tests_fn=make_test_runner(settings),
+        judge_fn=make_judge(settings, teacher_caller),
+        recorder=recorder,
+        project_id=project_id,
+    )
+
+
 def include_teacher_student_router(
     app,
     *,
@@ -65,51 +130,13 @@ def include_teacher_student_router(
     def _build_service(request: Request, *, principal: Any | None = None) -> TeacherStudentService:
         if service_factory is not None:
             return service_factory(request)
-
-        async def teacher_caller(*, messages, system) -> TeacherResult:
-            upstream_key = upstream_auth_func(request)
-            body = {
-                "model": getattr(settings, "teacher_student_teacher_model", "claude-sonnet-4-5"),
-                "max_tokens": settings.local_student_max_output_tokens,
-                "system": system,
-                "messages": messages,
-            }
-            started = time.perf_counter()
-            result: ProviderResult = await teacher_call_func(
-                body,
-                settings=settings,
-                upstream_api_key=upstream_key,
-                prompt_cache_mode="off",
-                extra_headers=dict(request.headers),
-            )
-            if result.status_code >= 400:
-                raise HTTPException(status_code=502, detail={"error": "teacher_upstream_error", "status": result.status_code})
-            text = anthropic_text(result.body)
-            output_tokens = int((result.body.get("usage") or {}).get("output_tokens") or 0)
-            return TeacherResult(
-                text=text,
-                output_tokens=output_tokens,
-                model=str(result.body.get("model") or "claude-sonnet"),
-                upstream_request_id=result.upstream_request_id,
-                latency_ms=int((time.perf_counter() - started) * 1000),
-            )
-
-        recorder = None
-        project_id = getattr(principal, "project_id", None)
-        if store is not None and project_id is not None:
-            recorder = store.record_teacher_student_case
-        # Sandbox (Layer 1) and judge (Layer 2) are built from config; both return None when disabled,
-        # which makes the verifier apply the missing-evidence confidence caps.
-        from .judge import make_judge
-        from .sandbox import make_test_runner
-
-        return TeacherStudentService(
+        return build_teacher_student_service(
+            request,
             settings=settings,
-            teacher_caller=teacher_caller,
-            run_tests_fn=make_test_runner(settings),
-            judge_fn=make_judge(settings, teacher_caller),
-            recorder=recorder,
-            project_id=project_id,
+            teacher_call_func=teacher_call_func,
+            upstream_auth_func=upstream_auth_func,
+            store=store,
+            principal=principal,
         )
 
     @router.get("/health")

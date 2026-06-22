@@ -244,12 +244,20 @@ class Settings:
     local_preprocess_enabled: bool = _bool("YELLOWSTONE_LOCAL_PREPROCESS_ENABLED", False)
     local_student_enabled: bool = _bool("DECOMPUTE_LOCAL_STUDENT_ENABLED", False)
     local_student_training_enabled: bool = _bool("DECOMPUTE_LOCAL_STUDENT_TRAINING_ENABLED", False)
+    # OPT-IN active serving on the live /v1/messages proxy path (the one `decompute claude` uses). When
+    # true AND the master switch is on, an eligible coding turn is first attempted by the local student;
+    # the verifier accepts it (answer served locally, no Claude call) or escalates, falling through to
+    # the SAME upstream Claude call the request would have made anyway — reusing the request's own
+    # subscription/API credential, so no separate teacher auth is needed. OFF by default: with this
+    # false the student is observe-only on /v1/messages and serves only via the explicit ts-run command.
+    local_student_serve: bool = _bool("DECOMPUTE_LOCAL_STUDENT_SERVE", False)
 
     # ── Local coding student (teacher-student) ────────────────────────────────
-    # An OPTIONAL, off-by-default local model that answers narrow coding tasks, invoked only via the
-    # explicit `decompute ts-run`/`ts-health`/`local-chat` commands (never from /v1/messages). The
-    # provider speaks OpenAI-compatible chat-completions (llama.cpp `llama-server`, Ollama, LM Studio,
-    # vLLM). See docs/teacher_student_plan.md. local_student_enabled (above) is the master switch.
+    # An OPTIONAL, off-by-default local model that answers narrow coding tasks. Invoked via the explicit
+    # `decompute ts-run`/`ts-health`/`local-chat` commands, and — only when local_student_serve is on —
+    # inline on the /v1/messages proxy path (student-first, escalate-to-Claude). The provider speaks
+    # OpenAI-compatible chat-completions (llama.cpp `llama-server`, Ollama, LM Studio, vLLM). See
+    # docs/teacher_student_plan.md. local_student_enabled (above) is the master switch.
     local_student_backend: str = os.getenv("DECOMPUTE_LOCAL_STUDENT_BACKEND", "llama_cpp")
     local_student_base_url: str = os.getenv("DECOMPUTE_LOCAL_STUDENT_BASE_URL", "http://127.0.0.1:18080/v1")
     local_student_model: str = os.getenv("DECOMPUTE_LOCAL_STUDENT_MODEL", "local-student-coder")
@@ -405,6 +413,23 @@ class Settings:
                 if self.teacher_student_sandbox_backend == "container" and self.teacher_student_sandbox_runtime not in {"docker", "podman"}:
                     errors.append(
                         "DECOMPUTE_TS_SANDBOX_RUNTIME must be 'docker' or 'podman' for the container sandbox in production"
+                    )
+            # Serving the student inline on /v1/messages (DECOMPUTE_LOCAL_STUDENT_SERVE) requires the
+            # master switch AND a real verification signal — otherwise a serve would emit an UNVERIFIED
+            # answer (the no-evidence cap, 0.55, never clears the threshold, but we refuse to even risk a
+            # misconfiguration that serves unchecked). Acceptable signals: an independent judge, or test
+            # execution in a production-safe sandbox. The judge is the expected signal on the proxy path
+            # (real requests carry no tests).
+            if self.local_student_serve:
+                if not self.local_student_enabled:
+                    errors.append("DECOMPUTE_LOCAL_STUDENT_SERVE requires DECOMPUTE_LOCAL_STUDENT_ENABLED=true")
+                has_judge = self.teacher_student_judge_enabled
+                has_sandbox = self.teacher_student_test_execution_enabled and self.teacher_student_sandbox_backend in {"container", "cloudflare"}
+                if not (has_judge or has_sandbox):
+                    errors.append(
+                        "DECOMPUTE_LOCAL_STUDENT_SERVE requires a verification signal: set "
+                        "DECOMPUTE_TS_JUDGE_ENABLED=true (recommended for the proxy path) or enable test "
+                        "execution with a production-safe sandbox. Serving without verification is refused."
                     )
             # Distillation on Claude outputs is approved but governed: production must explicitly encode
             # the legal/product sign-off, not just flip the allow flag (CLAUDE.md "Policy exception").

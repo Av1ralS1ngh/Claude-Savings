@@ -42,8 +42,10 @@ from .schemas import (
     VerdictLayer,
 )
 
-# A teacher caller takes the normalized messages + system prompt and returns (text, output_tokens,
-# upstream_request_id) or raises. The router supplies one bound to the request's auth/headers.
+# A teacher caller takes the normalized messages + system prompt and returns (text, input_tokens,
+# output_tokens, upstream_request_id) or raises. The router supplies one bound to the request's
+# auth/headers. input_tokens is what the teacher (Claude) actually billed for the prompt — needed so
+# teacher-involved routes report real cost, not 0.
 TeacherCaller = Callable[..., Awaitable["TeacherResult"]]
 
 
@@ -54,6 +56,7 @@ class TeacherResult:
     model: str
     upstream_request_id: str | None
     latency_ms: int
+    input_tokens: int = 0
 
 
 class TeacherUnavailable(Exception):
@@ -306,7 +309,8 @@ class TeacherStudentService:
         if not self._teacher_allowed():
             return TeacherStudentRunResponse(id=run_id, route="student_unavailable", final_answer=None)
         tr = await self._call_teacher(task_text=task_text, student_answer=None, tests=req.tests, escalation_reason=reason)
-        usage = RunUsage(teacher_output_tokens=tr.output_tokens, teacher_latency_ms=tr.latency_ms, teacher_called=True)
+        # No student ran, so the teacher's billed input IS the run's input.
+        usage = RunUsage(input_tokens=tr.input_tokens, teacher_output_tokens=tr.output_tokens, teacher_latency_ms=tr.latency_ms, teacher_called=True)
         return TeacherStudentRunResponse(
             id=run_id, route="teacher_only", final_answer=tr.text, teacher_answer=tr.text,
             usage=usage, request_id=tr.upstream_request_id,
@@ -319,7 +323,9 @@ class TeacherStudentService:
         student_text = student.text if student is not None else None
         tr = await self._call_teacher(task_text=task_text, student_answer=student_text, tests=req.tests, escalation_reason=reason)
         usage = RunUsage(
-            input_tokens=getattr(student, "input_tokens", 0),
+            # Prefer the student's billed input (student + teacher see ~the same prompt); when no
+            # student ran (require_teacher path), fall back to the teacher's billed input, not 0.
+            input_tokens=getattr(student, "input_tokens", 0) or tr.input_tokens,
             student_output_tokens=getattr(student, "output_tokens", 0),
             student_latency_ms=getattr(student, "latency_ms", 0),
             teacher_output_tokens=tr.output_tokens,

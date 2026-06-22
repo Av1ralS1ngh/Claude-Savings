@@ -28,10 +28,15 @@ VERIFIER_VERSION = "v1"
 # Confidence caps by available evidence (plan §"Layer 3"). The final confidence is the MIN of the
 # base score and the applicable cap, so missing evidence pulls a confident-looking answer below the
 # threshold and forces escalation.
-CAP_TESTS_PASSED = 1.00      # tests ran in sandbox and passed
-CAP_JUDGE_PASSED = 0.80      # no tests but an independent judge passed
+CAP_TESTS_PASSED = 1.00      # tests ran in sandbox and passed — strongest evidence
+# An independent, skeptical Claude judge passing (find-flaws prompt, fails closed on doubt — see
+# judge.py) is strong evidence on its own: it is the primary serve signal on the /v1/messages proxy
+# path, where requests carry no user tests. Set to base_confidence so a judge-approved answer with no
+# deterministic flaws reaches the base score and can clear a threshold up to that value. Keep STRICTLY
+# below CAP_TESTS_PASSED so executed-and-passing tests always outrank a judge opinion.
+CAP_JUDGE_PASSED = 0.85      # no tests but an independent judge passed
 CAP_SANDBOX_UNAVAILABLE = 0.60  # tests provided but no sandbox to run them
-CAP_NO_EVIDENCE = 0.55       # no tests and no judge
+CAP_NO_EVIDENCE = 0.55       # no tests and no judge — always escalates
 
 _REFUSAL_RE = re.compile(
     r"\b(i can't|i cannot|i'm sorry|i am sorry|as an ai|i'm unable|i am unable|cannot help with)\b",

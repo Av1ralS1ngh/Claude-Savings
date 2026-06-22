@@ -100,14 +100,20 @@ def test_sandbox_cannot_run_does_not_pretend_pass():
 # ── Judge layer ─────────────────────────────────────────────────────────────
 
 
-def test_judge_pass_lifts_cap_to_080_still_below_default_threshold():
+def test_judge_pass_accepts_at_default_threshold_no_tests():
+    """The serve-on-proxy enabler: a skeptical judge passing (no user tests) lifts the cap to
+    CAP_JUDGE_PASSED (0.85), which clears the 0.82 default threshold -> accept_student. This is what
+    lets the /v1/messages serve path work, since real proxy requests carry no tests."""
     async def judge(*, task_text, answer, tests):
         return V.JudgeResult(passed=True, model="claude-judge")
 
     r = asyncio.run(V.verify(task_text="add", answer=GOOD_ANSWER, tests=None, threshold=THRESHOLD, judge_fn=judge))
-    # judge-passed cap is 0.80, below the 0.82 default -> still escalates, but for below_threshold.
-    assert r.escalated
-    assert r.confidence <= V.CAP_JUDGE_PASSED
+    assert not r.escalated
+    assert r.decision == "accept_student"
+    assert r.confidence >= THRESHOLD
+    assert r.judge_model == "claude-judge"
+    # A judge opinion must still rank strictly below executed-and-passing tests.
+    assert V.CAP_JUDGE_PASSED < V.CAP_TESTS_PASSED
 
 
 def test_judge_pass_accepts_when_threshold_lowered():
