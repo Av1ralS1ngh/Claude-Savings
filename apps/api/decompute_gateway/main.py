@@ -33,6 +33,7 @@ from .security import AuthPrincipal, assert_csrf_for_browser_mutation, auth_cont
 from .sse import SSEUsageTracker
 from .streaming_cleanup import StreamUsageTracker, proxy_sse_stream
 from .support_router import include_support_bundle_router
+from .teacher_student.router import include_teacher_student_router
 from . import telemetry
 from .workload import classify_workload
 from .yscompress import CCR_RETRIEVE_TOOL, YSCompressClient, estimate_tokens
@@ -162,6 +163,21 @@ def _auth(request: Request, scope: str | None = None) -> AuthPrincipal:
     return principal
 
 
+def _last_user_text(messages: list[dict[str, Any]]) -> str:
+    """The most recent user turn's text, flattened. Used only for cheap teacher-student observe-mode
+    intent classification on /v1/messages; never sent anywhere."""
+    for m in reversed(messages or []):
+        if not isinstance(m, dict) or m.get("role") != "user":
+            continue
+        content = m.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = [b["text"] for b in content if isinstance(b, dict) and isinstance(b.get("text"), str)]
+            return "\n".join(parts)
+    return ""
+
+
 def detect_client(request: Request) -> str | None:
     """Classify the calling harness from the User-Agent into a small known set so the
     dashboard can split savings by client (Claude Code vs OpenClaw vs SDK). We store
@@ -251,6 +267,92 @@ def _usage_from_result(result: ProviderResult) -> dict[str, int]:
         "cache_creation_input_tokens": int(usage.get("cache_creation_input_tokens") or 0),
         "cache_read_input_tokens": int(usage.get("cache_read_input_tokens") or 0),
     }
+
+
+async def _try_serve_with_student(
+    request: Request,
+    *,
+    body: dict[str, Any],
+    model: str | None,
+    streaming: bool,
+    principal: AuthPrincipal,
+    comp: Any,
+    plan: Any,
+    request_id: str,
+    headers: dict[str, str],
+    recorded_cache_mode: str,
+    start: float,
+    workload: str | None,
+    session_id: str | None,
+    client: str | None,
+) -> "JSONResponse | StreamingResponse | None":
+    """Attempt to serve an eligible /v1/messages coding turn with the local student (opt-in serve path).
+
+    Returns a Claude-shaped response — JSON for a non-streaming request, Anthropic SSE for a streaming
+    one (Claude Code streams) — when the verifier ACCEPTS the student answer (served locally, no
+    upstream Claude call). Returns None to fall through to the normal Claude call. NEVER raises into the
+    request: any student/verifier failure returns None so the proxy degrades to plain Claude — the
+    student can only ever ADD a local fast-path, never break the request."""
+    from .anthropic_provider import mock_claude_stream_chunks
+    from .teacher_student.router import build_teacher_student_service
+    from .teacher_student.schemas import TeacherStudentRunRequest
+
+    try:
+        service = build_teacher_student_service(
+            request,
+            settings=settings,
+            teacher_call_func=call_anthropic_messages,
+            upstream_auth_func=lambda req: upstream_anthropic_auth(req, settings),
+            store=store,
+            principal=principal,
+        )
+        ts_req = TeacherStudentRunRequest(messages=body.get("messages") or [])
+        resp = await service.run(ts_req)
+    except Exception:
+        log.warning("student-serve attempt failed; falling through to Claude", extra={"extra": {"request_id": request_id}}, exc_info=True)
+        return None
+
+    # Only short-circuit when the student answer was accepted on its own. Any escalation
+    # (teacher_corrected/teacher_only) or unavailability falls through so the request takes the normal
+    # Claude path with the request's own auth — never a degraded answer.
+    if resp.route != "student_only" or not resp.final_answer:
+        return None
+
+    out_tokens = int(getattr(resp.usage, "student_output_tokens", 0) or 0)
+    _record_usage(
+        principal=principal, endpoint="/v1/messages:stream" if streaming else "/v1/messages", model=model,
+        raw_input_tokens=comp.tokens_before, yscompress_input_tokens=comp.tokens_after,
+        yellowstone_final_input_tokens=0,  # nothing was sent upstream — full input saved
+        output_tokens=out_tokens, cache_creation_input_tokens=0, cache_read_input_tokens=0,
+        prompt_cache_mode=recorded_cache_mode, plan=plan, request_id=request_id,
+        upstream_request_id=None, status_code=200, start_time=start, workload_class=workload,
+        session_id=session_id, client=client,
+    )
+    payload = {
+        "id": resp.id,
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [{"type": "text", "text": resp.final_answer}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {"input_tokens": comp.tokens_before, "output_tokens": out_tokens},
+    }
+    headers["x-decompute-served-by"] = "local-student"
+    if resp.verdict is not None:
+        headers["x-decompute-student-confidence"] = str(getattr(resp.verdict, "confidence", ""))
+    if streaming:
+        # Emit the accepted student answer as Anthropic-shaped SSE so a streaming client (Claude Code)
+        # receives a normal stream. mock_claude_stream_chunks is the same helper the local/mock
+        # provider uses; reusing it keeps the SSE envelope identical to what the client already accepts.
+        chunks = mock_claude_stream_chunks(payload)
+
+        async def _student_sse():
+            for chunk in chunks:
+                yield chunk
+
+        return StreamingResponse(_student_sse(), media_type="text/event-stream", headers=headers)
+    return JSONResponse(payload, status_code=200, headers=headers)
 
 
 async def _real_token_baseline(model: str | None, body: dict[str, Any], *, upstream_key: Any, extra_headers: dict[str, str] | None = None) -> int | None:
@@ -360,6 +462,13 @@ def startup() -> None:
     purged = store.purge_expired_ccr()
     if purged:
         log.info("purged expired CCR items", extra={"extra": {"purged": purged}})
+    # Enforce teacher-student capture retention: clear content past its window (H2). Best-effort.
+    try:
+        ts_purged = store.purge_expired_teacher_student_cases()
+        if ts_purged:
+            log.info("purged expired teacher-student content", extra={"extra": {"purged": ts_purged}})
+    except Exception:
+        pass
     # Anonymous, counts-only weekly savings beacon. Daemon threads; honors the opt-outs and the weekly
     # cadence internally, beacons at boot then re-checks daily (for a long-running gateway), never raises.
     try:
@@ -1370,12 +1479,36 @@ async def anthropic_messages_proxy(request: Request, payload: MessagesRequest) -
     # like the compressor did nothing. Normal turns record the real prompt-cache mode.
     recorded_cache_mode = "preserved" if cache_preserved else prompt_cache_mode
     planner = YellowstonePlanner(scan_local_devices(), planner_version=settings.yellowstone_planner_version, policy_version=settings.yellowstone_policy_version, local_preprocess_enabled=settings.local_preprocess_enabled, local_student_enabled=settings.local_student_enabled)
-    plan = planner.plan(model=model, traffic=TrafficProfile(comp.tokens_before, comp.tokens_after, comp.tokens_after, p95_output_tokens=body.get("max_tokens", 1024), workload_class=decompute_cfg.get("workload_class", "interactive")), compression_mode=mode, prompt_cache_mode=prompt_cache_mode)
+    # Teacher-student OBSERVE mode (plan §"Yellowstone And Routing"): when the local student is
+    # enabled, classify the coding intent cheaply so the planner can record a "would have tried the
+    # student" candidate in route metadata. This NEVER calls the student or changes the response —
+    # it's analytics only. Skipped entirely (zero overhead) when the feature is off.
+    observe_intent = None
+    observe_has_tools = bool(body.get("tools"))
+    if settings.local_student_enabled:
+        from .teacher_student.intent import classify_coding_intent
+        observe_intent = classify_coding_intent(_last_user_text(body.get("messages") or []))
+    plan = planner.plan(model=model, traffic=TrafficProfile(comp.tokens_before, comp.tokens_after, comp.tokens_after, p95_output_tokens=body.get("max_tokens", 1024), workload_class=decompute_cfg.get("workload_class", "interactive")), compression_mode=mode, prompt_cache_mode=prompt_cache_mode, coding_intent=observe_intent, has_tools=observe_has_tools)
     upstream_key = upstream_anthropic_auth(request, settings)
     headers = _response_headers(request_id=request_id, comp=comp, plan=plan)
     _apply_license_headers(headers, license_meta)
     if cache_preserved:
         headers["x-decompute-prompt-cache-preserved"] = "true"  # compression skipped to keep the client's cache hits
+    # OPT-IN student-first serving (DECOMPUTE_LOCAL_STUDENT_SERVE), BEFORE the stream/non-stream split so
+    # it covers both — Claude Code streams, so a non-streaming-only serve would never fire in real use.
+    # On a verifier ACCEPT the student answer is returned (as JSON or Anthropic SSE, matching the
+    # request); otherwise this returns None and the request falls through to the normal Claude call,
+    # which uses the SAME upstream_key — so escalation reuses the request's own auth. Strictly gated:
+    # feature off, tools present, or non-coding intent -> skipped entirely (zero overhead).
+    if settings.local_student_serve and settings.local_student_enabled and observe_intent and not observe_has_tools:
+        student_served = await _try_serve_with_student(
+            request, body=body, model=model, streaming=bool(body.get("stream")),
+            principal=principal, comp=comp, plan=plan, request_id=request_id, headers=headers,
+            recorded_cache_mode=recorded_cache_mode, start=start, workload=workload,
+            session_id=session_id, client=client,
+        )
+        if student_served is not None:
+            return student_served
     if bool(body.get("stream")):
         # Streaming with client-disconnect cleanup. proxy_sse_stream polls the
         # downstream client; on disconnect/cancel it closes the upstream Anthropic
@@ -1589,4 +1722,15 @@ include_support_bundle_router(
     capabilities_func=lambda: capabilities_dict(settings),
     health_func=health,
     user_auth_func=_support_user_ctx,
+)
+
+# Command-gated local-student API. main.py only mounts the router and injects existing deps (auth,
+# settings, the one Anthropic client); the feature stays isolated behind its own route prefix.
+include_teacher_student_router(
+    app,
+    settings=settings,
+    auth_func=_auth,
+    teacher_call_func=call_anthropic_messages,
+    upstream_auth_func=lambda request: upstream_anthropic_auth(request, settings),
+    store=store,
 )

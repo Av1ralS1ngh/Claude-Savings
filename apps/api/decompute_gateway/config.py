@@ -244,6 +244,76 @@ class Settings:
     local_preprocess_enabled: bool = _bool("YELLOWSTONE_LOCAL_PREPROCESS_ENABLED", False)
     local_student_enabled: bool = _bool("DECOMPUTE_LOCAL_STUDENT_ENABLED", False)
     local_student_training_enabled: bool = _bool("DECOMPUTE_LOCAL_STUDENT_TRAINING_ENABLED", False)
+    # OPT-IN active serving on the live /v1/messages proxy path (the one `decompute claude` uses). When
+    # true AND the master switch is on, an eligible coding turn is first attempted by the local student;
+    # the verifier accepts it (answer served locally, no Claude call) or escalates, falling through to
+    # the SAME upstream Claude call the request would have made anyway — reusing the request's own
+    # subscription/API credential, so no separate teacher auth is needed. OFF by default: with this
+    # false the student is observe-only on /v1/messages and serves only via the explicit ts-run command.
+    local_student_serve: bool = _bool("DECOMPUTE_LOCAL_STUDENT_SERVE", False)
+
+    # ── Local coding student (teacher-student) ────────────────────────────────
+    # An OPTIONAL, off-by-default local model that answers narrow coding tasks. Invoked via the explicit
+    # `decompute ts-run`/`ts-health`/`local-chat` commands, and — only when local_student_serve is on —
+    # inline on the /v1/messages proxy path (student-first, escalate-to-Claude). The provider speaks
+    # OpenAI-compatible chat-completions (llama.cpp `llama-server`, Ollama, LM Studio, vLLM). See
+    # docs/teacher_student_plan.md. local_student_enabled (above) is the master switch.
+    local_student_backend: str = os.getenv("DECOMPUTE_LOCAL_STUDENT_BACKEND", "llama_cpp")
+    local_student_base_url: str = os.getenv("DECOMPUTE_LOCAL_STUDENT_BASE_URL", "http://127.0.0.1:18080/v1")
+    local_student_model: str = os.getenv("DECOMPUTE_LOCAL_STUDENT_MODEL", "local-student-coder")
+    local_student_api_key: str | None = os.getenv("DECOMPUTE_LOCAL_STUDENT_API_KEY")
+    local_student_context_window: int = _int("DECOMPUTE_LOCAL_STUDENT_CONTEXT_WINDOW", 32_000)
+    local_student_max_output_tokens: int = _int("DECOMPUTE_LOCAL_STUDENT_MAX_OUTPUT_TOKENS", 2048)
+    local_student_connect_timeout_s: float = _float("DECOMPUTE_LOCAL_STUDENT_CONNECT_TIMEOUT_S", 3.0)
+    local_student_read_timeout_s: float = _float("DECOMPUTE_LOCAL_STUDENT_READ_TIMEOUT_S", 60.0)
+    local_student_overall_timeout_s: float = _float("DECOMPUTE_LOCAL_STUDENT_OVERALL_TIMEOUT_S", 120.0)
+    local_student_health_ttl_s: float = _float("DECOMPUTE_LOCAL_STUDENT_HEALTH_TTL_S", 15.0)
+    local_student_max_concurrency: int = _int("DECOMPUTE_LOCAL_STUDENT_MAX_CONCURRENCY", 1)
+    # A test-ONLY in-process mock provider. NEVER a runtime fallback for a down model — a down student
+    # raises a typed error or escalates to the teacher (plan invariant #3, "no silent mock fallback").
+    # Rejected in production by validate_for_startup.
+    local_student_mock: bool = _bool("DECOMPUTE_LOCAL_STUDENT_MOCK", False)
+    # The student is local by default. To point it at a REMOTE endpoint in production you must opt in
+    # explicitly (and use https) — see the SSRF guard in validate_for_startup.
+    local_student_allow_remote: bool = _bool("DECOMPUTE_LOCAL_STUDENT_ALLOW_REMOTE", False)
+
+    # Teacher-student verifier / governance (consumed in later phases; declared here so production
+    # validation can reject unsafe combinations from the first ship).
+    # The Claude model used as the teacher when the verifier escalates. Configurable so a retired
+    # model id doesn't 404 the teacher path (Orig-1). Passed through the gateway's normal model
+    # allowlist + provider, so it must be an allowed Claude model.
+    teacher_student_teacher_model: str = os.getenv("DECOMPUTE_TS_TEACHER_MODEL", "claude-sonnet-4-5")
+    teacher_student_sandbox_backend: str = os.getenv("DECOMPUTE_TS_SANDBOX_BACKEND", "disabled")
+    teacher_student_test_execution_enabled: bool = _bool("DECOMPUTE_TS_TEST_EXECUTION", False)
+    # Max concurrent sandbox containers across the process (Orig-4): bounds resource use / DoS.
+    teacher_student_sandbox_max_concurrency: int = _int("DECOMPUTE_TS_SANDBOX_MAX_CONCURRENCY", 2)
+    # Container-sandbox hardening (used only when backend=container). All have safe ceilings.
+    teacher_student_sandbox_runtime: str = os.getenv("DECOMPUTE_TS_SANDBOX_RUNTIME", "docker")
+    teacher_student_sandbox_image: str = os.getenv("DECOMPUTE_TS_SANDBOX_IMAGE", "python:3.12-slim")
+    teacher_student_sandbox_timeout_s: int = _int("DECOMPUTE_TS_SANDBOX_TIMEOUT_S", 15)
+    teacher_student_sandbox_memory: str = os.getenv("DECOMPUTE_TS_SANDBOX_MEMORY", "256m")
+    teacher_student_sandbox_cpus: str = os.getenv("DECOMPUTE_TS_SANDBOX_CPUS", "1.0")
+    teacher_student_sandbox_pids: int = _int("DECOMPUTE_TS_SANDBOX_PIDS", 64)
+    teacher_student_confidence_threshold: float = _float("DECOMPUTE_TS_CONFIDENCE_THRESHOLD", 0.82)
+    teacher_student_judge_enabled: bool = _bool("DECOMPUTE_TS_JUDGE_ENABLED", False)
+    teacher_student_capture_enabled: bool = _bool("DECOMPUTE_TS_CAPTURE_ENABLED", False)
+    teacher_student_governance_mode: str = os.getenv("DECOMPUTE_TS_GOVERNANCE_MODE", "metadata_only")
+    teacher_student_capture_retention_days: int = _int("DECOMPUTE_TS_CAPTURE_RETENTION_DAYS", 30)
+    # Using Claude (teacher) outputs as model-training targets. Legal/product approved this for the
+    # teacher-student distillation work (see CLAUDE.md "Policy exception"), but it stays default-off and
+    # production must explicitly encode the sign-off via DECOMPUTE_TS_CLAUDE_TRAINING_SIGNOFF.
+    teacher_student_allow_claude_training_targets: bool = _bool("DECOMPUTE_TS_ALLOW_CLAUDE_TRAINING_TARGETS", False)
+    teacher_student_claude_training_signoff: bool = _bool("DECOMPUTE_TS_CLAUDE_TRAINING_SIGNOFF", False)
+
+    @property
+    def local_student_base_url_is_loopback(self) -> bool:
+        """True if the configured student endpoint is on the local machine. The student is a LOCAL
+        model; a non-loopback http:// URL in production would mean shipping plaintext prompts to a
+        remote host, which validate_for_startup rejects."""
+        from urllib.parse import urlparse
+
+        host = (urlparse(self.local_student_base_url).hostname or "").lower()
+        return host in {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
 
     @property
     def is_production(self) -> bool:
@@ -306,6 +376,81 @@ class Settings:
                 errors.append("DECOMPUTE_DASHBOARD_AUTH_REQUIRED must be true in production")
             if self.local_student_training_enabled:
                 errors.append("Local student continuous training is not a V0 production feature")
+            # ── Teacher-student production safety (plan §"Production validation") ──
+            # No silent mock answer can ever ship: the test-only in-process mock is a dev convenience,
+            # and in production it would return a canned answer as if it came from a real model.
+            if self.local_student_mock:
+                errors.append("DECOMPUTE_LOCAL_STUDENT_MOCK must be false in production (no mock answers)")
+            # SSRF / exfiltration guard (H3): the "local" student must be LOOPBACK in production unless
+            # an operator explicitly opts into a remote endpoint. Without the opt-in, ANY non-loopback
+            # host (even https) is rejected — otherwise a misconfigured base_url could ship every prompt
+            # to an arbitrary internal/external host. With the opt-in, the remote endpoint must be https.
+            if self.local_student_enabled and not self.local_student_base_url_is_loopback:
+                if not self.local_student_allow_remote:
+                    errors.append(
+                        "DECOMPUTE_LOCAL_STUDENT_BASE_URL must be loopback in production. To use a remote "
+                        "student set DECOMPUTE_LOCAL_STUDENT_ALLOW_REMOTE=true (and use https)."
+                    )
+                elif not self.local_student_base_url.startswith("https://"):
+                    errors.append(
+                        "A remote DECOMPUTE_LOCAL_STUDENT_BASE_URL must use https in production "
+                        "(plaintext prompts would cross the network)."
+                    )
+            # Test execution must run in a real sandbox, never bare subprocess on the request path.
+            if self.teacher_student_test_execution_enabled and self.teacher_student_sandbox_backend == "disabled":
+                errors.append(
+                    "DECOMPUTE_TS_TEST_EXECUTION requires a production-safe DECOMPUTE_TS_SANDBOX_BACKEND "
+                    "(not 'disabled') in production"
+                )
+            # Only known, production-safe sandbox backends may execute tests. 'container' (docker/podman)
+            # and 'cloudflare' (hosted) are the safe options; anything else (and an unsafe runtime) is rejected.
+            if self.teacher_student_test_execution_enabled:
+                if self.teacher_student_sandbox_backend not in {"container", "cloudflare"}:
+                    errors.append(
+                        f"DECOMPUTE_TS_SANDBOX_BACKEND={self.teacher_student_sandbox_backend!r} is not a "
+                        "production-safe sandbox; use 'container' or 'cloudflare'"
+                    )
+                if self.teacher_student_sandbox_backend == "container" and self.teacher_student_sandbox_runtime not in {"docker", "podman"}:
+                    errors.append(
+                        "DECOMPUTE_TS_SANDBOX_RUNTIME must be 'docker' or 'podman' for the container sandbox in production"
+                    )
+            # Serving the student inline on /v1/messages (DECOMPUTE_LOCAL_STUDENT_SERVE) requires the
+            # master switch AND a real verification signal — otherwise a serve would emit an UNVERIFIED
+            # answer (the no-evidence cap, 0.55, never clears the threshold, but we refuse to even risk a
+            # misconfiguration that serves unchecked). Acceptable signals: an independent judge, or test
+            # execution in a production-safe sandbox. The judge is the expected signal on the proxy path
+            # (real requests carry no tests).
+            if self.local_student_serve:
+                if not self.local_student_enabled:
+                    errors.append("DECOMPUTE_LOCAL_STUDENT_SERVE requires DECOMPUTE_LOCAL_STUDENT_ENABLED=true")
+                has_judge = self.teacher_student_judge_enabled
+                has_sandbox = self.teacher_student_test_execution_enabled and self.teacher_student_sandbox_backend in {"container", "cloudflare"}
+                if not (has_judge or has_sandbox):
+                    errors.append(
+                        "DECOMPUTE_LOCAL_STUDENT_SERVE requires a verification signal: set "
+                        "DECOMPUTE_TS_JUDGE_ENABLED=true (recommended for the proxy path) or enable test "
+                        "execution with a production-safe sandbox. Serving without verification is refused."
+                    )
+            # Distillation on Claude outputs is approved but governed: production must explicitly encode
+            # the legal/product sign-off, not just flip the allow flag (CLAUDE.md "Policy exception").
+            if self.teacher_student_allow_claude_training_targets and not self.teacher_student_claude_training_signoff:
+                errors.append(
+                    "DECOMPUTE_TS_ALLOW_CLAUDE_TRAINING_TARGETS requires DECOMPUTE_TS_CLAUDE_TRAINING_SIGNOFF "
+                    "to be set in production (records the legal/product approval)"
+                )
+            # Capture must never store raw content without a redaction mode and CCR encryption configured,
+            # mirroring the existing CCR production gate.
+            if (self.teacher_student_capture_enabled
+                    and self.teacher_student_governance_mode not in {"metadata_only", "redacted", "regulated"}):
+                errors.append(
+                    "DECOMPUTE_TS_GOVERNANCE_MODE must be one of metadata_only|redacted|regulated when capture is enabled"
+                )
+            if (self.teacher_student_capture_enabled
+                    and self.teacher_student_governance_mode == "redacted"
+                    and not self.ccr_encryption_key):
+                errors.append(
+                    "DECOMPUTE_CCR_ENCRYPTION_KEY is required when teacher-student capture stores redacted content"
+                )
             # Secret hygiene: hashing/signing peppers must never ship as the dev default in prod,
             # or device-hashes/license-hashes become forgeable and low-entropy fingerprints
             # become brute-forceable from a DB leak.

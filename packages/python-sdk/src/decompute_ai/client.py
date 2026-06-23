@@ -93,6 +93,52 @@ class Licenses(_Resource):
         return self._client.post("/v1/licenses/deactivate")
 
 
+class TeacherStudent(_Resource):
+    """Command-gated local coding student. Backs `decompute ts-run` / `ts-health` / `local-chat`."""
+
+    def health(self) -> dict[str, Any]:
+        return self._client.get("/v1/teacher_student/health")
+
+    def run(
+        self,
+        task: str,
+        *,
+        tests: str | None = None,
+        require_teacher: bool = False,
+        execute_tests: bool = False,
+        max_tokens: int = 2048,
+        temperature: float = 0.2,
+        source: str = "cli",
+        command: str = "ts-run",
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "task": task,
+            "mode": "student_first",
+            "require_teacher": require_teacher,
+            "execute_tests": execute_tests,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "source": source,
+            "command": command,
+        }
+        if tests is not None:
+            body["tests"] = tests
+        return self._client.post("/v1/teacher_student/run", body)
+
+    def local_chat(self, prompt: str, *, max_tokens: int = 2048, temperature: float = 0.2) -> dict[str, Any]:
+        return self._client.post(
+            "/v1/teacher_student/local-chat",
+            {"prompt": prompt, "max_tokens": max_tokens, "temperature": temperature, "source": "cli", "command": "local-chat"},
+        )
+
+    def summary(self) -> dict[str, Any]:
+        return self._client.get("/v1/teacher_student/summary")
+
+    def export_sft(self) -> Any:
+        """Download the SFT distillation export (NDJSON). Requires the distill:read scope."""
+        return self._client.get("/v1/teacher_student/export/sft.jsonl", raw=True)
+
+
 class Usage(_Resource):
     def summary(self) -> dict[str, Any]:
         return self._client.get("/v1/usage")
@@ -144,6 +190,7 @@ class Decompute:
         self.models = Models(self)
         self.usage = Usage(self)
         self.licenses = Licenses(self)
+        self.teacher_student = TeacherStudent(self)
 
     def headers(self) -> dict[str, str]:
         # BYOK: forward the user's own Claude key as x-api-key. When none is set we send

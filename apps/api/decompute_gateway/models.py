@@ -19,6 +19,14 @@ def utcnow() -> datetime:
 # caller bypasses detect_client(). Anything outside this set is normalized to NULL.
 CLIENT_BUCKETS = frozenset({"claude_code", "openclaw", "sdk", "other"})
 
+# Closed enum sets for the teacher-student tables, enforced at the store boundary (db.py) exactly
+# like CLIENT_BUCKETS. A value outside the set is normalized to a safe default, never persisted raw.
+TS_MODES = frozenset({"student_first", "teacher_first", "parallel", "distill"})
+TS_ROUTES = frozenset({"student_only", "teacher_corrected", "teacher_only", "student_unavailable", "disabled"})
+TS_STORAGE_MODES = frozenset({"metadata_only", "redacted", "regulated"})
+TS_GOVERNANCE_MODES = frozenset({"metadata_only", "redacted", "regulated"})
+TS_DECISIONS = frozenset({"accept_student", "escalate"})
+
 
 class Base(DeclarativeBase):
     pass
@@ -67,6 +75,12 @@ class Project(Base):
     stripe_subscription_id: Mapped[str | None] = mapped_column(String(64), index=True)
     subscription_status: Mapped[str | None] = mapped_column(String(32))  # active|trialing|past_due|canceled|...
     subscription_current_period_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Teacher-student capture consent (plan §"Minimal V1 Tables"). BOTH server config and project
+    # config must allow capture; capture_locked=true forces metadata-only regardless of opt-in.
+    teacher_student_capture_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    teacher_student_governance_mode: Mapped[str] = mapped_column(String(32), default="metadata_only", nullable=False)
+    teacher_student_capture_retention_days: Mapped[int] = mapped_column(Integer, default=30, nullable=False)
+    teacher_student_capture_locked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     __table_args__ = (
         Index("ix_projects_org_created", "org_id", "created_at"),
@@ -232,3 +246,80 @@ class AuditLog(Base):
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSONField, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     __table_args__ = (Index("ix_audit_project_created", "project_id", "created_at"),)
+
+
+# ── Teacher-student tables (plan §"Data Model And Migrations") ─────────────────
+# Default storage is metadata-only: content columns (prompts, answers, tests) stay NULL unless
+# capture is explicitly enabled at BOTH server and project level. The store boundary (db.py) is what
+# enforces this — these columns merely have room for content when governance permits it.
+
+
+class TeacherStudentRun(Base):
+    __tablename__ = "teacher_student_runs"
+    id: Mapped[str] = mapped_column(String(48), primary_key=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str | None] = mapped_column(String(200))
+    mode: Mapped[str] = mapped_column(String(32), default="student_first", nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="open", nullable=False)
+    student_model: Mapped[str | None] = mapped_column(String(128))
+    teacher_model: Mapped[str | None] = mapped_column(String(128))
+    governance_mode: Mapped[str] = mapped_column(String(32), default="metadata_only", nullable=False)
+    case_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    teacher_call_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    metadata_json: Mapped[dict[str, Any] | None] = mapped_column(JSONField)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    __table_args__ = (Index("ix_ts_runs_project_created", "project_id", "created_at"),)
+
+
+class TeacherStudentCase(Base):
+    __tablename__ = "teacher_student_cases"
+    id: Mapped[str] = mapped_column(String(48), primary_key=True)
+    run_id: Mapped[str | None] = mapped_column(ForeignKey("teacher_student_runs.id", ondelete="CASCADE"), index=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    usage_event_id: Mapped[str | None] = mapped_column(String(48), index=True)
+    request_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    session_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    client: Mapped[str | None] = mapped_column(String(32), index=True)
+    route: Mapped[str] = mapped_column(String(32), nullable=False)
+    workload_class: Mapped[str | None] = mapped_column(String(32))
+    coding_intent: Mapped[str | None] = mapped_column(String(32))
+    escalation_reason: Mapped[str | None] = mapped_column(String(64))
+    storage_mode: Mapped[str] = mapped_column(String(32), default="metadata_only", nullable=False)
+    prompt_sha256: Mapped[str | None] = mapped_column(String(64))
+    feature_json: Mapped[dict[str, Any] | None] = mapped_column(JSONField)
+    # Content columns — NULL in metadata-only mode (the default).
+    student_answer: Mapped[str | None] = mapped_column(Text)
+    teacher_answer: Mapped[str | None] = mapped_column(Text)
+    final_answer: Mapped[str | None] = mapped_column(Text)
+    tests_json: Mapped[dict[str, Any] | None] = mapped_column(JSONField)
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    student_output_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    teacher_output_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    student_latency_ms: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    teacher_latency_ms: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    __table_args__ = (
+        Index("ix_ts_cases_project_created", "project_id", "created_at"),
+        Index("ix_ts_cases_run_created", "run_id", "created_at"),
+    )
+
+
+class TeacherStudentVerdict(Base):
+    __tablename__ = "teacher_student_verdicts"
+    id: Mapped[str] = mapped_column(String(48), primary_key=True)
+    case_id: Mapped[str] = mapped_column(ForeignKey("teacher_student_cases.id", ondelete="CASCADE"), index=True)
+    verifier_version: Mapped[str | None] = mapped_column(String(32))
+    decision: Mapped[str] = mapped_column(String(32), nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    threshold: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    escalated: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    escalation_reason: Mapped[str | None] = mapped_column(String(64))
+    tests_ran: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    tests_passed: Mapped[bool | None] = mapped_column(Boolean)
+    sandbox_backend: Mapped[str | None] = mapped_column(String(32))
+    judge_model: Mapped[str | None] = mapped_column(String(128))
+    layers_json: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONField)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    __table_args__ = (Index("ix_ts_verdicts_case", "case_id"),)
