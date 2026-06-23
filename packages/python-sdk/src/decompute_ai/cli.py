@@ -12,6 +12,7 @@ from typing import Any, Optional
 
 import typer
 from rich import print
+from rich.panel import Panel
 from rich.table import Table
 
 from .client import Decompute
@@ -184,6 +185,128 @@ student_app = typer.Typer(help="Manage the local coding-student runtime (llama.c
 app.add_typer(student_app, name="student")
 
 
+# ── Curated student-model catalog ─────────────────────────────────────────────
+# Top open coding models, with the quant that gives the best quality-per-GB at each RAM tier. `gb` is
+# the on-disk weight size; the runtime needs ~1.6x that resident, so `min_ram_gb` is the smallest
+# machine that runs it WITHOUT swap thrash (weight*1.6 + 6 GB OS reserve, rounded). `hf` is the
+# llama.cpp `-hf` spec (repo:quant) — llama-server downloads it on first use and caches it.
+# Ordered small→large so the picker can recommend the best model that fits.
+STUDENT_MODELS = [
+    {
+        "id": "qwen2.5-coder-1.5b",
+        "name": "Qwen2.5-Coder 1.5B",
+        "hf": "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF:Q5_K_M",
+        "gb": 1.3, "min_ram_gb": 8,
+        "note": "Tiny + fast. Good for simple patches/lint on 8 GB machines; weakest quality.",
+    },
+    {
+        "id": "qwen2.5-coder-3b",
+        "name": "Qwen2.5-Coder 3B",
+        "hf": "Qwen/Qwen2.5-Coder-3B-Instruct-GGUF:Q4_K_M",
+        "gb": 2.0, "min_ram_gb": 8,
+        "note": "Solid small coder. The safe default for 8–16 GB; coherent code, low memory.",
+    },
+    {
+        "id": "qwen2.5-coder-7b",
+        "name": "Qwen2.5-Coder 7B",
+        "hf": "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF:Q5_K_M",
+        "gb": 5.4, "min_ram_gb": 16,
+        "note": "Best quality-per-GB on 16 GB. Strong coding; runs on Metal/GPU at ~15 tok/s. Recommended for 16 GB.",
+    },
+    {
+        "id": "llama3.1-8b",
+        "name": "Llama 3.1 8B Instruct",
+        "hf": "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF:Q5_K_M",
+        "gb": 5.7, "min_ram_gb": 16,
+        "note": "General-purpose 8B. Decent code, very good prose/explanations. Alternative to Qwen-7B on 16 GB.",
+    },
+    {
+        "id": "qwen2.5-coder-14b",
+        "name": "Qwen2.5-Coder 14B",
+        "hf": "Qwen/Qwen2.5-Coder-14B-Instruct-GGUF:Q4_K_M",
+        "gb": 9.0, "min_ram_gb": 24,
+        "note": "Noticeably stronger coding. Needs 24 GB+ to avoid swap. Great on 32 GB Macs.",
+    },
+    {
+        "id": "qwen2.5-coder-32b",
+        "name": "Qwen2.5-Coder 32B",
+        "hf": "Qwen/Qwen2.5-Coder-32B-Instruct-GGUF:Q4_K_M",
+        "gb": 20.0, "min_ram_gb": 48,
+        "note": "Near-frontier local coding. For 48 GB+ / Mac Studio-class machines only.",
+    },
+]
+
+
+def _total_ram_gb() -> int:
+    """Total physical RAM in GB, cross-platform (mirrors start_student_llama_cpp.sh)."""
+    try:
+        if sys.platform == "darwin":
+            out = subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip()
+            return int(out) // (1024 ** 3)
+        # Linux: MemTotal in kB.
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal"):
+                    return int(line.split()[1]) // (1024 ** 2)
+    except Exception:
+        pass
+    return 0  # unknown -> treat as "can't verify", never block
+
+
+def _fits_ram(model: dict, total_gb: int) -> bool:
+    """True if the model runs without swap thrash on a machine with total_gb RAM. total_gb==0 (unknown)
+    is permissive (we can't verify, so we warn rather than block)."""
+    return total_gb == 0 or total_gb >= model["min_ram_gb"]
+
+
+def _model_search_dirs() -> list[Path]:
+    """All the places a GGUF might already live, so we never re-download one the user already has:
+    the llama.cpp -hf cache, the conventional ~/models, an env override, and HF's hub cache."""
+    dirs = [Path.home() / "models", Path.home() / ".cache" / "huggingface" / "hub"]
+    if sys.platform == "darwin":
+        dirs.append(Path.home() / "Library" / "Caches" / "llama.cpp")
+    dirs.append(Path(os.getenv("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "llama.cpp")
+    if os.getenv("DECOMPUTE_MODELS_DIR"):
+        dirs.insert(0, Path(os.environ["DECOMPUTE_MODELS_DIR"]))
+    # De-dup while preserving order.
+    seen: set[str] = set()
+    out: list[Path] = []
+    for d in dirs:
+        key = str(d)
+        if key not in seen:
+            seen.add(key)
+            out.append(d)
+    return out
+
+
+def _downloaded_model_files() -> list[str]:
+    """Lowercased GGUF filenames already on disk across the known model dirs (for reuse-detection).
+    Searches recursively so HF's nested hub cache layout is covered too."""
+    names: list[str] = []
+    for d in _model_search_dirs():
+        if not d.is_dir():
+            continue
+        try:
+            names.extend(p.name.lower() for p in d.rglob("*.gguf"))
+        except Exception:
+            continue
+    return names
+
+
+def _is_downloaded(model: dict, cached: list[str]) -> bool:
+    """Best-effort: is this catalog model already on disk? GGUF filenames vary by downloader (llama.cpp
+    -hf vs a manual HF download), so match on the model's identifying tokens + the quant rather than an
+    exact name. E.g. repo 'Qwen/Qwen2.5-Coder-7B-Instruct-GGUF:Q5_K_M' must match the file
+    'qwen2.5-coder-7b-instruct-q5_k_m-00001-of-00002.gguf'."""
+    repo, _, quant = model["hf"].partition(":")
+    stem = repo.split("/")[-1].lower()
+    # Drop a trailing '-gguf' (repo naming) that never appears in the weight filename.
+    stem = stem[:-5] if stem.endswith("-gguf") else stem
+    quant = quant.lower().replace("_", "_")  # keep as-is; files use the same underscore form
+    # Require the model stem AND (if a quant was specified) the quant token to both appear.
+    return any(stem in f and (not quant or quant in f) for f in cached)
+
+
 def _student_base_url() -> str:
     return os.getenv("DECOMPUTE_LOCAL_STUDENT_BASE_URL", "http://127.0.0.1:18080/v1")
 
@@ -221,10 +344,21 @@ def student_start(
     weight_gb: float = typer.Option(0.0, "--weight-gb", help="Model file size in GB for the RAM feasibility check."),
     force: bool = typer.Option(False, "--force", help="Bypass the RAM feasibility check (risk: swap thrash)."),
 ):
-    """Start the local student via scripts/start_student_llama_cpp.sh (user-managed, no auto-download)."""
+    """Start the local student via scripts/start_student_llama_cpp.sh (user-managed, no auto-download).
+
+    Uses the model you set with `decompute student models` unless you pass --model."""
     if _student_alive():
         print("[yellow]local student already reachable; nothing to do.[/yellow]")
         return
+    # Fall back to the model/size chosen via the wizard (config) when not given explicitly.
+    cfg_student = load_config().get("student", {}) if not model else {}
+    model = model or cfg_student.get("model")
+    if weight_gb == 0.0:
+        weight_gb = float(cfg_student.get("weight_gb", 0.0) or 0.0)
+    if not model:
+        print("[yellow]No student model set.[/yellow] Run [bold]decompute student models[/bold] to pick + download one,")
+        print("  or pass [bold]--model <hf-repo:quant>[/bold].")
+        raise typer.Exit(2)
     script = Path(__file__).resolve().parents[4] / "scripts" / "start_student_llama_cpp.sh"
     if not script.is_file():
         print(f"[red]launcher not found:[/red] {script}")
@@ -284,30 +418,192 @@ def student_smoke(prompt: str = typer.Argument("Write a Python add(a, b) functio
         raise typer.Exit(1)
 
 
+def _render_model_catalog(total_gb: int, cached: list[str]) -> None:
+    """Print the catalog as a table: which fit this machine + which are already downloaded."""
+    t = Table(title="Local coding-student models")
+    t.add_column("#", justify="right")
+    t.add_column("Model")
+    t.add_column("Size", justify="right")
+    t.add_column("Min RAM", justify="right")
+    t.add_column("Status")
+    t.add_column("Best for")
+    for i, m in enumerate(STUDENT_MODELS, 1):
+        fits = _fits_ram(m, total_gb)
+        have = _is_downloaded(m, cached)
+        if have:
+            status = "[green]downloaded[/green]"
+        elif not fits:
+            status = f"[red]needs {m['min_ram_gb']} GB[/red]"
+        else:
+            status = "[cyan]available[/cyan]"
+        row_note = m["note"]
+        t.add_row(str(i), m["name"], f"{m['gb']:.1f} GB", f"{m['min_ram_gb']} GB", status, row_note)
+    print(t)
+
+
+def _setup_student_model(model_id: Optional[str] = None, *, yes: bool = False) -> Optional[dict]:
+    """Shared wizard: show the catalog, pick a model that fits, download it, return the chosen entry.
+
+    Returns the catalog dict (with an extra "hf" used by `student start`), or None if the user backed
+    out / a custom spec was used. Reuses an already-downloaded model without re-fetching."""
+    total_gb = _total_ram_gb()
+    cached = _downloaded_model_files()
+    ram_str = f"{total_gb} GB" if total_gb else "unknown"
+    print(f"\n[bold]Choose a local student model[/bold]  (this machine: ~[cyan]{ram_str}[/cyan] RAM)")
+    _render_model_catalog(total_gb, cached)
+
+    # Recommend the strongest model that FITS and isn't already-downloaded-and-better.
+    fitting = [m for m in STUDENT_MODELS if _fits_ram(m, total_gb)]
+    recommended = fitting[-1] if fitting else STUDENT_MODELS[0]
+    already = next((m for m in STUDENT_MODELS if _is_downloaded(m, cached) and _fits_ram(m, total_gb)), None)
+    if already:
+        print(f"\n[green]✓ Already downloaded and fits:[/green] [bold]{already['name']}[/bold] — you can use it right away.")
+    print(f"[dim]Recommended for your RAM:[/dim] [bold]{recommended['name']}[/bold]")
+
+    # Resolve the selection.
+    chosen: Optional[dict] = None
+    if model_id:
+        chosen = next((m for m in STUDENT_MODELS if m["id"] == model_id), None)
+        if chosen is None:
+            print(f"[yellow]Unknown model id '{model_id}'.[/yellow] Pick from the table, or pass a custom hf spec to `student start --model`.")
+            return None
+    elif yes:
+        chosen = already or recommended
+    else:
+        default_idx = STUDENT_MODELS.index(already or recommended) + 1
+        raw = typer.prompt(
+            f"Pick a model number (1-{len(STUDENT_MODELS)}), or 'q' to skip",
+            default=str(default_idx),
+        ).strip().lower()
+        if raw in ("q", "quit", ""):
+            print("Skipped. Run [bold]decompute student models[/bold] any time to set one up.")
+            return None
+        if not raw.isdigit() or not (1 <= int(raw) <= len(STUDENT_MODELS)):
+            print("[yellow]Not a valid choice.[/yellow]")
+            return None
+        chosen = STUDENT_MODELS[int(raw) - 1]
+
+    # Feasibility warning (never a hard block — the user may know better / accept swap).
+    if not _fits_ram(chosen, total_gb):
+        print(f"[red]⚠ {chosen['name']} needs ~{chosen['min_ram_gb']} GB; this machine has ~{ram_str}.[/red]")
+        print("  It will likely thrash swap and slow/freeze the machine. Pick a smaller model unless you're sure.")
+        if not (yes or typer.confirm("Continue anyway?", default=False)):
+            return None
+
+    # Reuse if already downloaded.
+    if _is_downloaded(chosen, cached):
+        print(f"[green]✓ {chosen['name']} is already downloaded[/green] — no download needed.")
+        return chosen
+
+    # Download (via llama-server's -hf cache). Requires llama.cpp.
+    if shutil.which("llama-server") is None:
+        print("[red]llama-server not found.[/red] Install llama.cpp first:  [bold]brew install llama.cpp[/bold]")
+        print(f"  Then re-run, or download manually with:  llama-server -hf {chosen['hf']}")
+        return None
+    print(f"\nAbout to download [bold]{chosen['name']}[/bold] (~{chosen['gb']:.1f} GB) from Hugging Face.")
+    if not (yes or typer.confirm("Download now?", default=True)):
+        print("Aborted. Nothing downloaded.")
+        return None
+    print("[dim]downloading (llama.cpp caches it; this can take a while on a slow connection)…[/dim]")
+    # `llama-server -hf <spec> --help`-style fetch isn't available; the canonical fetch is to start it
+    # briefly. We hand off to `student start`, which downloads-on-first-use then serves.
+    rc = _download_via_llama(chosen["hf"])
+    if rc != 0:
+        print(f"[red]download failed (exit {rc}).[/red] You can retry with:  llama-server -hf {chosen['hf']}")
+        return None
+    print(f"[green]✓ {chosen['name']} downloaded.[/green]")
+    return chosen
+
+
+def _download_via_llama(hf_spec: str) -> int:
+    """Fetch a model into the llama.cpp cache without leaving a server running. We start llama-server
+    with -hf (which downloads), wait until it's serving, then stop it. Returns 0 on success."""
+    import signal as _signal
+
+    log = _student_pidfile().with_name("student-download.log")
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with open(log, "ab") as lf:
+        proc = subprocess.Popen(
+            ["llama-server", "-hf", hf_spec, "--host", "127.0.0.1", "--port", "18099"],
+            stdout=lf, stderr=lf, start_new_session=True,
+        )
+    try:
+        import httpx
+        # Poll up to 30 min (large model on a slow link); the server only listens once weights are loaded.
+        for _ in range(360):
+            if proc.poll() is not None:
+                return proc.returncode or 1  # exited before serving -> download/parse error
+            try:
+                if httpx.get("http://127.0.0.1:18099/models", timeout=2.0).status_code < 400:
+                    return 0  # serving == download complete
+            except Exception:
+                pass
+            time.sleep(5)
+        return 1  # timed out
+    finally:
+        try:
+            os.killpg(os.getpgid(proc.pid), _signal.SIGTERM)
+        except Exception:
+            proc.terminate()
+
+
+@student_app.command("models")
+def student_models(
+    model_id: Optional[str] = typer.Option(None, "--model", help="Pick by catalog id (skip the prompt)."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Auto-pick the recommended model + download without prompts."),
+):
+    """Browse + download a local coding-student model (RAM-aware, reuses already-downloaded models).
+
+    Shows the top open coding models, which fit your RAM, and which you already have — then downloads
+    your pick and points the gateway at it."""
+    chosen = _setup_student_model(model_id, yes=yes)
+    if chosen is None:
+        return
+    # Persist the choice so `student start` / the gateway use it.
+    save_config({"student": {"model": chosen["hf"], "weight_gb": chosen["gb"]}})
+    print(f"\n[green]✓ Set {chosen['name']} as your student model.[/green]")
+    print(f"  Start it:   [bold]decompute student start[/bold]")
+    print(f"  Then:       [bold]export DECOMPUTE_LOCAL_STUDENT_ENABLED=true[/bold]  and  [bold]decompute ts-health[/bold]")
+
+
 @student_app.command("install")
-def student_install(target: str = typer.Argument("gemma-coder")):
-    """Print instructions to install a local backend + model (no automatic download)."""
-    print("[bold]Local student install (manual — nothing is downloaded for you):[/bold]")
-    print("  1. Install llama.cpp:  brew install llama.cpp   (or build from source)")
-    print("  2. Pick a model that FITS your RAM. On a 16 GB Mac, a 12B coder will NOT fit;")
-    print("     use a small coder (~3-4 GB quant) or route coding tasks to Claude.")
-    print("  3. Start it:  decompute student start --model <hf-repo:quant> --weight-gb <size>")
-    print(f"  4. Point the gateway at it:  export DECOMPUTE_LOCAL_STUDENT_BASE_URL={_student_base_url()}")
-    print("  5. Enable the feature:  export DECOMPUTE_LOCAL_STUDENT_ENABLED=true")
+def student_install(target: Optional[str] = typer.Argument(None)):
+    """Set up a local student model (RAM-aware wizard). Alias of `decompute student models`."""
+    student_models(model_id=target)
 
 
 @student_app.command("pull")
-def student_pull(model: str = typer.Argument(...), size_gb: float = typer.Option(0.0, "--size-gb")):
-    """Download a model with confirmation (shows name + size first; never silent)."""
-    print(f"about to pull model: [bold]{model}[/bold]" + (f"  (~{size_gb} GB)" if size_gb else ""))
-    if not typer.confirm("download now?"):
-        print("aborted.")
+def student_pull(
+    model: str = typer.Argument(..., help="A catalog id, or a raw llama.cpp hf spec (repo:quant)."),
+    size_gb: float = typer.Option(0.0, "--size-gb", help="Weight size in GB (for the RAM check on a custom spec)."),
+):
+    """Download a specific model now (catalog id or a custom hf spec); reuses it if already present."""
+    # A catalog id -> go through the RAM-aware wizard path.
+    if any(m["id"] == model for m in STUDENT_MODELS):
+        student_models(model_id=model)
+        return
+    # A raw hf spec (advanced): confirm + download directly, with a best-effort reuse check.
+    cached = _downloaded_model_files()
+    repo_stem = model.partition(":")[0].split("/")[-1].lower()
+    if any(repo_stem in f for f in cached):
+        print(f"[green]✓ {model} appears already downloaded[/green] — nothing to do.")
+        return
+    print(f"About to download custom model: [bold]{model}[/bold]" + (f"  (~{size_gb} GB)" if size_gb else ""))
+    if not typer.confirm("Download now?", default=True):
+        print("Aborted.")
         raise typer.Exit(0)
     if shutil.which("llama-server") is None:
-        print("[red]llama-server not found; install llama.cpp first.[/red]")
+        print("[red]llama-server not found; install llama.cpp first (brew install llama.cpp).[/red]")
         raise typer.Exit(3)
-    # llama.cpp downloads on first -hf use; we just confirm and hand off to `start`.
-    print("run: [bold]decompute student start --model " + model + "[/bold] to fetch + launch.")
+    rc = _download_via_llama(model)
+    if rc != 0:
+        print(f"[red]download failed (exit {rc}).[/red]")
+        raise typer.Exit(rc)
+    student_cfg = {"model": model}
+    if size_gb:
+        student_cfg["weight_gb"] = size_gb
+    save_config({"student": student_cfg})
+    print(f"[green]✓ downloaded + set as student model.[/green] Start it with [bold]decompute student start[/bold].")
 
 
 def _set_dotted(updates: dict, dotted: str, value) -> dict:
@@ -813,9 +1109,43 @@ def init(
         print("For a VS Code project: [bold]decompute vscode .[/bold]")
     else:
         print("Next: [bold]decompute claude[/bold] when you're ready.")
-    # Point first-time users straight at the dashboard — this is the #1 thing people couldn't find.
-    print(f"\n[bold]Your savings dashboard:[/bold] [bold cyan]{base_url.rstrip('/')}/dashboard[/bold cyan]")
-    print("  Open it any time with [bold]decompute dashboard[/bold].")
+
+    # 7. Optional: set up a local coding-student model (the teacher-student feature). Opt-in, since it
+    #    downloads weights and needs llama.cpp — default off so init stays fast for everyone.
+    if not yes:
+        print("\n[bold]Optional — local coding student[/bold]")
+        print("  Run small coding tasks on a local model (verified, falls back to Claude) to cut cost.")
+        # EOF-resilient: a piped/non-interactive init that runs out of input just skips this (default no),
+        # never crashing — the student is always set up later with `decompute student models`.
+        try:
+            want_student = typer.confirm("Set up a local student model now? (downloads weights)", default=False)
+        except (EOFError, typer.Abort):
+            want_student = False
+        if want_student:
+            chosen = _setup_student_model()
+            if chosen is not None:
+                save_config({"student": {"model": chosen["hf"], "weight_gb": chosen["gb"]}})
+                print(f"  Start it with [bold]decompute student start[/bold], then set [bold]DECOMPUTE_LOCAL_STUDENT_ENABLED=true[/bold].")
+        else:
+            print("  You can do this any time: [bold]decompute student models[/bold].")
+
+    # Point first-time users straight at the dashboard — this is the #1 thing people couldn't find,
+    # so make it an unmissable callout AND offer to open it right now.
+    dash_url = base_url.rstrip("/") + "/dashboard"
+    print()
+    print(Panel.fit(
+        f"[bold]Your savings dashboard[/bold]\n[bold cyan]{dash_url}[/bold cyan]\n"
+        f"[dim]Open it any time with [bold]decompute dashboard[/bold][/dim]",
+        border_style="cyan", title="📊 Dashboard", title_align="left",
+    ))
+    # If the gateway is up, offer to open it now so first-timers actually see it once.
+    # In non-interactive (--yes) / piped runs we never spawn a browser — just leave the URL above.
+    if _gateway_running(base_url) and not yes:
+        try:
+            if typer.confirm("Open your dashboard in the browser now?", default=True):
+                _open(dash_url)
+        except (EOFError, typer.Abort):
+            pass
 
 
 def _check_anthropic_key(key: str) -> str:
@@ -1186,10 +1516,14 @@ def doctor(
         for c in checks:
             table.add_row(str(c["check"]), "[green]ok[/green]" if c["ok"] else "[red]FAIL[/red]", str(c["detail"]))
         print(table)
-        # Always surface the dashboard URL — first-time users often can't find it otherwise.
+        # Always surface the dashboard URL prominently — first-time users often can't find it otherwise.
         if gateway_ok:
-            print(f"\n[bold]Dashboard:[/bold] [bold cyan]{_dashboard_url()}[/bold cyan]  "
-                  "[dim](open it with `decompute dashboard`)[/dim]")
+            print()
+            print(Panel.fit(
+                f"[bold]Your savings dashboard[/bold]\n[bold cyan]{_dashboard_url()}[/bold cyan]\n"
+                f"[dim]Open it any time with [bold]decompute dashboard[/bold] (or `decompute doctor --open`)[/dim]",
+                border_style="cyan", title="📊 Dashboard", title_align="left",
+            ))
             if open_dashboard:
                 print("[dim]opening dashboard in your browser…[/dim]")
                 _open(_dashboard_url())

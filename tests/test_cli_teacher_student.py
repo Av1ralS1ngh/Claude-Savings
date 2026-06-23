@@ -14,8 +14,54 @@ runner = CliRunner()
 def test_student_subcommands_registered():
     result = runner.invoke(app, ["student", "--help"])
     assert result.exit_code == 0
-    for cmd in ("status", "start", "stop", "smoke", "install", "pull"):
+    for cmd in ("status", "start", "stop", "smoke", "install", "pull", "models"):
         assert cmd in result.output
+
+
+def test_student_models_catalog_is_well_formed():
+    """Every catalog entry has the fields the wizard needs, ordered small->large, with valid hf specs."""
+    from decompute_ai.cli import STUDENT_MODELS
+
+    assert len(STUDENT_MODELS) >= 4
+    sizes = [m["gb"] for m in STUDENT_MODELS]
+    assert sizes == sorted(sizes), "catalog must be ordered smallest-first for the recommender"
+    ids = [m["id"] for m in STUDENT_MODELS]
+    assert len(ids) == len(set(ids)), "model ids must be unique"
+    for m in STUDENT_MODELS:
+        assert ":" in m["hf"], f"{m['id']} hf spec must be repo:quant"
+        assert m["gb"] > 0 and m["min_ram_gb"] >= m["gb"], f"{m['id']} min_ram must exceed weight"
+        assert m["note"]
+
+
+def test_fits_ram_logic():
+    from decompute_ai.cli import _fits_ram
+
+    big = {"min_ram_gb": 48}
+    small = {"min_ram_gb": 8}
+    assert _fits_ram(small, 16) is True
+    assert _fits_ram(big, 16) is False
+    assert _fits_ram(big, 0) is True  # unknown RAM is permissive (warn, never block)
+
+
+def test_is_downloaded_matches_real_filename_variants():
+    """Reuse-detection must match a manually-downloaded GGUF whose name differs from the hf spec —
+    e.g. repo '...-7B-Instruct-GGUF:Q5_K_M' vs file 'qwen2.5-coder-7b-instruct-q5_k_m-00001-of-00002.gguf'."""
+    from decompute_ai.cli import _is_downloaded
+
+    model = {"hf": "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF:Q5_K_M"}
+    cached = ["qwen2.5-coder-7b-instruct-q5_k_m-00001-of-00002.gguf"]
+    assert _is_downloaded(model, cached) is True
+    # Wrong quant must NOT match.
+    assert _is_downloaded(model, ["qwen2.5-coder-7b-instruct-q4_k_m.gguf"]) is False
+    # Different model must NOT match.
+    assert _is_downloaded(model, ["llama-3.1-8b-instruct-q5_k_m.gguf"]) is False
+    assert _is_downloaded(model, []) is False
+
+
+def test_student_models_help_lists_models_command():
+    result = runner.invoke(app, ["student", "models", "--help"])
+    assert result.exit_code == 0
+    assert "--model" in result.output and "--yes" in result.output
 
 
 def test_ts_commands_registered():
@@ -44,12 +90,13 @@ def test_student_status_when_reachable(monkeypatch):
     assert "reachable" in result.output
 
 
-def test_student_install_prints_manual_steps_no_download():
-    result = runner.invoke(app, ["student", "install"])
+def test_student_install_opens_catalog_and_never_downloads_without_consent():
+    # `install` is now the RAM-aware model wizard. Answering 'q' at the picker exits with NO download.
+    result = runner.invoke(app, ["student", "install"], input="q\n")
     assert result.exit_code == 0
-    # The plan forbids auto-download: install is guidance only.
-    assert "nothing is downloaded" in result.output.lower()
-    assert "16 GB" in result.output  # the RAM warning is surfaced
+    # The catalog (model names + RAM tiers) is shown, and nothing is downloaded without an explicit pick.
+    assert "Qwen2.5-Coder" in result.output
+    assert "Min RAM" in result.output
 
 
 def test_student_pull_aborts_without_confirmation():

@@ -129,7 +129,7 @@ def load_config() -> dict:
 
 def _render_toml(cfg: dict) -> str:
     lines: list[str] = []
-    for section in ("gateway", "privacy", "ccr", "claude", "license", "telemetry"):
+    for section in ("gateway", "privacy", "ccr", "claude", "license", "telemetry", "student"):
         sec = cfg.get(section) or {}
         if not sec:
             continue
