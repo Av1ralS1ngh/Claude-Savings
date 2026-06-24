@@ -64,6 +64,25 @@ def test_student_models_help_lists_models_command():
     assert "--model" in result.output and "--yes" in result.output
 
 
+def test_find_local_model_path_picks_split_part_one(tmp_path, monkeypatch):
+    """An already-downloaded model must resolve to its on-disk PATH (so `student start` loads it with
+    -m instead of re-downloading via -hf). For a split GGUF, part 1 is returned."""
+    import decompute_ai.cli as cli
+
+    # A fake models dir with a split Qwen-7B (parts out of order on disk).
+    (tmp_path / "qwen2.5-coder-7b-instruct-q5_k_m-00002-of-00002.gguf").write_bytes(b"GGUF")
+    (tmp_path / "qwen2.5-coder-7b-instruct-q5_k_m-00001-of-00002.gguf").write_bytes(b"GGUF")
+    monkeypatch.setattr(cli, "_model_search_dirs", lambda: [tmp_path])
+
+    model = next(m for m in cli.STUDENT_MODELS if m["id"] == "qwen2.5-coder-7b")
+    p = cli._find_local_model_path(model)
+    assert p is not None and p.name.endswith("00001-of-00002.gguf")  # part 1, not part 2
+
+    # A model that's NOT on disk resolves to None.
+    other = next(m for m in cli.STUDENT_MODELS if m["id"] == "qwen2.5-coder-32b")
+    assert cli._find_local_model_path(other) is None
+
+
 def test_ts_commands_registered():
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0

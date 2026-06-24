@@ -279,18 +279,32 @@ def _model_search_dirs() -> list[Path]:
     return out
 
 
-def _downloaded_model_files() -> list[str]:
-    """Lowercased GGUF filenames already on disk across the known model dirs (for reuse-detection).
+def _downloaded_model_paths() -> list[Path]:
+    """GGUF file paths already on disk across the known model dirs (for reuse-detection).
     Searches recursively so HF's nested hub cache layout is covered too."""
-    names: list[str] = []
+    paths: list[Path] = []
     for d in _model_search_dirs():
         if not d.is_dir():
             continue
         try:
-            names.extend(p.name.lower() for p in d.rglob("*.gguf"))
+            paths.extend(d.rglob("*.gguf"))
         except Exception:
             continue
-    return names
+    return paths
+
+
+def _downloaded_model_files() -> list[str]:
+    """Lowercased GGUF filenames already on disk (thin wrapper over _downloaded_model_paths)."""
+    return [p.name.lower() for p in _downloaded_model_paths()]
+
+
+def _model_tokens(model: dict) -> tuple[str, str]:
+    """The (stem, quant) tokens that identify a catalog model in a filename. E.g. repo
+    'Qwen/Qwen2.5-Coder-7B-Instruct-GGUF:Q5_K_M' -> ('qwen2.5-coder-7b-instruct', 'q5_k_m')."""
+    repo, _, quant = model["hf"].partition(":")
+    stem = repo.split("/")[-1].lower()
+    stem = stem[:-5] if stem.endswith("-gguf") else stem  # repo naming suffix, never in the weight file
+    return stem, quant.lower()
 
 
 def _is_downloaded(model: dict, cached: list[str]) -> bool:
@@ -298,13 +312,21 @@ def _is_downloaded(model: dict, cached: list[str]) -> bool:
     -hf vs a manual HF download), so match on the model's identifying tokens + the quant rather than an
     exact name. E.g. repo 'Qwen/Qwen2.5-Coder-7B-Instruct-GGUF:Q5_K_M' must match the file
     'qwen2.5-coder-7b-instruct-q5_k_m-00001-of-00002.gguf'."""
-    repo, _, quant = model["hf"].partition(":")
-    stem = repo.split("/")[-1].lower()
-    # Drop a trailing '-gguf' (repo naming) that never appears in the weight filename.
-    stem = stem[:-5] if stem.endswith("-gguf") else stem
-    quant = quant.lower().replace("_", "_")  # keep as-is; files use the same underscore form
-    # Require the model stem AND (if a quant was specified) the quant token to both appear.
+    stem, quant = _model_tokens(model)
     return any(stem in f and (not quant or quant in f) for f in cached)
+
+
+def _find_local_model_path(model: dict) -> Optional[Path]:
+    """The on-disk path of an already-downloaded catalog model, so `student start` can launch it with
+    `-m <path>` (which uses the local file) instead of `-hf <repo>` (which re-downloads to a cache).
+    For a split GGUF, returns part 1 (`...-00001-of-...`), which llama.cpp loads with its siblings."""
+    stem, quant = _model_tokens(model)
+    matches = [p for p in _downloaded_model_paths()
+               if stem in p.name.lower() and (not quant or quant in p.name.lower())]
+    if not matches:
+        return None
+    # Prefer the first split part; else the single file. Sorting puts '-00001-of-' before '-00002-of-'.
+    return sorted(matches, key=lambda p: p.name.lower())[0]
 
 
 def _student_base_url() -> str:
@@ -353,18 +375,28 @@ def student_start(
     # Fall back to the model/size chosen via the wizard (config) when not given explicitly.
     cfg_student = load_config().get("student", {}) if not model else {}
     model = model or cfg_student.get("model")
+    model_path = None if model and not cfg_student else cfg_student.get("model_path")
     if weight_gb == 0.0:
         weight_gb = float(cfg_student.get("weight_gb", 0.0) or 0.0)
-    if not model:
+    if not model and not model_path:
         print("[yellow]No student model set.[/yellow] Run [bold]decompute student models[/bold] to pick + download one,")
         print("  or pass [bold]--model <hf-repo:quant>[/bold].")
         raise typer.Exit(2)
+    # If the wizard found the model on disk, load that file directly (no re-download via -hf).
+    # Re-resolve the path at start time in case the saved one moved.
+    if model_path and not Path(model_path).is_file():
+        catalog = next((m for m in STUDENT_MODELS if m["hf"] == model), None)
+        repath = _find_local_model_path(catalog) if catalog else None
+        model_path = str(repath) if repath else None
     script = Path(__file__).resolve().parents[4] / "scripts" / "start_student_llama_cpp.sh"
     if not script.is_file():
         print(f"[red]launcher not found:[/red] {script}")
         raise typer.Exit(3)
     env = {**os.environ, "PORT": str(port), "WEIGHT_GB": str(weight_gb), "FORCE": "1" if force else "0"}
-    if model:
+    if model_path:
+        env["MODEL_PATH"] = model_path
+        print(f"[dim]loading local file: {model_path}[/dim]")
+    elif model:
         env["MODEL"] = model
     pidfile = _student_pidfile()
     pidfile.parent.mkdir(parents=True, exist_ok=True)
@@ -490,10 +522,13 @@ def _setup_student_model(model_id: Optional[str] = None, *, yes: bool = False) -
         if not (yes or typer.confirm("Continue anyway?", default=False)):
             return None
 
-    # Reuse if already downloaded.
-    if _is_downloaded(chosen, cached):
+    # Reuse if already downloaded — and record the actual file path so `student start` loads it
+    # directly (-m <path>) instead of re-fetching via -hf.
+    local_path = _find_local_model_path(chosen)
+    if local_path is not None:
         print(f"[green]✓ {chosen['name']} is already downloaded[/green] — no download needed.")
-        return chosen
+        print(f"  [dim]using {local_path}[/dim]")
+        return {**chosen, "local_path": str(local_path)}
 
     # Download (via llama-server's -hf cache). Requires llama.cpp.
     if shutil.which("llama-server") is None:
@@ -559,8 +594,12 @@ def student_models(
     chosen = _setup_student_model(model_id, yes=yes)
     if chosen is None:
         return
-    # Persist the choice so `student start` / the gateway use it.
-    save_config({"student": {"model": chosen["hf"], "weight_gb": chosen["gb"]}})
+    # Persist the choice so `student start` / the gateway use it. local_path (when the model was found
+    # on disk) lets start load the file directly instead of re-downloading via -hf.
+    student_cfg = {"model": chosen["hf"], "weight_gb": chosen["gb"]}
+    if chosen.get("local_path"):
+        student_cfg["model_path"] = chosen["local_path"]
+    save_config({"student": student_cfg})
     print(f"\n[green]✓ Set {chosen['name']} as your student model.[/green]")
     print(f"  Start it:   [bold]decompute student start[/bold]")
     print(f"  Then:       [bold]export DECOMPUTE_LOCAL_STUDENT_ENABLED=true[/bold]  and  [bold]decompute ts-health[/bold]")
@@ -1124,7 +1163,10 @@ def init(
         if want_student:
             chosen = _setup_student_model()
             if chosen is not None:
-                save_config({"student": {"model": chosen["hf"], "weight_gb": chosen["gb"]}})
+                student_cfg = {"model": chosen["hf"], "weight_gb": chosen["gb"]}
+                if chosen.get("local_path"):
+                    student_cfg["model_path"] = chosen["local_path"]
+                save_config({"student": student_cfg})
                 print(f"  Start it with [bold]decompute student start[/bold], then set [bold]DECOMPUTE_LOCAL_STUDENT_ENABLED=true[/bold].")
         else:
             print("  You can do this any time: [bold]decompute student models[/bold].")

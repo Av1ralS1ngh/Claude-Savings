@@ -27,11 +27,16 @@ set -euo pipefail
 PORT="${PORT:-18080}"
 CTX="${CTX:-32768}"
 MODEL="${MODEL:-${DECOMPUTE_LOCAL_STUDENT_MODEL:-}}"
+MODEL_PATH="${MODEL_PATH:-}"          # a local .gguf file -> loaded with -m (no download)
 WEIGHT_GB="${WEIGHT_GB:-0}"
 FORCE="${FORCE:-0}"
 
-if [[ -z "${MODEL}" ]]; then
-  echo "error: set MODEL=<hf-repo:quant> or DECOMPUTE_LOCAL_STUDENT_MODEL" >&2
+if [[ -z "${MODEL}" && -z "${MODEL_PATH}" ]]; then
+  echo "error: set MODEL=<hf-repo:quant> (download) or MODEL_PATH=<file.gguf> (local), or DECOMPUTE_LOCAL_STUDENT_MODEL" >&2
+  exit 2
+fi
+if [[ -n "${MODEL_PATH}" && ! -f "${MODEL_PATH}" ]]; then
+  echo "error: MODEL_PATH does not exist: ${MODEL_PATH}" >&2
   exit 2
 fi
 
@@ -61,6 +66,13 @@ if [[ "${WEIGHT_GB}" != "0" && "${FORCE}" != "1" ]]; then
   fi
 fi
 
-echo "starting llama-server: model=${MODEL} port=${PORT} ctx=${CTX}"
 echo "endpoint: http://127.0.0.1:${PORT}/v1   (set DECOMPUTE_LOCAL_STUDENT_BASE_URL to match)"
-exec llama-server -hf "${MODEL}" --host 127.0.0.1 --port "${PORT}" -c "${CTX}"
+if [[ -n "${MODEL_PATH}" ]]; then
+  # Load the local file directly — no network, uses the model the user already has on disk.
+  echo "starting llama-server: file=${MODEL_PATH} port=${PORT} ctx=${CTX}"
+  exec llama-server -m "${MODEL_PATH}" --host 127.0.0.1 --port "${PORT}" -c "${CTX}"
+else
+  # Fetch + cache from Hugging Face on first use.
+  echo "starting llama-server: model=${MODEL} port=${PORT} ctx=${CTX}"
+  exec llama-server -hf "${MODEL}" --host 127.0.0.1 --port "${PORT}" -c "${CTX}"
+fi
