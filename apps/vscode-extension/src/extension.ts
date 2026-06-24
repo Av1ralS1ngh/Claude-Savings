@@ -188,6 +188,9 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("decompute.disableRouting", () => disableRouting()),
     vscode.commands.registerCommand("decompute.checkLocalGateway", () => checkLocalGateway()),
     vscode.commands.registerCommand("decompute.openDashboard", () => openDashboard()),
+    vscode.commands.registerCommand("decompute.askLocalStudent", () => askLocalStudent()),
+    vscode.commands.registerCommand("decompute.teacherStudentSolve", () => teacherStudentSolve()),
+    vscode.commands.registerCommand("decompute.setupLocalStudent", () => setupLocalStudent()),
     vscode.commands.registerCommand("decompute.uninstall", () => uninstallDecompute(context)),
   );
 
@@ -723,6 +726,82 @@ function openSetup(): void {
 
 function openDashboard(): void {
   void vscode.env.openExternal(vscode.Uri.parse(gatewayUrl() + "/dashboard"));
+}
+
+/** Run a teacher-student task through the local student via `decompute ts-run`, in a terminal so the
+ * student's answer streams live. Thin wrapper over the CLI per the plan (no parallel routing). */
+async function runTeacherStudent(task: string, opts: { requireTeacher?: boolean } = {}): Promise<void> {
+  const bin = await whichCli();
+  if (!bin) {
+    const pick = await vscode.window.showWarningMessage(
+      "Decompute CLI isn't installed yet. Run setup first.",
+      "Set Up Decompute"
+    );
+    if (pick === "Set Up Decompute") await runSetupWizard();
+    return;
+  }
+  const terminal = decomputeTerminal("Decompute · local student");
+  terminal.show();
+  let line = `${cmd(bin)} ts-run ${q(task)}`;
+  if (opts.requireTeacher) line += " --require-teacher";
+  // addNewLine=true: run it (the answer streams into the terminal). The user sees route + verifier line.
+  terminal.sendText(line, true);
+}
+
+/** "Ask Local Student": prompt for a coding task, run it verified through the local student. */
+async function askLocalStudent(): Promise<void> {
+  const task = await vscode.window.showInputBox({
+    title: "Ask the local student",
+    prompt: "A coding task — answered locally, verified, and escalated to Claude if not confident.",
+    placeHolder: "e.g. Write a Python function that reverses a string",
+    ignoreFocusOut: true,
+  });
+  if (!task || !task.trim()) return;
+  await runTeacherStudent(task.trim());
+}
+
+/** "Teacher-Student Solve": use the editor selection as the task (or prompt if nothing selected). */
+async function teacherStudentSolve(): Promise<void> {
+  const editor = vscode.window.activeTextEditor;
+  const selected = editor ? editor.document.getText(editor.selection).trim() : "";
+  let task = selected;
+  if (!task) {
+    const typed = await vscode.window.showInputBox({
+      title: "Teacher-student solve",
+      prompt: "Select code first, or describe the task here.",
+      placeHolder: "e.g. Add input validation to this function",
+      ignoreFocusOut: true,
+    });
+    task = (typed || "").trim();
+  } else {
+    // Wrap a selection with a light instruction so the student knows what to do with it.
+    const instr = await vscode.window.showInputBox({
+      title: "Teacher-student solve (on selection)",
+      prompt: "What should the student do with the selected code? (blank = improve/complete it)",
+      placeHolder: "e.g. add docstring + type hints",
+      ignoreFocusOut: true,
+    });
+    const what = (instr || "improve and complete this code").trim();
+    task = `${what}:\n\n${selected}`;
+  }
+  if (!task) return;
+  await runTeacherStudent(task);
+}
+
+/** "Set Up Local Student Model": open the RAM-aware model wizard in a terminal. */
+async function setupLocalStudent(): Promise<void> {
+  const bin = await whichCli();
+  if (!bin) {
+    const pick = await vscode.window.showWarningMessage(
+      "Decompute CLI isn't installed yet. Run setup first.",
+      "Set Up Decompute"
+    );
+    if (pick === "Set Up Decompute") await runSetupWizard();
+    return;
+  }
+  const terminal = decomputeTerminal("Decompute · student model setup");
+  terminal.show();
+  terminal.sendText(`${cmd(bin)} student models`, true);
 }
 
 async function configureGatewayUrl(): Promise<void> {

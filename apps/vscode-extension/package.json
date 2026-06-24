@@ -102,10 +102,31 @@
         "title": "Decompute: Open Dashboard"
       },
       {
+        "command": "decompute.askLocalStudent",
+        "title": "Decompute: Ask Local Student (verified, falls back to Claude)"
+      },
+      {
+        "command": "decompute.teacherStudentSolve",
+        "title": "Decompute: Teacher-Student Solve (selection or prompt)"
+      },
+      {
+        "command": "decompute.setupLocalStudent",
+        "title": "Decompute: Set Up Local Student Model"
+      },
+      {
         "command": "decompute.uninstall",
         "title": "Decompute: Uninstall (remove CLI, gateway & config)"
       }
     ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "decompute.teacherStudentSolve",
+          "when": "editorHasSelection",
+          "group": "decompute@1"
+        }
+      ]
+    },
     "configuration": {
       "title": "Decompute",
       "properties": {
