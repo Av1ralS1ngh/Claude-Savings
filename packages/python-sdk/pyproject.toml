@@ -13,6 +13,11 @@ authors = [{ name = "Decompute", email = "xcomp.decompute@gmail.com" }]
 keywords = ["decompute", "claude", "anthropic", "llm", "gateway", "token-optimization", "cli"]
 dependencies = ["httpx>=0.27", "typer>=0.12", "rich>=13.7"]
 
+# Optional extras. `mcp` powers the stdio MCP server (decompute-mcp) that exposes the local student
+# as an MCP tool; it's optional so the core CLI/SDK stays dependency-light.
+[project.optional-dependencies]
+mcp = ["mcp>=1.0"]
+
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
@@ -31,6 +36,7 @@ Repository = "https://github.com/Decompute-AI/Claude-Coder"
 
 [project.scripts]
 decompute = "decompute_ai.cli:app"
+decompute-mcp = "decompute_ai.mcp_server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
