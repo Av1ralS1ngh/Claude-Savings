@@ -562,17 +562,26 @@ def _setup_student_model(model_id: Optional[str] = None, *, yes: bool = False) -
         chosen = already or recommended
     else:
         default_idx = STUDENT_MODELS.index(already or recommended) + 1
-        raw = typer.prompt(
-            f"Pick a model number (1-{len(STUDENT_MODELS)}), or 'q' to skip",
-            default=str(default_idx),
-        ).strip().lower()
-        if raw in ("q", "quit", ""):
-            print("Skipped. Run [bold]decompute student models[/bold] any time to set one up.")
+        # Re-prompt on a bad entry instead of bailing — a typo shouldn't drop the user out of setup.
+        chosen = None
+        for _ in range(3):
+            raw = typer.prompt(
+                f"Pick a model number (1-{len(STUDENT_MODELS)}), or 'q' to skip",
+                default=str(default_idx),
+            )
+            # Be forgiving: keep only the digits the user typed (tolerates stray spaces / a leading '#').
+            cleaned = "".join(ch for ch in str(raw) if ch.isdigit())
+            low = str(raw).strip().lower()
+            if low in ("q", "quit") or (not cleaned and low == ""):
+                print("Skipped. Run [bold]decompute student models[/bold] any time to set one up.")
+                return None
+            if cleaned and 1 <= int(cleaned) <= len(STUDENT_MODELS):
+                chosen = STUDENT_MODELS[int(cleaned) - 1]
+                break
+            print(f"[yellow]Enter a number 1-{len(STUDENT_MODELS)}, or 'q' to skip.[/yellow]")
+        if chosen is None:
+            print("[yellow]No valid choice — skipping. Run `decompute student models` to try again.[/yellow]")
             return None
-        if not raw.isdigit() or not (1 <= int(raw) <= len(STUDENT_MODELS)):
-            print("[yellow]Not a valid choice.[/yellow]")
-            return None
-        chosen = STUDENT_MODELS[int(raw) - 1]
 
     # Feasibility warning (never a hard block — the user may know better / accept swap).
     if not _fits_ram(chosen, total_gb):
