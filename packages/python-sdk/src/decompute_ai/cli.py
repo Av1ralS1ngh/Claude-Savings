@@ -288,9 +288,9 @@ def _fits_ram(model: dict, total_gb: int) -> bool:
 
 
 def _ts_run_command() -> str:
-    """The shell command the /student slash command runs — `decompute ts-run` against the configured
-    gateway, with absolute paths so it works from any directory Claude Code is launched in."""
-    gw = cfg_base_url().rstrip("/")
+    """The shell command the /student slash command runs — `decompute ts-run`, with absolute paths so
+    it works from any directory Claude Code is launched in. The gateway URL is NOT baked in: `ts-run`
+    resolves it from config at runtime, so the command never goes stale if the gateway changes."""
     # Prefer the installed `decompute` on PATH; fall back to this source checkout's module form.
     bin_path = shutil.which("decompute")
     if bin_path:
@@ -301,7 +301,7 @@ def _ts_run_command() -> str:
         venv_py = here.parents[4] / ".venv" / "bin" / "python"  # .../Claude-Coder/.venv/bin/python
         py = str(venv_py) if venv_py.exists() else sys.executable
         runner = f'PYTHONPATH="{repo_src}" "{py}" -m decompute_ai.cli'
-    return f'DECOMPUTE_BASE_URL={gw} {runner} ts-run "$ARGUMENTS"'
+    return f'{runner} ts-run "$ARGUMENTS"'
 
 
 def _install_student_slash_command(*, global_scope: bool = True) -> Optional[Path]:
@@ -316,7 +316,7 @@ def _install_student_slash_command(*, global_scope: bool = True) -> Optional[Pat
 description: Answer this coding task with the LOCAL student model (verified; escalates to Claude only if not confident)
 argument-hint: [coding task]
 disable-model-invocation: true
-allowed-tools: Bash(DECOMPUTE_BASE_URL=* * ts-run *)
+allowed-tools: Bash(* ts-run *)
 ---
 
 The user invoked the local student model for this coding task. The answer below was produced by the
