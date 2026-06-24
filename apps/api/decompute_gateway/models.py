@@ -170,6 +170,14 @@ class UsageEvent(Base):
     client: Mapped[str | None] = mapped_column(String(32), index=True)
     cache_mode: Mapped[str | None] = mapped_column(String(32))
     route_json: Mapped[dict[str, Any] | None] = mapped_column(JSONField)
+    # Teacher-student observe-mode signals on the /v1/messages path, promoted from route_json to
+    # indexed columns so the "would the student have served?" question can be aggregated cheaply
+    # (the observe -> auto-route decision data). local_student_candidate: the request was eligible for
+    # the local student. coding_intent: the classified intent (simple_code_patch/.../unknown).
+    # served_by_student: True only when the student actually served this request (opt-in serve path).
+    local_student_candidate: Mapped[bool | None] = mapped_column(Boolean, default=False, index=True)
+    coding_intent: Mapped[str | None] = mapped_column(String(32), index=True)
+    served_by_student: Mapped[bool | None] = mapped_column(Boolean, default=False, index=True)
     optimization_steps_json: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONField)
     # Streaming accounting (nullable: only set on streamed requests; legacy rows stay NULL).
     stream_status: Mapped[str | None] = mapped_column(String(40), index=True)

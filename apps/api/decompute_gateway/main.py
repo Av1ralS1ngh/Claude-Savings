@@ -326,7 +326,7 @@ async def _try_serve_with_student(
         output_tokens=out_tokens, cache_creation_input_tokens=0, cache_read_input_tokens=0,
         prompt_cache_mode=recorded_cache_mode, plan=plan, request_id=request_id,
         upstream_request_id=None, status_code=200, start_time=start, workload_class=workload,
-        session_id=session_id, client=client,
+        session_id=session_id, client=client, served_by_student=True,
     )
     payload = {
         "id": resp.id,
@@ -397,7 +397,7 @@ def _clean_session_id(raw: str | None) -> str | None:
     return cleaned or None
 
 
-def _record_usage(*, principal: AuthPrincipal, endpoint: str, model: str | None, raw_input_tokens: int, yscompress_input_tokens: int, yellowstone_final_input_tokens: int, output_tokens: int, cache_creation_input_tokens: int, cache_read_input_tokens: int, prompt_cache_mode: str, plan: Any, request_id: str, upstream_request_id: str | None, status_code: int, start_time: float, workload_class: str | None = None, optimization_steps: list[dict[str, Any]] | None = None, stream_status: str | None = None, stream_cancelled: bool = False, stream_cancel_reason: str | None = None, stream_json: dict[str, Any] | None = None, session_id: str | None = None, billed_input_tokens: int | None = None, real_raw_input_tokens: int | None = None, client: str | None = None) -> None:
+def _record_usage(*, principal: AuthPrincipal, endpoint: str, model: str | None, raw_input_tokens: int, yscompress_input_tokens: int, yellowstone_final_input_tokens: int, output_tokens: int, cache_creation_input_tokens: int, cache_read_input_tokens: int, prompt_cache_mode: str, plan: Any, request_id: str, upstream_request_id: str | None, status_code: int, start_time: float, workload_class: str | None = None, optimization_steps: list[dict[str, Any]] | None = None, stream_status: str | None = None, stream_cancelled: bool = False, stream_cancel_reason: str | None = None, stream_json: dict[str, Any] | None = None, session_id: str | None = None, billed_input_tokens: int | None = None, real_raw_input_tokens: int | None = None, client: str | None = None, served_by_student: bool = False) -> None:
     elapsed_ms = int((time.perf_counter() - start_time) * 1000)
     # Honest savings: measure BOTH sides on Anthropic's real tokenizer. real_raw_input_tokens
     # is count_tokens() of the uncompressed prompt; billed_input_tokens is what Anthropic actually
@@ -436,6 +436,12 @@ def _record_usage(*, principal: AuthPrincipal, endpoint: str, model: str | None,
                 "client": client,
                 "cache_mode": prompt_cache_mode,
                 "route": plan.to_dict() if plan else None,
+                # Observe-mode signals promoted to indexed columns (3-A): whether the local student was
+                # an eligible candidate for this request, the coding intent, and whether it actually
+                # served. Derived from the plan; served_by_student is set by the serve path.
+                "local_student_candidate": bool(getattr(plan, "local_student_candidate", False)),
+                "coding_intent": getattr(plan, "coding_intent", None),
+                "served_by_student": served_by_student,
                 "optimization_steps": optimization_steps or [],
                 "stream_status": stream_status,
                 "stream_cancelled": stream_cancelled,
