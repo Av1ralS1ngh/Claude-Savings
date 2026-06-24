@@ -289,8 +289,12 @@ def _fits_ram(model: dict, total_gb: int) -> bool:
 
 def _ts_run_command() -> str:
     """The shell command the /student slash command runs — `decompute ts-run`, with absolute paths so
-    it works from any directory Claude Code is launched in. The gateway URL is NOT baked in: `ts-run`
-    resolves it from config at runtime, so the command never goes stale if the gateway changes."""
+    it works from any directory Claude Code is launched in.
+
+    The gateway URL is forced via `env DECOMPUTE_BASE_URL=<configured>` so an inherited (possibly
+    stale) DECOMPUTE_BASE_URL in the Claude Code session can't send ts-run at the wrong gateway. The
+    value comes from config at install time; re-run `decompute student models` if the gateway moves."""
+    gw = cfg_base_url().rstrip("/")
     # Prefer the installed `decompute` on PATH; fall back to this source checkout's module form.
     bin_path = shutil.which("decompute")
     if bin_path:
@@ -301,7 +305,8 @@ def _ts_run_command() -> str:
         venv_py = here.parents[4] / ".venv" / "bin" / "python"  # .../Claude-Coder/.venv/bin/python
         py = str(venv_py) if venv_py.exists() else sys.executable
         runner = f'PYTHONPATH="{repo_src}" "{py}" -m decompute_ai.cli'
-    return f'{runner} ts-run "$ARGUMENTS"'
+    # `env DECOMPUTE_BASE_URL=...` prefix overrides any inherited value for this one command.
+    return f'env DECOMPUTE_BASE_URL="{gw}" {runner} ts-run "$ARGUMENTS"'
 
 
 def _install_student_slash_command(*, global_scope: bool = True) -> Optional[Path]:
