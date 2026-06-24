@@ -287,6 +287,60 @@ def _fits_ram(model: dict, total_gb: int) -> bool:
     return total_gb == 0 or total_gb >= model["min_ram_gb"]
 
 
+def _ts_run_command() -> str:
+    """The shell command the /student slash command runs — `decompute ts-run` against the configured
+    gateway, with absolute paths so it works from any directory Claude Code is launched in."""
+    gw = cfg_base_url().rstrip("/")
+    # Prefer the installed `decompute` on PATH; fall back to this source checkout's module form.
+    bin_path = shutil.which("decompute")
+    if bin_path:
+        runner = f'"{bin_path}"'
+    else:
+        here = Path(__file__).resolve()
+        repo_src = here.parents[1]                       # .../packages/python-sdk/src
+        venv_py = here.parents[4] / ".venv" / "bin" / "python"  # .../Claude-Coder/.venv/bin/python
+        py = str(venv_py) if venv_py.exists() else sys.executable
+        runner = f'PYTHONPATH="{repo_src}" "{py}" -m decompute_ai.cli'
+    return f'DECOMPUTE_BASE_URL={gw} {runner} ts-run "$ARGUMENTS"'
+
+
+def _install_student_slash_command(*, global_scope: bool = True) -> Optional[Path]:
+    """Install a Claude Code `/student` slash command so a user can invoke the local model from INSIDE
+    a Claude Code session: `/student <task>` runs it through `decompute ts-run` (verified; escalates to
+    Claude if the verifier isn't confident) and shows the answer in the session. Global by default
+    (~/.claude/commands) so it works in every project. Returns the written path, or None on failure."""
+    base = CLAUDE_CONFIG_DIR if global_scope else (Path.cwd() / ".claude")
+    cmd_dir = base / "commands"
+    cmd_file = cmd_dir / "student.md"
+    body = f"""---
+description: Answer this coding task with the LOCAL student model (verified; escalates to Claude only if not confident)
+argument-hint: [coding task]
+disable-model-invocation: true
+allowed-tools: Bash(DECOMPUTE_BASE_URL=* * ts-run *)
+---
+
+The user invoked the local student model for this coding task. The answer below was produced by the
+local model on this machine (the gateway verified it; it falls back to Claude only if the verifier
+isn't confident). Present the answer as the response to the user's request.
+
+## Local student answer
+
+!`{_ts_run_command()}`
+
+## Your job
+Show the user the local student's answer above (the code and the route line). Do NOT re-answer the
+task yourself — the point is that the local model answered it. If the route is `teacher_corrected` or
+`teacher_only`, note that the verifier wasn't confident so it escalated to Claude, and the shown
+answer is the corrected one.
+"""
+    try:
+        cmd_dir.mkdir(parents=True, exist_ok=True)
+        cmd_file.write_text(body)
+        return cmd_file
+    except Exception:
+        return None
+
+
 def _model_search_dirs() -> list[Path]:
     """All the places a GGUF might already live, so we never re-download one the user already has:
     the llama.cpp -hf cache, the conventional ~/models, an env override, and HF's hub cache."""
@@ -342,6 +396,58 @@ def _is_downloaded(model: dict, cached: list[str]) -> bool:
     'qwen2.5-coder-7b-instruct-q5_k_m-00001-of-00002.gguf'."""
     stem, quant = _model_tokens(model)
     return any(stem in f and (not quant or quant in f) for f in cached)
+
+
+def _gateway_env_file() -> Optional[Path]:
+    """The .env the auto-started gateway reads (load_dotenv / run_gateway.sh sources it). Dev: the repo
+    .env beside scripts/run_gateway.sh; otherwise a gateway.env in the config dir. Returns the path to
+    write (creating it under the config dir if no repo .env exists)."""
+    # Dev: repo root has scripts/run_gateway.sh which sources ./.env — walk up from CWD to find it.
+    for base in (Path.cwd(), *Path.cwd().parents):
+        if (base / "scripts" / "run_gateway.sh").is_file():
+            return base / ".env"
+    # Installed: a gateway.env in the config dir (the gateway loads it via load_dotenv when run there).
+    from .config import CONFIG_DIR
+    return Path(CONFIG_DIR) / "gateway.env"
+
+
+def _enable_student_in_gateway_env() -> bool:
+    """Write the teacher-student settings into the gateway's env file so the auto-started gateway has
+    the local student enabled — idempotent (updates existing keys, appends missing). Returns True on
+    success. The student's model_path/model come from the saved config."""
+    env_path = _gateway_env_file()
+    if env_path is None:
+        return False
+    cfg = load_config().get("student", {})
+    desired = {
+        "DECOMPUTE_LOCAL_STUDENT_ENABLED": "true",
+        "DECOMPUTE_LOCAL_STUDENT_BACKEND": "llama_cpp",
+        "DECOMPUTE_LOCAL_STUDENT_BASE_URL": _student_base_url(),
+        "DECOMPUTE_LOCAL_STUDENT_MODEL": "local-student-coder",
+        # The judge is the verification signal on the live proxy path (requests carry no tests).
+        "DECOMPUTE_TS_JUDGE_ENABLED": "true",
+    }
+    try:
+        lines = env_path.read_text().splitlines() if env_path.is_file() else []
+        seen: set[str] = set()
+        out: list[str] = []
+        for line in lines:
+            key = line.split("=", 1)[0].strip() if "=" in line and not line.lstrip().startswith("#") else None
+            if key in desired:
+                out.append(f"{key}={desired[key]}")
+                seen.add(key)
+            else:
+                out.append(line)
+        missing = [k for k in desired if k not in seen]
+        if missing:
+            out.append("")
+            out.append("# Teacher-student local model (set by `decompute student models`)")
+            out.extend(f"{k}={desired[k]}" for k in missing)
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        env_path.write_text("\n".join(out).rstrip() + "\n")
+        return True
+    except Exception:
+        return False
 
 
 def _find_local_model_path(model: dict) -> Optional[Path]:
@@ -706,9 +812,22 @@ def student_models(
     if chosen.get("local_path"):
         student_cfg["model_path"] = chosen["local_path"]
     save_config({"student": student_cfg})
+    # Wire the teacher-student feature into the gateway's env so the auto-started gateway has it on —
+    # the user shouldn't have to set env vars by hand. (No-op if no gateway env file is found.)
+    wrote = _enable_student_in_gateway_env()
+    # Install the /student slash command so the model is usable INSIDE Claude Code too.
+    slash = _install_student_slash_command()
     print(f"\n[green]✓ Set {chosen['name']} as your student model.[/green]")
-    print(f"  Start it:   [bold]decompute student start[/bold]")
-    print(f"  Then:       [bold]export DECOMPUTE_LOCAL_STUDENT_ENABLED=true[/bold]  and  [bold]decompute ts-health[/bold]")
+    print("  Next:")
+    print("    1. [bold]decompute student start[/bold]   (loads the model)")
+    if wrote:
+        print("    2. [bold]decompute claude[/bold]          (then routine coding can run locally)")
+        print("  [dim]The gateway uses the local student automatically — no env vars to set.[/dim]")
+    else:
+        print("    2. enable it for the gateway: set [bold]DECOMPUTE_LOCAL_STUDENT_ENABLED=true[/bold] then [bold]decompute claude[/bold]")
+    print("\n  Use it [bold]outside[/bold] Claude Code:  [bold]decompute ts-run \"<task>\"[/bold]")
+    if slash:
+        print("  Use it [bold]inside[/bold] Claude Code:   type [bold]/student <task>[/bold]  (the local model answers, verified)")
 
 
 @student_app.command("install")
@@ -1273,7 +1392,12 @@ def init(
                 if chosen.get("local_path"):
                     student_cfg["model_path"] = chosen["local_path"]
                 save_config({"student": student_cfg})
-                print(f"  Start it with [bold]decompute student start[/bold], then set [bold]DECOMPUTE_LOCAL_STUDENT_ENABLED=true[/bold].")
+                _enable_student_in_gateway_env()      # gateway picks up the student automatically
+                slash = _install_student_slash_command()  # usable inside Claude Code as /student
+                print("  Start it with [bold]decompute student start[/bold]. Then use it:")
+                print("    • outside Claude Code:  [bold]decompute ts-run \"<task>\"[/bold]")
+                if slash:
+                    print("    • inside Claude Code:   [bold]/student <task>[/bold]")
         else:
             print("  You can do this any time: [bold]decompute student models[/bold].")
 
