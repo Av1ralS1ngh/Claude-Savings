@@ -251,6 +251,12 @@ class Settings:
     # subscription/API credential, so no separate teacher auth is needed. OFF by default: with this
     # false the student is observe-only on /v1/messages and serves only via the explicit ts-run command.
     local_student_serve: bool = _bool("DECOMPUTE_LOCAL_STUDENT_SERVE", False)
+    # Shadow calibration (3-C): on a sampled fraction of observe-eligible /v1/messages requests, after
+    # Claude answers, verify the student answer OUT-OF-BAND and compare it to Claude's — producing a
+    # measured false-accept rate (the ground truth needed before trusting auto-route). Off by default;
+    # the sample rate caps how many shadow runs fire (0.0 = off even if enabled). Never on the hot path.
+    local_student_shadow_calibration: bool = _bool("DECOMPUTE_LOCAL_STUDENT_SHADOW_CALIBRATION", False)
+    local_student_shadow_sample_rate: float = _float("DECOMPUTE_LOCAL_STUDENT_SHADOW_SAMPLE_RATE", 0.1)
 
     # ── Local coding student (teacher-student) ────────────────────────────────
     # An OPTIONAL, off-by-default local model that answers narrow coding tasks. Invoked via the explicit

@@ -95,3 +95,30 @@ def test_summary_observe_block_aggregates_candidates_and_served(tmp_path):
     assert obs["deflection_headroom"] == 1  # eligible-but-not-served
     assert obs["by_intent"]["simple_code_patch"] == {"candidates": 2, "served": 1}
     assert obs["by_intent"]["lint_fix"] == {"candidates": 1, "served": 1}
+
+
+def test_calibration_false_accept_rate(tmp_path):
+    """Shadow calibration (3-C): false-accept rate = of answers the verifier WOULD have served, how
+    many disagreed with Claude. Would-not-accept rows don't count against it."""
+    store = _store(tmp_path)
+    pid = store.create_project("p")["id"]
+    for agreed in (True, True, True, False):  # 4 would-accept, 1 wrong -> 25%
+        store.record_calibration(project_id=pid, request_id="r", coding_intent="lint_fix",
+                                 prompt_sha256="a" * 64, would_accept=True, confidence=0.85,
+                                 agreed_with_teacher=agreed, judge_model="claude-judge")
+    store.record_calibration(project_id=pid, request_id="r", coding_intent="lint_fix",
+                             prompt_sha256="a" * 64, would_accept=False, confidence=0.55,
+                             agreed_with_teacher=None, judge_model=None)
+    cal = store.teacher_student_summary(project_id=pid)["calibration"]
+    assert cal["shadow_sample_n"] == 5
+    assert cal["would_accept_n"] == 4
+    assert cal["false_accepts"] == 1
+    assert cal["false_accept_rate_estimate"] == 0.25
+
+
+def test_calibration_empty_is_none(tmp_path):
+    store = _store(tmp_path)
+    pid = store.create_project("p")["id"]
+    cal = store.teacher_student_summary(project_id=pid)["calibration"]
+    assert cal["shadow_sample_n"] == 0
+    assert cal["false_accept_rate_estimate"] is None  # no sample yet

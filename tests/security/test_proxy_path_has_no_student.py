@@ -44,6 +44,10 @@ SANCTIONED_SUBSTRINGS: set[str] = {
     "from .teacher_student.schemas import TeacherStudentRunRequest",
     "build_teacher_student_service(",
     "TeacherStudentRunRequest(",
+    # READ-ONLY metrics: the dashboard card + shadow calibration read aggregate counts. No student
+    # invocation — just SELECTs over recorded rows.
+    "teacher_student_summary(",
+    "store.record_calibration(",
 }
 
 # `local_provider` is the module that actually CALLS the student model — it must NEVER appear in the

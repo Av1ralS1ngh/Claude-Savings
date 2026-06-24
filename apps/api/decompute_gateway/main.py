@@ -355,6 +355,93 @@ async def _try_serve_with_student(
     return JSONResponse(payload, status_code=200, headers=headers)
 
 
+def _anthropic_answer_text(body: Any) -> str:
+    """Flatten the text blocks of an Anthropic /v1/messages response body to a single string."""
+    if not isinstance(body, dict):
+        return ""
+    parts = [b.get("text", "") for b in (body.get("content") or []) if isinstance(b, dict) and b.get("type") == "text"]
+    return "".join(parts)
+
+
+def _shadow_should_sample(request_id: str) -> bool:
+    """Deterministic sampler for shadow calibration: hash the request id and compare to the configured
+    rate. Deterministic (no RNG) so it's reproducible and adds no per-request state."""
+    rate = float(getattr(settings, "local_student_shadow_sample_rate", 0.0) or 0.0)
+    if rate <= 0:
+        return False
+    if rate >= 1:
+        return True
+    bucket = (int(hashlib.sha256((request_id or "").encode()).hexdigest()[:8], 16) % 10_000) / 10_000.0
+    return bucket < rate
+
+
+def _maybe_shadow_calibrate(request: Request, *, body: dict[str, Any], plan: Any, principal: AuthPrincipal,
+                            request_id: str, claude_answer: str, model: str | None) -> None:
+    """Fire-and-forget shadow calibration (3-C). On a sampled, observe-eligible coding turn, run the
+    student + verifier OUT-OF-BAND and compare to Claude's answer, recording a false-accept signal.
+
+    Strictly off the hot path: scheduled as a background task AFTER the response is built. Gated by the
+    flag + the eligibility the plan computed; any failure is swallowed (calibration must never affect a
+    real request)."""
+    if not getattr(settings, "local_student_shadow_calibration", False):
+        return
+    if not getattr(plan, "local_student_candidate", False):
+        return
+    if not _shadow_should_sample(request_id):
+        return
+    if not claude_answer:
+        return
+
+    async def _run() -> None:
+        try:
+            from .teacher_student.router import build_teacher_student_service
+            from .teacher_student.schemas import TeacherStudentRunRequest
+
+            service = build_teacher_student_service(
+                request, settings=settings, teacher_call_func=call_anthropic_messages,
+                upstream_auth_func=lambda req: upstream_anthropic_auth(req, settings),
+                store=store, principal=principal,
+            )
+            resp = await service.run(TeacherStudentRunRequest(messages=body.get("messages") or []))
+            verdict = resp.verdict
+            would_accept = bool(resp.route == "student_only" and resp.final_answer)
+            confidence = float(getattr(verdict, "confidence", 0.0) or 0.0)
+            # Cheap agreement heuristic: did the student's answer share substantial code/text with
+            # Claude's? Only meaningful when the verifier would have served it. (A judge cross-check is
+            # a future upgrade; this gives a first false-accept signal without extra Claude cost.)
+            agreed = _answers_agree(resp.final_answer or resp.student_answer or "", claude_answer) if would_accept else None
+            task_text = _last_user_text(body.get("messages") or [])
+            store.record_calibration(
+                project_id=principal.project_id, request_id=request_id,
+                coding_intent=getattr(plan, "coding_intent", None),
+                prompt_sha256=hashlib.sha256(task_text.encode("utf-8")).hexdigest(),
+                would_accept=would_accept, confidence=confidence, agreed_with_teacher=agreed,
+                judge_model=getattr(verdict, "judge_model", None),
+            )
+        except Exception:
+            log.debug("shadow calibration failed (ignored)", extra={"extra": {"request_id": request_id}}, exc_info=True)
+
+    try:
+        asyncio.create_task(_run())
+    except RuntimeError:
+        pass  # no running loop (shouldn't happen in the async handler) — skip silently
+
+
+def _answers_agree(a: str, b: str, *, threshold: float = 0.5) -> bool:
+    """Coarse agreement: Jaccard overlap of the code-ish tokens in two answers exceeds a threshold.
+    A deliberately simple, cost-free proxy for 'did the student reach the same solution as Claude'."""
+    import re as _re
+
+    def toks(s: str) -> set[str]:
+        return set(t for t in _re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", s.lower()) if t)
+    ta, tb = toks(a), toks(b)
+    if not ta or not tb:
+        return False
+    inter = len(ta & tb)
+    union = len(ta | tb)
+    return (inter / union) >= threshold if union else False
+
+
 async def _real_token_baseline(model: str | None, body: dict[str, Any], *, upstream_key: Any, extra_headers: dict[str, str] | None = None) -> int | None:
     """Anthropic's real-tokenizer count of the UNCOMPRESSED prompt — the honest savings
     denominator. The compressor's len/4 estimate undercounts ~5x vs Anthropic's tokenizer,
@@ -1673,6 +1760,11 @@ async def anthropic_messages_proxy(request: Request, payload: MessagesRequest) -
     # them from the pre-retrieval plan) so the header matches what was actually sent.
     headers["x-decompute-tokens-after"] = str(final_input_tokens)
     headers["x-decompute-tokens-saved"] = str(max(0, comp.tokens_before - final_input_tokens))
+    # Shadow calibration (3-C): on a sampled observe-eligible coding turn, AFTER Claude has answered,
+    # fire an off-hot-path task that runs the student + verifier and compares to Claude's answer,
+    # recording a false-accept signal. Fire-and-forget — never delays or affects this response.
+    _maybe_shadow_calibrate(request, body=body, plan=plan, principal=principal, request_id=request_id,
+                            claude_answer=_anthropic_answer_text(result.body), model=model)
     return JSONResponse(body_out, status_code=result.status_code, headers=headers)
 
 

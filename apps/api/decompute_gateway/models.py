@@ -331,3 +331,26 @@ class TeacherStudentVerdict(Base):
     layers_json: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONField)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     __table_args__ = (Index("ix_ts_verdicts_case", "case_id"),)
+
+
+class TeacherStudentCalibration(Base):
+    """Shadow-evaluation record (3-C): on a sampled fraction of observe-eligible /v1/messages requests,
+    the student answer is verified OUT-OF-BAND (off the hot path, after Claude already answered) and
+    compared to Claude's actual answer. This is the only way to get a measured FALSE-ACCEPT rate — the
+    ground-truth signal an operator needs before trusting auto-route. Metadata-only: stores the booleans
+    + a prompt hash, never the prompt/answer content."""
+    __tablename__ = "teacher_student_calibration"
+    id: Mapped[str] = mapped_column(String(48), primary_key=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    request_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    coding_intent: Mapped[str | None] = mapped_column(String(32), index=True)
+    prompt_sha256: Mapped[str | None] = mapped_column(String(64))
+    # The verifier's out-of-band decision on the student answer (would it have served?).
+    would_accept: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    # Whether the (would-be-accepted) student answer AGREED with Claude's actual answer. A
+    # would_accept=True + agreed_with_teacher=False is a FALSE ACCEPT — the signal we minimize.
+    agreed_with_teacher: Mapped[bool | None] = mapped_column(Boolean, index=True)
+    judge_model: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    __table_args__ = (Index("ix_ts_calib_project_created", "project_id", "created_at"),)

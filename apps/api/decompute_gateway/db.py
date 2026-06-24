@@ -1073,7 +1073,48 @@ class Store:
                 # vs. served count is the "headroom" — what auto-route COULD deflect — and the per-intent
                 # split shows where. This is the data that justifies (or doesn't) ramping auto-route.
                 "observe": self._observe_mode_summary(s, project_id),
+                # Shadow-calibration (3-C): the measured false-accept rate from out-of-band evals — the
+                # ground-truth signal gating auto-route. null until shadow calibration has a sample.
+                "calibration": self._calibration_summary(s, project_id),
             }
+
+    def record_calibration(self, *, project_id: str, request_id: str | None, coding_intent: str | None,
+                           prompt_sha256: str | None, would_accept: bool, confidence: float,
+                           agreed_with_teacher: bool | None, judge_model: str | None) -> None:
+        """Persist one shadow-eval outcome (3-C). Best-effort; never raises into the caller."""
+        import uuid as _uuid
+
+        from .models import TeacherStudentCalibration
+        try:
+            with self.session() as s:
+                s.add(TeacherStudentCalibration(
+                    id=f"tscal_{_uuid.uuid4().hex[:24]}",
+                    project_id=project_id, request_id=request_id, coding_intent=coding_intent,
+                    prompt_sha256=prompt_sha256, would_accept=bool(would_accept), confidence=float(confidence),
+                    agreed_with_teacher=agreed_with_teacher, judge_model=judge_model,
+                ))
+        except Exception:
+            pass
+
+    def _calibration_summary(self, s, project_id: str) -> dict[str, Any]:
+        """Aggregate shadow-eval rows into a measured false-accept estimate (helper for the summary)."""
+        from .models import TeacherStudentCalibration
+
+        rows = s.query(TeacherStudentCalibration).filter(TeacherStudentCalibration.project_id == project_id).all()
+        n = len(rows)
+        # A false accept = the verifier WOULD have served the student, but the answer disagreed with
+        # Claude. Only count rows where we have a teacher comparison (agreed_with_teacher is not None).
+        would_accept = [r for r in rows if r.would_accept and r.agreed_with_teacher is not None]
+        false_accepts = [r for r in would_accept if r.agreed_with_teacher is False]
+        denom = len(would_accept)
+        return {
+            "shadow_sample_n": n,
+            "would_accept_n": denom,
+            "false_accepts": len(false_accepts),
+            # Of the answers the verifier would have served, how many were wrong (vs Claude). The
+            # number to drive toward zero before widening auto-route. None until there's a sample.
+            "false_accept_rate_estimate": round(len(false_accepts) / denom, 4) if denom else None,
+        }
 
     def _observe_mode_summary(self, s, project_id: str) -> dict[str, Any]:
         """Aggregate the observe-mode columns on usage_events for a project (helper for the summary)."""
