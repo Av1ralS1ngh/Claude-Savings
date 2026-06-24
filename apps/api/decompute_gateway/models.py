@@ -81,6 +81,10 @@ class Project(Base):
     teacher_student_governance_mode: Mapped[str] = mapped_column(String(32), default="metadata_only", nullable=False)
     teacher_student_capture_retention_days: Mapped[int] = mapped_column(Integer, default=30, nullable=False)
     teacher_student_capture_locked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Auto-route ramp (3-D): per-project opt-in to inline serving. NULL/false = the project is not in
+    # the auto-route canary even if the global flag + percentage would allow it. An in-process
+    # ramp-down knob (flip false to stop serving a project without a redeploy).
+    local_student_serve_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     __table_args__ = (
         Index("ix_projects_org_created", "org_id", "created_at"),

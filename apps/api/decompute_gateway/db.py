@@ -267,6 +267,37 @@ class Store:
             p = s.get(Project, project_id)
             return self.project_to_dict(p) if p else None
 
+    def should_serve_canary(self, *, project_id: str, key_prefix: str | None, percentage: int) -> bool:
+        """Auto-route ramp gate (3-D): True only if this project opted in (local_student_serve_enabled)
+        AND it falls inside the percentage canary. Deterministic by API-key-prefix so a given key is
+        consistently in-or-out across requests. This ONLY narrows serving — the caller already checked
+        the master flag + verification signal. Any error -> False (fail closed; never serve more)."""
+        try:
+            with self.session() as s:
+                p = s.get(Project, project_id)
+                if p is None or not getattr(p, "local_student_serve_enabled", False):
+                    return False
+            pct = max(0, min(100, int(percentage)))
+            if pct >= 100:
+                return True
+            if pct <= 0:
+                return False
+            import hashlib as _h
+            bucket = int(_h.sha256((key_prefix or project_id).encode()).hexdigest()[:8], 16) % 100
+            return bucket < pct
+        except Exception:
+            return False
+
+    def set_project_serve_enabled(self, project_id: str, enabled: bool) -> bool:
+        """Flip a project's auto-route opt-in (the in-process ramp-down / kill-switch). Returns the
+        new value, or raises if the project is missing."""
+        with self.session() as s:
+            p = s.get(Project, project_id)
+            if p is None:
+                raise KeyError(project_id)
+            p.local_student_serve_enabled = bool(enabled)
+            return p.local_student_serve_enabled
+
     @staticmethod
     def project_to_dict(p: Project) -> dict[str, Any]:
         return {

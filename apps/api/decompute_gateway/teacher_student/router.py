@@ -198,6 +198,25 @@ def include_teacher_student_router(
             return JSONResponse({"runs": []})
         return JSONResponse({"runs": store.list_teacher_student_runs(project_id=principal.project_id)})
 
+    @router.post("/serve-control")
+    async def teacher_student_serve_control(request: Request):
+        """Auto-route ramp control (3-D): opt this project in/out of inline serving — the in-process
+        kill-switch / ramp-down (no redeploy). Body: {"enabled": true|false}. Requires an admin scope;
+        the global DECOMPUTE_LOCAL_STUDENT_SERVE flag + percentage still gate above this."""
+        principal = auth_func(request, "teacher_student:admin")
+        if store is None:
+            return JSONResponse(status_code=503, content={"error": "no_store"})
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        enabled = bool(payload.get("enabled", False))
+        try:
+            new_val = store.set_project_serve_enabled(principal.project_id, enabled)
+        except KeyError:
+            return JSONResponse(status_code=404, content={"error": "project_not_found"})
+        return JSONResponse({"project_id": principal.project_id, "local_student_serve_enabled": new_val})
+
     @router.get("/export/sft.jsonl")
     async def teacher_student_export_sft(request: Request):
         # Export is a DISTINCT scope — messages:write must never imply it (plan §Privacy).

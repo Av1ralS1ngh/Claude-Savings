@@ -257,6 +257,12 @@ class Settings:
     # the sample rate caps how many shadow runs fire (0.0 = off even if enabled). Never on the hot path.
     local_student_shadow_calibration: bool = _bool("DECOMPUTE_LOCAL_STUDENT_SHADOW_CALIBRATION", False)
     local_student_shadow_sample_rate: float = _float("DECOMPUTE_LOCAL_STUDENT_SHADOW_SAMPLE_RATE", 0.1)
+    # Auto-route RAMP controls (3-D). These only ever NARROW the serve gate — serving still requires
+    # local_student_serve (the master kill-switch) AND a verification signal. The percentage is a
+    # deterministic canary by API-key-prefix (a given key is consistently in or out), so an operator can
+    # ramp 0 -> 10 -> 100 once calibration looks good. Per-project enablement is on the Project row.
+    # 100 (default) = no extra throttle beyond the master flag; 0 = serve nothing even if the flag is on.
+    local_student_serve_percentage: int = _int("DECOMPUTE_LOCAL_STUDENT_SERVE_PERCENTAGE", 100)
 
     # ── Local coding student (teacher-student) ────────────────────────────────
     # An OPTIONAL, off-by-default local model that answers narrow coding tasks. Invoked via the explicit
@@ -437,6 +443,9 @@ class Settings:
                         "DECOMPUTE_TS_JUDGE_ENABLED=true (recommended for the proxy path) or enable test "
                         "execution with a production-safe sandbox. Serving without verification is refused."
                     )
+            # Ramp percentage must be a sane 0-100 (it's a canary throttle, not a free dial).
+            if not (0 <= self.local_student_serve_percentage <= 100):
+                errors.append("DECOMPUTE_LOCAL_STUDENT_SERVE_PERCENTAGE must be between 0 and 100")
             # Distillation on Claude outputs is approved but governed: production must explicitly encode
             # the legal/product sign-off, not just flip the allow flag (CLAUDE.md "Policy exception").
             if self.teacher_student_allow_claude_training_targets and not self.teacher_student_claude_training_signoff:

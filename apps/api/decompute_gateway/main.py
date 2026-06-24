@@ -1634,7 +1634,17 @@ async def anthropic_messages_proxy(request: Request, payload: MessagesRequest) -
     # request); otherwise this returns None and the request falls through to the normal Claude call,
     # which uses the SAME upstream_key — so escalation reuses the request's own auth. Strictly gated:
     # feature off, tools present, or non-coding intent -> skipped entirely (zero overhead).
-    if settings.local_student_serve and settings.local_student_enabled and observe_intent and not observe_has_tools:
+    # RAMP (3-D): even with the master flag on, only serve when this project opted in AND the request
+    # falls inside the percentage canary — an additional AND that only ever NARROWS serving.
+    serve_gated = (
+        settings.local_student_serve and settings.local_student_enabled
+        and observe_intent and not observe_has_tools
+        and store.should_serve_canary(
+            project_id=principal.project_id, key_prefix=principal.key_prefix,
+            percentage=settings.local_student_serve_percentage,
+        )
+    )
+    if serve_gated:
         student_served = await _try_serve_with_student(
             request, body=body, model=model, streaming=bool(body.get("stream")),
             principal=principal, comp=comp, plan=plan, request_id=request_id, headers=headers,

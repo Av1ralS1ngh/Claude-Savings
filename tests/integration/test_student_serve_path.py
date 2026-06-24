@@ -34,6 +34,12 @@ def _reload_app_with(monkeypatch, **env):
     importlib.reload(cfg)
     import decompute_gateway.main as main
     importlib.reload(main)
+    # Auto-route ramp (3-D): the serve gate now also requires the project to be opted in. The serving
+    # tests below want serving to fire, so enable it on the default project (percentage defaults to 100).
+    try:
+        main.store.set_project_serve_enabled("proj_default", True)
+    except Exception:
+        pass
     return main
 
 
