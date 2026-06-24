@@ -487,26 +487,64 @@ def student_stop():
 
 
 @student_app.command("smoke")
-def student_smoke(prompt: str = typer.Argument("Write a Python add(a, b) function.")):
-    """Send one prompt straight to the local student endpoint (bypasses the gateway)."""
+def student_smoke(
+    prompt: str = typer.Argument("Write a Python add(a, b) function."),
+    no_stream: bool = typer.Option(False, "--no-stream", help="Wait for the full answer instead of streaming it as it generates."),
+):
+    """Send one prompt straight to the local student endpoint (bypasses the gateway).
+
+    Streams the answer token-by-token as the model generates it (use --no-stream to wait for the whole
+    thing)."""
     import httpx
 
     if not _student_alive():
         print("[red]local student not reachable.[/red] start it first.")
         raise typer.Exit(1)
     model = os.getenv("DECOMPUTE_LOCAL_STUDENT_MODEL", "local-student-coder")
+    url = f"{_student_base_url().rstrip('/')}/chat/completions"
+    body = {"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 256}
+
+    if no_stream:
+        try:
+            r = httpx.post(url, json=body, timeout=60.0)
+            r.raise_for_status()
+            text = (((r.json().get("choices") or [{}])[0]).get("message") or {}).get("content") or ""
+            print(text or "[yellow](empty response)[/yellow]")
+        except Exception as exc:
+            print(f"[red]smoke failed:[/red] {exc}")
+            raise typer.Exit(1)
+        return
+
+    # Streaming: ask the server for an SSE token stream and print each delta the moment it arrives, so
+    # the answer appears live instead of all-at-once after a pause. The OpenAI-compatible endpoint
+    # (llama-server/Ollama/etc.) emits `data: {json}` lines; the final one is `data: [DONE]`.
+    body["stream"] = True
+    got_any = False
     try:
-        r = httpx.post(
-            f"{_student_base_url().rstrip('/')}/chat/completions",
-            json={"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 256},
-            timeout=60.0,
-        )
-        r.raise_for_status()
-        text = (((r.json().get("choices") or [{}])[0]).get("message") or {}).get("content") or ""
-        print(text or "[yellow](empty response)[/yellow]")
+        with httpx.stream("POST", url, json=body, timeout=120.0) as r:
+            r.raise_for_status()
+            for line in r.iter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[len("data:"):].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    delta = (((json.loads(data).get("choices") or [{}])[0]).get("delta") or {}).get("content")
+                except json.JSONDecodeError:
+                    continue  # skip keep-alive / non-JSON lines
+                if delta:
+                    got_any = True
+                    # Write the raw chunk straight to stdout (no rich markup, no added newline) so code
+                    # formatting is preserved and the text flows like the model is typing.
+                    sys.stdout.write(delta)
+                    sys.stdout.flush()
     except Exception as exc:
-        print(f"[red]smoke failed:[/red] {exc}")
+        print(f"\n[red]smoke failed:[/red] {exc}")
         raise typer.Exit(1)
+    print()  # final newline after the streamed answer
+    if not got_any:
+        print("[yellow](empty response)[/yellow]")
 
 
 def _render_model_catalog(total_gb: int, cached: list[str]) -> None:
