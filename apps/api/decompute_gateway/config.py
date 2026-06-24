@@ -308,6 +308,9 @@ class Settings:
     teacher_student_sandbox_pids: int = _int("DECOMPUTE_TS_SANDBOX_PIDS", 64)
     teacher_student_confidence_threshold: float = _float("DECOMPUTE_TS_CONFIDENCE_THRESHOLD", 0.82)
     teacher_student_judge_enabled: bool = _bool("DECOMPUTE_TS_JUDGE_ENABLED", False)
+    # DEV/DEMO ONLY: force the judge to pass (no real Claude call) so student_only can be shown without
+    # live Claude auth. Rejected in production by validate_for_startup — never a real signal.
+    teacher_student_judge_mock_pass: bool = _bool("DECOMPUTE_TS_JUDGE_MOCK_PASS", False)
     teacher_student_capture_enabled: bool = _bool("DECOMPUTE_TS_CAPTURE_ENABLED", False)
     teacher_student_governance_mode: str = os.getenv("DECOMPUTE_TS_GOVERNANCE_MODE", "metadata_only")
     teacher_student_capture_retention_days: int = _int("DECOMPUTE_TS_CAPTURE_RETENTION_DAYS", 30)
@@ -393,6 +396,9 @@ class Settings:
             # and in production it would return a canned answer as if it came from a real model.
             if self.local_student_mock:
                 errors.append("DECOMPUTE_LOCAL_STUDENT_MOCK must be false in production (no mock answers)")
+            # The force-pass judge is a dev/demo aid; in production it would accept unverified answers.
+            if self.teacher_student_judge_mock_pass:
+                errors.append("DECOMPUTE_TS_JUDGE_MOCK_PASS must be false in production (no fake verification)")
             # SSRF / exfiltration guard (H3): the "local" student must be LOOPBACK in production unless
             # an operator explicitly opts into a remote endpoint. Without the opt-in, ANY non-loopback
             # host (even https) is rejected — otherwise a misconfigured base_url could ship every prompt

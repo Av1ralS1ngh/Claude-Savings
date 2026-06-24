@@ -69,6 +69,15 @@ def make_judge(settings: Settings, teacher_caller: JudgeTeacherCaller | None):
     student — satisfying the no-self-judge rule."""
     if not getattr(settings, "teacher_student_judge_enabled", False):
         return None
+
+    # DEV ONLY: a force-pass judge for demos/tests, so student_only can be shown without a live Claude
+    # judge call. Gated behind a flag that is REJECTED in production by config.validate_for_startup
+    # (same contract as the mock student) — never a real verification signal.
+    if getattr(settings, "teacher_student_judge_mock_pass", False):
+        async def mock_judge_fn(*, task_text: str, answer: str, tests: str | None) -> JudgeResult:
+            return JudgeResult(passed=True, model="mock-judge(dev)", severity=0, detail="dev mock pass")
+        return mock_judge_fn
+
     if teacher_caller is None:
         return None
 
