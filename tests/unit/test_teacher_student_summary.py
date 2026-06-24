@@ -75,3 +75,23 @@ def test_summary_empty_project_is_zeroed(tmp_path):
     assert summ["cases"] == 0
     assert summ["accept_evidence"]["tests_backed"] == 0
     assert summ["judge"]["pass_rate"] == 0.0
+    assert summ["observe"]["candidates"] == 0
+
+
+def test_summary_observe_block_aggregates_candidates_and_served(tmp_path):
+    """Observe-mode (3-B): the summary reports how many /v1/messages requests were student-eligible
+    candidates, how many actually served locally, the auto-route headroom, and a per-intent split."""
+    store = _store(tmp_path)
+    pid = store.create_project("p")["id"]
+    # 2 simple_code_patch candidates (1 served), 1 lint_fix (served), 1 non-candidate (excluded).
+    store.record_usage({"endpoint": "/v1/messages", "local_student_candidate": True, "coding_intent": "simple_code_patch", "served_by_student": False}, project_id=pid, key_prefix=None)
+    store.record_usage({"endpoint": "/v1/messages", "local_student_candidate": True, "coding_intent": "simple_code_patch", "served_by_student": True}, project_id=pid, key_prefix=None)
+    store.record_usage({"endpoint": "/v1/messages", "local_student_candidate": True, "coding_intent": "lint_fix", "served_by_student": True}, project_id=pid, key_prefix=None)
+    store.record_usage({"endpoint": "/v1/messages", "local_student_candidate": False}, project_id=pid, key_prefix=None)
+
+    obs = store.teacher_student_summary(project_id=pid)["observe"]
+    assert obs["candidates"] == 3          # the non-candidate is excluded
+    assert obs["served_locally"] == 2
+    assert obs["deflection_headroom"] == 1  # eligible-but-not-served
+    assert obs["by_intent"]["simple_code_patch"] == {"candidates": 2, "served": 1}
+    assert obs["by_intent"]["lint_fix"] == {"candidates": 1, "served": 1}

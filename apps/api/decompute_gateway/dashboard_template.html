@@ -277,6 +277,15 @@
     .req-row .req-id,.req-row .req-wl,.req-row .req-cap{display:none}
     .setup-card{grid-template-columns:1fr}
   }
+  /* Teacher-student card */
+  .ts-card{margin-top:18px;padding:18px 20px;border:1px solid var(--rule-softer);border-radius:12px;background:var(--card)}
+  .ts-card .card-h{font-size:14px;font-weight:600;margin-bottom:14px}
+  .ts-card .card-sub{font-weight:400;color:var(--dim);font-size:12px;margin-left:6px}
+  .ts-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:14px}
+  .ts-stat{padding:10px 0}
+  .ts-stat .ts-val{font-size:22px;font-weight:600;color:var(--green-deep);font-family:var(--mono)}
+  .ts-stat .ts-lbl{font-size:11px;color:var(--dim);margin-top:2px}
+  .ts-stat .ts-hint{display:block;font-size:10px;color:var(--dim);opacity:.8;margin-top:1px}
 </style>
 </head>
 <body>
@@ -538,6 +547,9 @@
         </div>
         <div class="req-list" id="reqList">__REQUEST_ROWS__</div>
       </div>
+
+      <!-- TEACHER-STUDENT (rendered empty until the feature is used) -->
+      __TS_CARD__
 
             <!-- BENCHMARK -->
       <div class="section-label">Benchmark <span class="right">__BENCHMARK_META__</span></div>

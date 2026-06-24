@@ -1068,7 +1068,40 @@ class Store:
                     "passed": judge_passed,
                     "pass_rate": round(judge_passed / judge_consulted, 4) if judge_consulted else 0.0,
                 },
+                # Observe-mode (3-B): on the live /v1/messages path, how often was the student an
+                # eligible candidate, and of those how often did it actually serve? The candidate count
+                # vs. served count is the "headroom" — what auto-route COULD deflect — and the per-intent
+                # split shows where. This is the data that justifies (or doesn't) ramping auto-route.
+                "observe": self._observe_mode_summary(s, project_id),
             }
+
+    def _observe_mode_summary(self, s, project_id: str) -> dict[str, Any]:
+        """Aggregate the observe-mode columns on usage_events for a project (helper for the summary)."""
+        from sqlalchemy import case, func
+
+        rows = (
+            s.query(
+                UsageEvent.coding_intent,
+                func.count().label("candidates"),
+                func.sum(case((UsageEvent.served_by_student.is_(True), 1), else_=0)).label("served"),
+            )
+            .filter(UsageEvent.project_id == project_id, UsageEvent.local_student_candidate.is_(True))
+            .group_by(UsageEvent.coding_intent)
+            .all()
+        )
+        by_intent: dict[str, dict[str, int]] = {}
+        total_candidates = total_served = 0
+        for intent, candidates, served in rows:
+            c, sv = int(candidates or 0), int(served or 0)
+            by_intent[intent or "unknown"] = {"candidates": c, "served": sv}
+            total_candidates += c
+            total_served += sv
+        return {
+            "candidates": total_candidates,          # eligible local-student requests on the proxy
+            "served_locally": total_served,          # of those, actually served by the student
+            "deflection_headroom": total_candidates - total_served,  # what auto-route could still deflect
+            "by_intent": by_intent,
+        }
 
     def export_distillation_records(
         self, *, project_id: str, target: str = "sft", limit: int = 1000,

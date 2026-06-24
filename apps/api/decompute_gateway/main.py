@@ -643,6 +643,46 @@ def _dashboard_request_rows(recent: list[dict[str, Any]]) -> str:
     return "".join(rows)
 
 
+def _dashboard_ts_card(project_id: str) -> str:
+    """Teacher-student card HTML for the dashboard (3-B). Shows the deflection + verification + observe
+    metrics an operator watches to decide whether to ramp auto-route. Empty string (card hidden) when
+    there's no teacher-student activity at all, so it never clutters a fresh install."""
+    try:
+        summ = store.teacher_student_summary(project_id=project_id)
+    except Exception:
+        return ""
+    obs = summ.get("observe") or {}
+    if not summ.get("cases") and not obs.get("candidates"):
+        return ""  # feature unused — hide the card
+    ev = summ.get("accept_evidence") or {}
+    judge = summ.get("judge") or {}
+
+    def stat(label: str, value: str, hint: str = "") -> str:
+        h = f'<span class="ts-hint">{hint}</span>' if hint else ""
+        return f'<div class="ts-stat"><div class="ts-val">{value}</div><div class="ts-lbl">{label}</div>{h}</div>'
+
+    cases = summ.get("cases", 0)
+    accepted = summ.get("student_accepted", 0)
+    esc = round((summ.get("escalation_rate") or 0.0) * 100)
+    pass_rate = round((judge.get("pass_rate") or 0.0) * 100)
+    cands = obs.get("candidates", 0)
+    served = obs.get("served_locally", 0)
+    headroom = obs.get("deflection_headroom", 0)
+    stats = (
+        stat("student-served", str(accepted), f"of {cases} runs")
+        + stat("escalated to Claude", f"{esc}%")
+        + stat("tests-backed", str(ev.get("tests_backed", 0)), f"judge-only {ev.get('judge_only', 0)}")
+        + stat("judge pass-rate", f"{pass_rate}%" if judge.get("consulted") else "—")
+        + stat("observe candidates", str(cands), f"on /v1/messages")
+        + stat("auto-route headroom", str(headroom), f"served {served}")
+    )
+    return (
+        '<section class="card ts-card"><div class="card-h">Teacher-Student '
+        '<span class="card-sub">local student deflection &amp; auto-route readiness</span></div>'
+        f'<div class="ts-grid">{stats}</div></section>'
+    )
+
+
 def _dur_compact(seconds: float) -> str:
     """Compact elapsed-time label for chart axis ticks: now / 15m / 2h / 3d / 2w."""
     s = int(max(0.0, seconds))
@@ -904,6 +944,7 @@ def dashboard(request: Request, response: Response) -> str:
         "__CH_AXIS_4__": chart["xLabels"][4],
         "__RANGE_DATA_JSON__": data_json,
         "__SCRIPT_NONCE__": nonce,
+        "__TS_CARD__": _dashboard_ts_card(principal.project_id),
     }
     out = _DASHBOARD_TEMPLATE
     for k, v in repl.items():
