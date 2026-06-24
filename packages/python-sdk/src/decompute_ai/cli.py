@@ -207,6 +207,13 @@ STUDENT_MODELS = [
         "note": "Solid small coder. The safe default for 8–16 GB; coherent code, low memory.",
     },
     {
+        "id": "deepseek-coder-6.7b",
+        "name": "DeepSeek-Coder 6.7B",
+        "hf": "TheBloke/deepseek-coder-6.7B-instruct-GGUF:Q5_K_M",
+        "gb": 4.8, "min_ram_gb": 16,
+        "note": "Strong, code-specialized 6.7B. A good Qwen-7B alternative on 16 GB.",
+    },
+    {
         "id": "qwen2.5-coder-7b",
         "name": "Qwen2.5-Coder 7B",
         "hf": "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF:Q5_K_M",
@@ -221,11 +228,32 @@ STUDENT_MODELS = [
         "note": "General-purpose 8B. Decent code, very good prose/explanations. Alternative to Qwen-7B on 16 GB.",
     },
     {
+        "id": "gemma-12b-coder-q4",
+        "name": "Gemma 12B Coder (Q4)",
+        "hf": "yuxinlu1/gemma-4-12B-coder-fable5-composer2.5-v1-GGUF:Q4_K_M",
+        "gb": 7.4, "min_ram_gb": 24,
+        "note": "12B coder at 4-bit. Stronger than the 7Bs but needs ~24 GB — froze 16 GB Macs in testing. For 24 GB+.",
+    },
+    {
         "id": "qwen2.5-coder-14b",
         "name": "Qwen2.5-Coder 14B",
         "hf": "Qwen/Qwen2.5-Coder-14B-Instruct-GGUF:Q4_K_M",
         "gb": 9.0, "min_ram_gb": 24,
         "note": "Noticeably stronger coding. Needs 24 GB+ to avoid swap. Great on 32 GB Macs.",
+    },
+    {
+        "id": "gemma-12b-coder-q8",
+        "name": "Gemma 12B Coder (Q8)",
+        "hf": "yuxinlu1/gemma-4-12B-coder-fable5-composer2.5-v1-GGUF:Q8_0",
+        "gb": 12.7, "min_ram_gb": 28,
+        "note": "Near-lossless 8-bit of the 12B coder. Best 12B quality; needs ~28 GB. For 32 GB+ machines.",
+    },
+    {
+        "id": "codestral-22b",
+        "name": "Codestral 22B",
+        "hf": "bartowski/Codestral-22B-v0.1-GGUF:Q4_K_M",
+        "gb": 13.0, "min_ram_gb": 28,
+        "note": "Mistral's code model. Excellent multi-language coding. Needs ~28 GB; great on 32 GB+.",
     },
     {
         "id": "qwen2.5-coder-32b",
@@ -365,6 +393,7 @@ def student_start(
     port: int = typer.Option(18080, "--port"),
     weight_gb: float = typer.Option(0.0, "--weight-gb", help="Model file size in GB for the RAM feasibility check."),
     force: bool = typer.Option(False, "--force", help="Bypass the RAM feasibility check (risk: swap thrash)."),
+    no_wait: bool = typer.Option(False, "--no-wait", help="Return immediately instead of showing a loading spinner until ready."),
 ):
     """Start the local student via scripts/start_student_llama_cpp.sh (user-managed, no auto-download).
 
@@ -405,7 +434,37 @@ def student_start(
         proc = subprocess.Popen(["bash", str(script)], env=env, stdout=lf, stderr=lf, start_new_session=True)
     pidfile.write_text(str(proc.pid))
     print(f"[green]started llama-server (pid {proc.pid})[/green]; logs: {log}")
-    print("  run [bold]decompute student status[/bold] in a few seconds to confirm readiness.")
+
+    if no_wait:
+        print("  run [bold]decompute student status[/bold] in a few seconds to confirm readiness.")
+        return
+
+    # Show a live spinner while the model loads (downloads can take minutes; loading a local file is
+    # seconds) so the user never feels stuck. Poll readiness; bail out loudly if the process dies.
+    from rich.console import Console
+
+    console = Console()
+    deadline = time.time() + (1800 if not model_path else 180)  # 30 min if downloading, 3 min if local
+    what = "downloading + loading the model" if not model_path else "loading the model into memory"
+    try:
+        with console.status(f"[cyan]{what}…[/cyan] (this can take a moment)", spinner="dots"):
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    console.print(f"[red]✗ llama-server exited (code {proc.returncode}) before it was ready.[/red]")
+                    console.print(f"  check the log:  [bold]{log}[/bold]")
+                    raise typer.Exit(1)
+                if _student_alive():
+                    break
+                time.sleep(2)
+            else:
+                console.print("[yellow]⚠ still not ready after the timeout — it may be a slow download.[/yellow]")
+                console.print(f"  follow progress:  [bold]tail -f {log}[/bold]   then [bold]decompute student status[/bold]")
+                return
+    except KeyboardInterrupt:
+        print("\n[dim](still loading in the background; check `decompute student status`)[/dim]")
+        return
+    print(f"[green]✓ student is ready[/green] at [cyan]{_student_base_url()}[/cyan]")
+    print("  try it:  [bold]decompute student smoke \"write a python function to reverse a string\"[/bold]")
 
 
 @student_app.command("stop")
