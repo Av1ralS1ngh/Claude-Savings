@@ -37,13 +37,38 @@ _PATCH_RE = re.compile(
     re.I,
 )
 _CODE_HINT_RE = re.compile(r"```|\bdef \b|\bclass \b|\bfunction\b|\bimport \b", re.I)
+# A language name is a strong signal the user wants code, even in casual phrasing
+# ("check if a number is prime in python", "a bash one-liner to ...").
+_LANG_RE = re.compile(
+    r"\b(python|javascript|typescript|java|golang|go lang|rust|c\+\+|c#|ruby|php|bash|shell|sql|"
+    r"kotlin|swift|scala|haskell|html|css|regex|json|yaml)\b",
+    re.I,
+)
+# Casual coding-task signals that don't require a "function/class" noun. Three forms:
+#   1. an explicit code noun ("snippet", "one-liner", "script", "regex", "query", "command")
+#   2. a produce-verb + a connector ("write a … to …", "give me … that …")
+#   3. a common algorithmic verb ("reverse", "sort", "check if", "compute", "parse", "count" …)
+# All require a coding CONTEXT (a language or code hint) to count — see classify_coding_intent — so
+# plain prose like "write a poem" or "summarize this article" stays unknown.
+_CASUAL_CODE_RE = re.compile(
+    r"\b(code|snippet|one[- ]?liner|script|program|regex|query|command)\b"
+    r"|\b(write|create|generate|give me|show me|produce)\b[^.\n]{0,40}\b(to|that|which|for)\b"
+    r"|\b(reverse|sort|compute|calculate|parse|count|check if|validate|convert|encode|decode|"
+    r"merge|filter|search|find|return|print|read|format|split|join|remove|replace|append)\b",
+    re.I,
+)
 
 
 def classify_coding_intent(text: str) -> str:
-    """Return the coding intent of a request's text. Conservative: `unknown` when unsure."""
+    """Return the coding intent of a request's text. Conservative: `unknown` when unsure.
+
+    Recognizes both explicit phrasings ("write a function to …") and casual ones ("check if a number
+    is prime in python", "a bash one-liner to …") — but a coding CONTEXT (a language name or code-ish
+    hint) is required for the looser patterns, so plain prose never misclassifies as code."""
     t = (text or "").strip()
     if not t:
         return "unknown"
+    has_code_context = bool(_LANG_RE.search(t) or _CODE_HINT_RE.search(t))
     # Most specific first.
     if _TEST_RE.search(t):
         return "test_generation"
@@ -54,8 +79,15 @@ def classify_coding_intent(text: str) -> str:
     # A patch-y verb + some code-ish signal -> simple code patch.
     if _PATCH_RE.search(t) and (_CODE_HINT_RE.search(t) or len(t) < 1000):
         return "simple_code_patch"
+    # "Explain/what does this code do" is a distinct, more-specific intent than a casual code request;
+    # check it BEFORE the loose casual-code pattern (which would otherwise grab "explain what this
+    # regex does").
     if _EXPLAIN_RE.search(t):
         return "explain_code"
+    # Casual phrasing, but only when there's a clear coding context (language/code hint) so we don't
+    # grab plain prose. Bounded length keeps it to short, student-sized tasks.
+    if has_code_context and _CASUAL_CODE_RE.search(t) and len(t) < 1000:
+        return "simple_code_patch"
     return "unknown"
 
 
