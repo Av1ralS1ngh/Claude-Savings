@@ -93,6 +93,30 @@ def _print_route_summary(resp: dict) -> None:
         print(f"  teacher called: no — est. teacher cost avoided ${avoided}")
 
 
+def _explain_ts_error(exc: Exception) -> None:
+    """Turn a raw teacher-student error into an actionable message — the common failures (gateway down,
+    feature not enabled, student down) get a clear 'here's what to do', not a cryptic 'HTTP 404'."""
+    status = getattr(exc, "status_code", None)
+    msg = str(exc)
+    gw = cfg_base_url()
+    if "connection to" in msg.lower() or "failed" in msg.lower() and status is None:
+        print(f"[red]✗ Can't reach the gateway[/red] at [cyan]{gw}[/cyan].")
+        print("  Is it running? Start your session with [bold]decompute claude[/bold] (it auto-starts the gateway),")
+        print("  or check [bold]decompute status[/bold].")
+    elif status == 404:
+        print("[red]✗ The teacher-student feature isn't available on this gateway.[/red]")
+        print(f"  The gateway at [cyan]{gw}[/cyan] doesn't expose /v1/teacher_student — it may be an older")
+        print("  build or have the feature disabled. Enable the local student with [bold]decompute student models[/bold],")
+        print("  then restart the gateway, or point [bold]decompute[/bold] at the gateway that has it.")
+    elif status == 503:
+        print("[red]✗ The local student isn't ready.[/red]")
+        print("  Start it with [bold]decompute student start[/bold], then [bold]decompute ts-health[/bold] to confirm.")
+    elif status in (401, 403):
+        print("[red]✗ Authentication failed for the gateway.[/red]  Check your key / run [bold]decompute init[/bold].")
+    else:
+        print(f"[red]teacher-student run failed:[/red] {msg}")
+
+
 @app.command("ts-run")
 def ts_run(
     task: str = typer.Argument(..., help="The coding task for the local student."),
@@ -111,7 +135,7 @@ def ts_run(
             max_tokens=max_tokens,
         )
     except DecomputeError as exc:
-        print(f"[red]teacher-student run failed:[/red] {exc}")
+        _explain_ts_error(exc)
         raise typer.Exit(1)
     answer = resp.get("final_answer")
     if answer:
@@ -149,7 +173,7 @@ def ts_health():
     try:
         h = _client().teacher_student.health()
     except DecomputeError as exc:
-        print(f"[red]ts-health failed:[/red] {exc}")
+        _explain_ts_error(exc)
         raise typer.Exit(1)
     enabled = h.get("enabled")
     sh = h.get("student_health") or {}

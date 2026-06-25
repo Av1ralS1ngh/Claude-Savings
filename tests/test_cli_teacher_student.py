@@ -196,3 +196,24 @@ def test_ts_run_prints_answer_and_route(monkeypatch):
     assert result.exit_code == 0
     assert "def add" in result.output
     assert "student_only" in result.output
+
+
+def test_explain_ts_error_actionable_messages(capsys):
+    """ts-run/ts-health turn raw errors into actionable guidance, not cryptic 'HTTP 404'."""
+    from decompute_ai.cli import _explain_ts_error
+    from decompute_ai.errors import APIError, DecomputeError
+
+    # 404 -> "feature not available" guidance
+    _explain_ts_error(APIError(404, "HTTP 404: Not Found"))
+    out = capsys.readouterr().out.lower()
+    assert "teacher-student feature isn't available" in out or "feature" in out
+
+    # connection failure -> "can't reach the gateway"
+    _explain_ts_error(DecomputeError("connection to http://127.0.0.1:9999 failed: refused"))
+    out = capsys.readouterr().out.lower()
+    assert "can't reach the gateway" in out
+
+    # 503 -> student not ready
+    _explain_ts_error(APIError(503, "student_unavailable"))
+    out = capsys.readouterr().out.lower()
+    assert "student isn't ready" in out or "student start" in out

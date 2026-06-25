@@ -175,7 +175,10 @@ def save_config(updates: dict) -> Path:
 
 # ── convenience accessors ─────────────────────────────────────────────────────
 def base_url() -> str:
-    return (load_config().get("gateway", {}).get("base_url") or DEFAULT_BASE_URL).rstrip("/")
+    """The gateway URL the CLI talks to. Precedence matches the client: DECOMPUTE_BASE_URL env >
+    config.toml [gateway].base_url > the local default. Honoring the env here keeps every consumer
+    (the client AND status/error messages) agreeing on which gateway is in use."""
+    return (os.getenv("DECOMPUTE_BASE_URL") or load_config().get("gateway", {}).get("base_url") or DEFAULT_BASE_URL).rstrip("/")
 
 
 def get_session_id() -> str | None:
