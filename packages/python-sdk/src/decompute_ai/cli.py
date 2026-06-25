@@ -184,6 +184,13 @@ def ts_health():
     print(f"  backend: {student.get('backend')}  model: {student.get('model')}  url: {student.get('base_url')}")
     print(f"  verifier threshold: {(h.get('verifier') or {}).get('threshold')}  judge: {(h.get('verifier') or {}).get('judge_enabled')}")
     print(f"  sandbox: {(h.get('sandbox') or {}).get('backend')}  governance: {(h.get('governance') or {}).get('mode')}")
+    # Actionable next step when something isn't ready — don't make the user infer it.
+    if not enabled:
+        print("\n  [yellow]→ The feature is off on the gateway.[/yellow] Set it up with [bold]decompute student models[/bold], then restart the gateway.")
+    elif not ok:
+        print("\n  [yellow]→ The local student model isn't responding.[/yellow] Start it with [bold]decompute student start[/bold] (then re-run [bold]decompute ts-health[/bold]).")
+    else:
+        print("\n  [green]→ Ready.[/green] Use it: [bold]decompute ts-run \"<task>\"[/bold], or [bold]/student <task>[/bold] inside [bold]decompute claude[/bold].")
 
 
 @app.command("local-chat")
