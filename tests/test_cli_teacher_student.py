@@ -217,3 +217,22 @@ def test_explain_ts_error_actionable_messages(capsys):
     _explain_ts_error(APIError(503, "student_unavailable"))
     out = capsys.readouterr().out.lower()
     assert "student isn't ready" in out or "student start" in out
+
+
+def test_commands_cheatsheet_lists_key_commands():
+    """`decompute commands` shows a grouped cheat-sheet covering the key user commands."""
+    result = runner.invoke(app, ["commands"])
+    assert result.exit_code == 0
+    for c in ("init", "claude", "student models", "ts-run", "status", "dashboard"):
+        assert c in result.output, f"cheat-sheet missing {c!r}"
+    # groups present
+    assert "Getting started" in result.output
+
+
+def test_commands_plain_is_deduped_scriptable():
+    result = runner.invoke(app, ["commands", "--plain"])
+    assert result.exit_code == 0
+    lines = [l for l in result.output.splitlines() if l.startswith("decompute ")]
+    assert "decompute init" in lines
+    # 'student models' + 'student start' must collapse to a single 'decompute student'
+    assert lines.count("decompute student") == 1

@@ -48,6 +48,7 @@ app = typer.Typer(
         "  1. decompute init                 set up + connect Claude Code\n"
         "  2. decompute student models       pick a local coding model (optional)\n"
         "  3. decompute claude               launch Claude Code through Decompute\n"
+        "  •  decompute commands             see EVERYTHING you can do (a grouped cheat-sheet)\n"
         "  •  decompute status               check everything's healthy\n"
         "  •  decompute dashboard            see your savings"
     ),
@@ -73,6 +74,69 @@ def _client() -> Decompute:
 def health():
     """Raw gateway /health JSON (low-level; prefer `decompute status` or `decompute doctor`)."""
     print(_client().get("/health"))
+
+
+# A curated, grouped cheat-sheet of everything Decompute can do — friendlier than the flat --help.
+# (name, one-line description) per group. Keep in sync when adding user-facing commands.
+_COMMAND_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
+    ("Getting started", [
+        ("init", "Set up Decompute + connect Claude Code (run this first)"),
+        ("claude", "Launch Claude Code through the Decompute gateway"),
+        ("vscode", "Configure a VS Code project to route through Decompute"),
+    ]),
+    ("Local coding model (teacher-student)", [
+        ("student models", "Pick + download a local coding model (RAM-aware)"),
+        ("student start", "Start the local model (loads it into memory)"),
+        ("student stop / status", "Stop the model / check if it's running"),
+        ("ts-run \"<task>\"", "Answer a coding task with the local model (verified)"),
+        ("ts-health", "Check the local model + verifier readiness"),
+        ("local-chat \"<prompt>\"", "Talk to the local model directly (unverified, debug)"),
+    ]),
+    ("See your usage & savings", [
+        ("status", "One-glance health: config, routing, gateway, savings"),
+        ("dashboard", "Open the savings dashboard in your browser"),
+        ("usage", "Show or export usage (CSV/JSON, date ranges)"),
+        ("limits", "Your quota — rate limits + monthly spend cap"),
+    ]),
+    ("Account & licensing", [
+        ("upgrade", "Subscribe to Pro for this device"),
+        ("activate", "Activate Pro after paying"),
+        ("license / billing", "Show your license / plan + subscription status"),
+        ("telemetry", "Control the weekly anonymous savings beacon"),
+    ]),
+    ("Diagnostics & config", [
+        ("doctor", "Diagnose gateway connection, auth, capabilities"),
+        ("config-show / config-set", "View / change non-secret config"),
+        ("version", "Show the CLI version (and check for updates)"),
+        ("support", "Support / debugging utilities"),
+        ("uninstall", "Remove Decompute (CLI, gateway, config)"),
+    ]),
+]
+
+
+@app.command("commands")
+def commands(plain: bool = typer.Option(False, "--plain", help="Plain list (one command per line, no grouping).")):
+    """Show everything Decompute can do — a grouped cheat-sheet of all commands.
+
+    (Tip: `decompute <command> --help` shows options for any command.)"""
+    if plain:
+        seen: set[str] = set()
+        for _group, items in _COMMAND_GROUPS:
+            for name, _desc in items:
+                # First token = the base command (e.g. "student models" -> "student"); dedupe.
+                base = name.split(" ")[0].rstrip('"')
+                if base not in seen:
+                    seen.add(base)
+                    print(f"decompute {base}")
+        return
+    print("\n[bold]Decompute — what you can do[/bold]  [dim](decompute <command> --help for details)[/dim]\n")
+    for group, items in _COMMAND_GROUPS:
+        print(f"[bold cyan]{group}[/bold cyan]")
+        width = max(len(n) for n, _ in items)
+        for name, desc in items:
+            print(f"  [bold]decompute {name.ljust(width)}[/bold]  [dim]{desc}[/dim]")
+        print()
+    print("[dim]Inside a `decompute claude` session, use [/dim][bold]/student <task>[/bold][dim] to answer with the local model.[/dim]")
 
 
 def _read_tests_arg(tests: str | None) -> str | None:
@@ -1467,6 +1531,9 @@ def init(
                 _open(dash_url)
         except (EOFError, typer.Abort):
             pass
+
+    # Leave them knowing how to discover everything — the last thing they see.
+    print("\n[bold]You're set up.[/bold]  Run [bold cyan]decompute commands[/bold cyan] any time to see everything you can do.")
 
 
 def _check_anthropic_key(key: str) -> str:
