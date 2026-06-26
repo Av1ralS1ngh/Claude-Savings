@@ -40,7 +40,19 @@ from .config import (
 )
 from .errors import DecomputeError
 
-app = typer.Typer(help="Decompute Gateway CLI — BYOK (bring your own Claude key)")
+app = typer.Typer(
+    help=(
+        "Decompute — run Claude Code through a local gateway that compresses prompts and can answer "
+        "routine coding tasks with a LOCAL model (verified, falling back to Claude).\n\n"
+        "New here? Start with these:\n"
+        "  1. decompute init                 set up + connect Claude Code\n"
+        "  2. decompute student models       pick a local coding model (optional)\n"
+        "  3. decompute claude               launch Claude Code through Decompute\n"
+        "  •  decompute status               check everything's healthy\n"
+        "  •  decompute dashboard            see your savings"
+    ),
+    no_args_is_help=True,
+)
 configure_app = typer.Typer(help="Configure editor and agent integrations.")
 app.add_typer(configure_app, name="configure")
 
@@ -57,8 +69,9 @@ def _client() -> Decompute:
     return Decompute()
 
 
-@app.command()
+@app.command(hidden=True)
 def health():
+    """Raw gateway /health JSON (low-level; prefer `decompute status` or `decompute doctor`)."""
     print(_client().get("/health"))
 
 
@@ -2298,30 +2311,35 @@ def support_send(
                          dry_run=False, send=True)
 
 
-@app.command("devices-scan")
+@app.command("devices-scan", hidden=True)
 def devices_scan():
+    """Dev: scan local compute devices the planner sees."""
     print_json(_client().devices.scan())
 
 
-@app.command("devices-list")
+@app.command("devices-list", hidden=True)
 def devices_list():
+    """Dev: list registered devices."""
     print_json(_client().devices.list())
 
 
-@app.command("compress")
+@app.command("compress", hidden=True)
 def compress(path: Optional[Path] = None, text: Optional[str] = None, mode: str = "safe"):
+    """Dev: preview the compression of some text (debugging the compressor)."""
     content = text or (path.read_text() if path else typer.prompt("Text"))
     print_json(_client().compression.preview([{"role": "tool", "content": content}], mode=mode))
 
 
-@app.command("plan")
+@app.command("plan", hidden=True)
 def plan(model: str = "claude-sonnet-4-5", path: Optional[Path] = None, message: str = "Hello"):
+    """Dev: show the routing/compression plan for a message (debugging the planner)."""
     content = path.read_text() if path else message
     print_json(_client().routes.plan(model=model, messages=[{"role": "user", "content": content}]))
 
 
-@app.command("chat")
+@app.command("chat", hidden=True)
 def chat(message: str, model: str = "claude-sonnet-4-5"):
+    """Dev: one-shot chat completion through the gateway (debugging)."""
     print_json(_client().chat.completions.create(model=model, messages=[{"role": "user", "content": message}]))
 
 
