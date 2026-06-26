@@ -29,14 +29,29 @@ The whole premise is "a bigger student deflects more coding traffic from Claude.
 hypothesis, not a fact, and distributed inference is the most expensive way to test it.** Before any
 clustering work, run a cheap eval:
 
-- Take real (or representative) Decompute coding traffic. Run it through the *existing* verifier with
-  (a) the current 7B student and (b) a 32B coder served on a single big box / cloud GPU (any
-  OpenAI-compatible endpoint — no clustering needed to measure this).
-- Measure: verifier **accept-rate** (student_only), **TTFT + tokens/s**, and the **net cost** including
-  the Claude **judge** call that still happens on the verify path.
-- **Decision gate:** clustering is worth building only if the bigger student's higher accept-rate, at
-  acceptable latency, **net-saves money** after judge cost + support + the TTFT tax. If a 32B clears
-  the verifier only marginally more than a 7B, sharding it over a home network is a net loss.
+**Design (gate-grade, not vibes).** Compare **7B vs 14B/16B vs 32B**, each served via an
+OpenAI-compatible endpoint (single big box / cloud GPU — no clustering needed to measure). Hold
+everything else identical across models: routing, prompts, verifier, **judge model**, temperature,
+context budget, timeout.
+
+- **Task set:** a **stratified** sample of real/representative Decompute coding tasks (e.g. by intent:
+  simple_code_patch / lint_fix / docs_edit / test_generation, and by size), **n ≥ 300** per model so
+  accept-rate differences carry error bars (report 95% CIs).
+- **Metrics per model:** verifier **accept-rate** (student_only), **false-accept rate** (judge/post-hoc
+  said wrong), Claude **escalation rate**, **human/test acceptance** on a sampled subset, **p50/p95
+  TTFT**, **p50/p95 total latency**, **endpoint $**, **Claude judge $**, and **avoided Claude
+  generation $**.
+- **Cost formula (per task):**
+  `net = endpoint_cost + claude_judge_cost − avoided_claude_generation_cost`. Sum across the set; a
+  model "pays" only if `Σ net < Σ net(7B)` by a material margin.
+- **Predeclared thresholds (set the numbers BEFORE running — these are business calls, placeholders
+  here):** ship a bigger student only if it
+  **(N)** raises verified accept-rate by **≥ N pp** (e.g. 10), **(M)** cuts Σ net cost by **≥ M%**
+  (e.g. 15), **(FA)** keeps false-accept rate **non-inferior** to the 7B, and **(T)** keeps **p95 total
+  latency < T** (e.g. 8 s for interactive coding). All four must pass.
+- **Go/no-go:** if a 32B doesn't clear all four vs 7B, do **not** build clustering (and probably not even
+  the bigger single-box student). If it clears them on a single box, *then* ask whether a home cluster
+  is the cheapest way to deliver that bigger model (often it isn't — §4 `openai_endpoint`).
 
 **Also evaluate the cheaper-than-sharding levers first** (any of these may beat clustering):
 - Better routing / a sharper coding-intent gate (already improved).
@@ -113,13 +128,25 @@ policy" as the product.** Concrete backends are implementations behind one contr
 | `exo` | a user-run exo cluster (`:52415/v1`), Apple-Silicon | **Experimental BYO** |
 | `llama_cpp_rpc` | GGUF sharded across a home cluster via llama.cpp RPC | **Experimental, gated** |
 
-The **contract** every backend must satisfy:
+**The contract is split into a generic base (every backend) + an optional cluster extension (only
+cluster backends).** Forcing `openai_endpoint`/vLLM/hosted to report pooled-memory/per-node was wrong —
+a random OpenAI-compatible server exposes none of that.
+
+`BaseCapability` — **every** backend must provide:
 1. OpenAI `/v1/chat/completions` (non-streaming for the verified student path — see §7).
-2. A **capability/health report**: model id, reachable?, pooled memory, per-node status, and a
-   **measured** readiness (loaded + a canary token) — not just "port open."
-3. A **preflight** the gateway runs before trusting it to serve (security posture + benchmark floor).
-4. Honor the **fallback policy** (§7): the gateway can abandon it and use Claude before any
-   user-visible output or side effect.
+2. **Reachable + model id**, and a **measured readiness**: a canary call returning **TTFT + tokens/s**
+   (not just "port open").
+3. A **conformance profile** (§13): tool-calls supported?, JSON/structured-output mode?, context
+   window, streaming chunk shape, stop-sequence + error semantics. "OpenAI-compatible" is leaky; we
+   probe it, we don't assume it.
+4. Honor the **fallback policy** (§7): abandonable for Claude before any user-visible output or side
+   effect.
+
+`ClusterCapability` (**optional**, only `llama_cpp_rpc` / `exo` / multi-node vLLM) — adds: pooled
+memory, **per-node status**, interconnect benchmark, and the empirical feasibility verdict (§5).
+
+A `preflight` runs the security posture (§6) + the benchmark floor before the gateway trusts any backend
+to serve.
 
 This makes "single bigger box," "hosted GPU," "exo," and "llama.cpp cluster" the *same* product surface
 — and lets us ship the high-value, low-risk part (point the student at a bigger endpoint) without the
@@ -188,9 +215,28 @@ transparently retry with Claude (duplication / state-repair). So:
 ## 8. Phasing (re-sliced per the review)
 
 **V1a — the backend contract (no clustering).** Generalize the provider to "any OpenAI-compatible
-student endpoint" (`openai_endpoint` backend), with capability/health reporting, the preflight, and the
-pre-stream fallback circuit-breaker. Ship "point your student at a bigger box / private GPU / hosted
-endpoint." This delivers most of the value (a bigger student) with **none** of the cluster risk.
+student endpoint" (`openai_endpoint` backend). Ship "point your student at a bigger box / private GPU /
+hosted endpoint." Delivers most of the value (a bigger student) with **none** of the cluster risk — but
+it is **not trivial**; do it properly. **V1a must include:**
+- **Endpoint config + auth-secret storage** (the endpoint's API key handled like the Claude key —
+  chmod-600, never logged, never echoed).
+- **Canary health check** with measured **TTFT + tokens/s** (the `BaseCapability` readiness).
+- **Endpoint conformance profile** — probe tools, JSON mode, context window, streaming, stop behavior
+  (§13); refuse/limit a student that can't do what the verify path needs.
+- **Pre-stream timeout/fallback** — the §7 circuit-breaker (buffered-until-verified for any non-trusted
+  endpoint; no streaming an unverified third-party draft).
+- **Cost + judge-call accounting** — record endpoint $ and the Claude judge $ that still fires on the
+  verify path, so savings are honest (§13).
+- **Privacy warning + consent** for a **non-local** endpoint — sending proprietary code to a third party
+  is a trust-boundary change; require explicit opt-in + a clear notice (§13).
+- **SSRF protections + TLS rules** — the gateway accepts a user-supplied URL, so: block
+  internal/metadata IPs (169.254.169.254, RFC-1918 unless explicitly a local student, localhost rules),
+  require https for non-loopback, validate the host. (Mirror the existing `local_student_base_url`
+  loopback guard, generalized.)
+- **Metrics** — local accept-rate, **fallback reason**, and the **Claude spend delta** vs baseline.
+- **The §0 eval harness/instrumentation lands HERE** — V1a is exactly what makes the §0 decision
+  measurable (it's how you serve a 32B from a single endpoint and record the metrics). Build the eval
+  on top of V1a's accounting, not as a throwaway script.
 
 **V1b — experimental llama.cpp RPC, one validated topology.** A single, validated **2-node** topology;
 **one pinned llama.cpp build**; **one pinned GGUF**; **no WiFi**; **no student streaming**; the §6
@@ -250,3 +296,36 @@ student and should ship first (V1a).
    satisfy the goal** ("host a larger student") at a fraction of the risk?
 3. **Cost guardrails:** are we comfortable that a degraded cluster silently shifts spend back to Claude,
    and how do we alert on it?
+
+---
+
+## 13. New risks the reframe introduces (V1a's real hard parts)
+
+Opening up `openai_endpoint` changes what Decompute *is*, and these must be designed up front:
+
+1. **Trust-boundary change (the biggest one).** Today it's "local student or Claude." Once
+   `openai_endpoint` is GA, Decompute can send **proprietary code to any configured third-party
+   server**. This needs: explicit **per-endpoint consent**, a **privacy notice**, **audit logs** of
+   what was sent where, **per-project policy** (an org can forbid non-local endpoints), and clear docs.
+   A non-loopback endpoint is **off by default** and opt-in. Local endpoints (loopback/Tailscale) are
+   the trusted default.
+2. **"OpenAI-compatible" is a leaky abstraction.** Chat-completions shape is not enough — coding agents
+   depend on **tool calls, structured/JSON output, stop sequences, context size, streaming chunk shape,
+   and error semantics**, which drift across servers (vLLM ≠ llama.cpp ≠ exo ≠ hosted). **Build a
+   conformance suite early** (it backs the `BaseCapability` conformance profile in §4): probe each
+   endpoint once, record what it actually supports, and degrade/refuse on the verify path accordingly.
+3. **Savings attribution gets harder — be honest.** A hosted 32B may deflect Claude but **cost money
+   elsewhere**. If the user hasn't configured the endpoint's pricing, the dashboard must say **"Claude
+   spend reduced"**, **not** "net savings." Only claim net savings when we can compute
+   `endpoint_cost + judge_cost − avoided_claude_cost`. Never overstate.
+
+---
+
+## 14. Status: APPROVED to build V1a (per second Codex review)
+
+Codex's verdict: *"sound to start building V1a from,"* conditioned on two pre-implementation changes,
+**both now incorporated**: (a) the backend contract is split into `BaseCapability` + optional
+`ClusterCapability` (§4), and (b) the §0 eval has explicit predeclared thresholds (N/M/FA/T), sample
+size, stratification, false-accept tracking, and a cost formula. V1a's full requirement list is in §8;
+its new hard parts (trust boundary, conformance, honest attribution) are §13. Clustering (V1b/V1c)
+remains gated behind the §0 eval + §5/§6 gates. **Awaiting the boss's green light to implement V1a.**
