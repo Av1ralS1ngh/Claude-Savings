@@ -281,6 +281,11 @@ class Settings:
     local_student_overall_timeout_s: float = _float("DECOMPUTE_LOCAL_STUDENT_OVERALL_TIMEOUT_S", 120.0)
     local_student_health_ttl_s: float = _float("DECOMPUTE_LOCAL_STUDENT_HEALTH_TTL_S", 15.0)
     local_student_max_concurrency: int = _int("DECOMPUTE_LOCAL_STUDENT_MAX_CONCURRENCY", 1)
+    # The local model serves ONE request at a time (single GPU); concurrent requests queue on a
+    # semaphore. This caps how long a request waits IN THE QUEUE before giving up with a clear "busy"
+    # error — so a burst fails fast (and escalates to Claude) instead of a request hanging behind a long
+    # backlog. Separate from overall_timeout_s, which bounds the request once it's actually running.
+    local_student_queue_timeout_s: float = _float("DECOMPUTE_LOCAL_STUDENT_QUEUE_TIMEOUT_S", 45.0)
     # A test-ONLY in-process mock provider. NEVER a runtime fallback for a down model — a down student
     # raises a typed error or escalates to the teacher (plan invariant #3, "no silent mock fallback").
     # Rejected in production by validate_for_startup.

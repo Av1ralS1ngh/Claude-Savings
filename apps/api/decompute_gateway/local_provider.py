@@ -220,6 +220,7 @@ class LocalStudentProvider:
         overall_timeout_s: float = 120.0,
         health_ttl_s: float = 15.0,
         max_concurrency: int = 1,
+        queue_timeout_s: float = 45.0,
         backend: str = "llama_cpp",
         transport: httpx.AsyncBaseTransport | None = None,
     ):
@@ -233,6 +234,7 @@ class LocalStudentProvider:
         self.overall_timeout_s = overall_timeout_s
         self.health_ttl_s = health_ttl_s
         self.max_concurrency = max_concurrency
+        self.queue_timeout_s = queue_timeout_s
         self.backend = backend
         self._transport = transport
         self._health_cache: _HealthCacheEntry | None = None
@@ -250,6 +252,7 @@ class LocalStudentProvider:
             overall_timeout_s=settings.local_student_overall_timeout_s,
             health_ttl_s=settings.local_student_health_ttl_s,
             max_concurrency=settings.local_student_max_concurrency,
+            queue_timeout_s=settings.local_student_queue_timeout_s,
             backend=settings.local_student_backend,
             transport=transport,
         )
@@ -383,7 +386,17 @@ class LocalStudentProvider:
 
         started = time.perf_counter()
         sem = _semaphore_for(self.base_url, self.max_concurrency)
-        async with sem:
+        # The model serves one request at a time; concurrent calls queue here. Bound the QUEUE WAIT
+        # separately so a burst fails fast with a clear "busy" error (the caller escalates to Claude)
+        # instead of a request hanging behind a long backlog. Only the wait is bounded — once we hold
+        # the slot, overall_timeout_s bounds the actual request.
+        try:
+            await asyncio.wait_for(sem.acquire(), timeout=self.queue_timeout_s)
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            raise LocalProviderTimeout(
+                f"local student is busy (queue wait exceeded {self.queue_timeout_s:.0f}s)"
+            ) from exc
+        try:
             try:
                 # Wall-clock cap (M1): httpx read timeout only bounds the gap between bytes, so a
                 # backend that drips bytes could hold the semaphore forever. wait_for bounds the WHOLE
@@ -395,6 +408,8 @@ class LocalStudentProvider:
                 raise LocalProviderTimeout(f"student timed out: {type(exc).__name__}") from exc
             except httpx.HTTPError as exc:
                 raise LocalProviderUnavailable(f"student unreachable: {type(exc).__name__}") from exc
+        finally:
+            sem.release()
 
         if resp.status_code >= 400:
             # Never echo the backend's raw body (it may include the prompt); a slug + status is enough.

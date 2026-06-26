@@ -360,3 +360,27 @@ def test_context_check_includes_output_budget():
     with pytest.raises(lp.LocalProviderOverContext):
         asyncio.run(prov.chat(messages=[{"role": "user", "content": "word " * 60}], max_tokens=256))
     assert calls["n"] == 0
+
+
+def test_queue_timeout_fails_fast_when_busy():
+    """Under a backlog (the single slot is held), a queued request must fail fast with a clear 'busy'
+    timeout — so a burst escalates to Claude instead of hanging behind the queue."""
+    import asyncio
+    from decompute_gateway.local_provider import (
+        LocalStudentProvider, LocalProviderTimeout, _semaphore_for,
+    )
+
+    async def go():
+        p = LocalStudentProvider(base_url="http://127.0.0.1:18080/v1", model="m",
+                                 max_concurrency=1, queue_timeout_s=0.3)
+        sem = _semaphore_for(p.base_url, 1)
+        await sem.acquire()  # occupy the only slot
+        try:
+            with pytest.raises(LocalProviderTimeout) as ei:
+                await p.chat(messages=[{"role": "user", "content": "hi"}], system="",
+                             max_tokens=10, temperature=0.2)
+            assert "busy" in str(ei.value).lower()
+        finally:
+            sem.release()
+
+    asyncio.run(go())
