@@ -763,10 +763,21 @@ def _dashboard_ts_card(project_id: str) -> str:
         + stat("observe candidates", str(cands), f"on /v1/messages")
         + stat("auto-route headroom", str(headroom), f"served {served}")
     )
+    # Honest attribution (plan §13): when the student runs on a non-local (paid) endpoint, the deflection
+    # avoids Claude spend GROSS — it doesn't net out the endpoint's own cost, which we don't know. Say so
+    # rather than imply pure savings. Local (loopback) students have ~no marginal cost, so no footnote.
+    note = ""
+    try:
+        from .endpoint_security import classify_endpoint
+        if classify_endpoint(settings.local_student_base_url).tier != "loopback":
+            note = ('<div class="ts-note">Student runs on a remote endpoint — deflection shows Claude '
+                    'spend <b>avoided</b>, which doesn\'t subtract the endpoint\'s own cost.</div>')
+    except Exception:
+        pass
     return (
         '<section class="card ts-card"><div class="card-h">Teacher-Student '
         '<span class="card-sub">local student deflection &amp; auto-route readiness</span></div>'
-        f'<div class="ts-grid">{stats}</div></section>'
+        f'<div class="ts-grid">{stats}</div>{note}</section>'
     )
 
 
