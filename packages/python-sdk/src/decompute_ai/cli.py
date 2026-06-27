@@ -199,13 +199,25 @@ def _explain_ts_error(exc: Exception) -> None:
 
 @app.command("ts-run")
 def ts_run(
-    task: str = typer.Argument(..., help="The coding task for the local student."),
+    task: Optional[str] = typer.Argument(None, help="The coding task for the local student."),
+    task_file: Optional[Path] = typer.Option(None, "--task-file", help="Read the task from a file (for multi-line tasks; avoids shell quoting — used by the VS Code extension)."),
     tests: Optional[str] = typer.Option(None, "--tests", help="Inline assertions or a path to a test file."),
     require_teacher: bool = typer.Option(False, "--require-teacher", help="Always get Claude review/correction."),
     execute_tests: bool = typer.Option(False, "--execute-tests", help="Run tests in the sandbox (only if server policy allows)."),
     max_tokens: int = typer.Option(2048, "--max-tokens"),
 ):
-    """Run one teacher-student coding task (local student, verified, escalates to Claude if risky)."""
+    """Run one teacher-student coding task (local student, verified, escalates to Claude if risky).
+
+    The task comes from the argument OR --task-file (a file is safer for multi-line code)."""
+    if task_file is not None:
+        try:
+            task = task_file.expanduser().read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            print(f"[red]✗[/red] couldn't read --task-file: {exc}")
+            raise typer.Exit(2)
+    if not task or not task.strip():
+        print("[red]✗[/red] no task given (pass a task argument or --task-file).")
+        raise typer.Exit(2)
     try:
         resp = _client().teacher_student.run(
             task,

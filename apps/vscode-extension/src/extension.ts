@@ -191,6 +191,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("decompute.askLocalStudent", () => askLocalStudent()),
     vscode.commands.registerCommand("decompute.teacherStudentSolve", () => teacherStudentSolve()),
     vscode.commands.registerCommand("decompute.setupLocalStudent", () => setupLocalStudent()),
+    vscode.commands.registerCommand("decompute.localStudentHealth", () => localStudentHealth()),
     vscode.commands.registerCommand("decompute.uninstall", () => uninstallDecompute(context)),
   );
 
@@ -742,7 +743,23 @@ async function runTeacherStudent(task: string, opts: { requireTeacher?: boolean 
   }
   const terminal = decomputeTerminal("Decompute · local student");
   terminal.show();
-  let line = `${cmd(bin)} ts-run ${q(task)}`;
+  // A multi-line task (e.g. a code selection) must NOT go on the command line: embedded newlines
+  // execute mid-command across shells (bash/zsh/pwsh). Write it to a temp file and pass --task-file,
+  // so the terminal command is always a single clean line. Single-line tasks stay inline for clarity.
+  let taskArg: string;
+  if (task.includes("\n")) {
+    const tmp = path.join(os.tmpdir(), `decompute-task-${randomUUID()}.txt`);
+    try {
+      fs.writeFileSync(tmp, task, { encoding: "utf8", mode: 0o600 });
+      taskArg = `--task-file ${q(tmp)}`;
+    } catch {
+      // Fall back to inline if the temp write fails (best-effort).
+      taskArg = q(task);
+    }
+  } else {
+    taskArg = q(task);
+  }
+  let line = `${cmd(bin)} ts-run ${taskArg}`;
   if (opts.requireTeacher) line += " --require-teacher";
   // addNewLine=true: run it (the answer streams into the terminal). The user sees route + verifier line.
   terminal.sendText(line, true);
@@ -802,6 +819,22 @@ async function setupLocalStudent(): Promise<void> {
   const terminal = decomputeTerminal("Decompute · student model setup");
   terminal.show();
   terminal.sendText(`${cmd(bin)} student models`, true);
+}
+
+/** "Local Student Health": check the local model + verifier are ready (with a measured canary). */
+async function localStudentHealth(): Promise<void> {
+  const bin = await whichCli();
+  if (!bin) {
+    const pick = await vscode.window.showWarningMessage(
+      "Decompute CLI isn't installed yet. Run setup first.",
+      "Set Up Decompute"
+    );
+    if (pick === "Set Up Decompute") await runSetupWizard();
+    return;
+  }
+  const terminal = decomputeTerminal("Decompute · local student");
+  terminal.show();
+  terminal.sendText(`${cmd(bin)} ts-health --measure`, true);
 }
 
 async function configureGatewayUrl(): Promise<void> {

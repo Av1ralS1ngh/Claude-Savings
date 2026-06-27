@@ -2,7 +2,7 @@
   "name": "decompute",
   "displayName": "Claude Savings",
   "description": "Cut your Claude Code token bill. A local gateway compresses context before each request — same model, same answers, fewer tokens. Bring your own key; runs entirely on your machine.",
-  "version": "0.1.17",
+  "version": "0.1.18",
   "publisher": "decompute",
   "license": "MIT",
   "icon": "icon.png",
@@ -112,6 +112,10 @@
       {
         "command": "decompute.setupLocalStudent",
         "title": "Decompute: Set Up Local Student Model"
+      },
+      {
+        "command": "decompute.localStudentHealth",
+        "title": "Decompute: Local Student Health (check it's ready)"
       },
       {
         "command": "decompute.uninstall",

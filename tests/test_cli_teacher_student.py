@@ -319,3 +319,34 @@ def test_ts_eval_summarizes_accept_rate(monkeypatch, tmp_path):
     line = json.loads(out.read_text().strip().splitlines()[-1])
     assert line["n"] == 3 and line["accepted_local"] == 2 and line["escalated_to_claude"] == 1
     assert line["label"] == "t"
+
+
+def test_ts_run_task_file_handles_multiline(monkeypatch, tmp_path):
+    """--task-file reads a multi-line task (the VS Code 'solve on selection' path) intact, avoiding
+    shell-quoting/newline problems of passing code on the command line."""
+    import decompute_ai.cli as cli
+
+    seen = {}
+
+    class _FakeTS:
+        def run(self, task, **k):
+            seen["task"] = task
+            return {"final_answer": "ok", "route": "student_only",
+                    "verdict": {"confidence": 0.9}, "usage": {"teacher_called": False,
+                    "estimated_teacher_cost_avoided_usd": 0.0}}
+
+    class _FakeClient:
+        teacher_student = _FakeTS()
+
+    monkeypatch.setattr(cli, "_client", lambda: _FakeClient())
+    f = tmp_path / "task.txt"
+    f.write_text("add a docstring:\n\ndef add(a, b):\n    return a + b\n")
+    r = runner.invoke(cli.app, ["ts-run", "--task-file", str(f)])
+    assert r.exit_code == 0, r.output
+    assert "\n" in seen["task"] and "def add" in seen["task"]
+
+
+def test_ts_run_empty_task_errors_clearly():
+    r = runner.invoke(app, ["ts-run"])
+    assert r.exit_code == 2
+    assert "no task" in r.output.lower()
