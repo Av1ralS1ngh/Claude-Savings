@@ -21,6 +21,7 @@ Design contract (see docs/teacher_student_plan.md §"Provider Design"):
 from __future__ import annotations
 
 import asyncio
+import json as _json
 from dataclasses import dataclass, field
 import time
 from typing import Any
@@ -344,6 +345,84 @@ class LocalStudentProvider:
             "latency_ms": int((time.perf_counter() - started) * 1000),
             "context_window": self.context_window,
         }
+
+    # ── Preflight: measured capability (V1a BaseCapability) ───────────────────
+    # "Is the port open?" is not enough to trust an endpoint to serve. The preflight MEASURES readiness
+    # (a real token stream → TTFT + tokens/s) and reports the security tier, so the gateway/eval can
+    # gate on a usability floor (§5) and so the §0 eval has its latency inputs. No prompts/keys leak.
+
+    async def canary(self, *, max_tokens: int = 16) -> dict[str, Any]:
+        """One tiny streaming completion to measure time-to-first-token + tokens/s. Never raises."""
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": "Reply with the single word: ok"}],
+            "max_tokens": max_tokens,
+            "temperature": 0.0,
+            "stream": True,
+        }
+        started = time.perf_counter()
+        ttft_ms: float | None = None
+        out_tokens = 0
+        try:
+            async with self._client(read_timeout_s=min(self.overall_timeout_s, 30.0)) as client:
+                async with client.stream("POST", "/chat/completions", json=payload, headers=self._headers()) as resp:
+                    if resp.status_code >= 400:
+                        return {"ok": False, "error": f"http_{resp.status_code}"}
+                    async for line in resp.aiter_lines():
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data = line[len("data:"):].strip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            delta = (((_json.loads(data).get("choices") or [{}])[0]).get("delta") or {}).get("content")
+                        except Exception:
+                            continue
+                        if delta:
+                            if ttft_ms is None:
+                                ttft_ms = (time.perf_counter() - started) * 1000
+                            out_tokens += 1  # ~1 chunk ≈ 1 token; a rough but consistent measure
+        except httpx.HTTPError as exc:
+            return {"ok": False, "error": "unreachable", "error_detail": type(exc).__name__}
+        total_ms = (time.perf_counter() - started) * 1000
+        if ttft_ms is None:
+            return {"ok": False, "error": "no_tokens"}
+        gen_ms = max(1.0, total_ms - ttft_ms)
+        return {
+            "ok": True,
+            "ttft_ms": int(ttft_ms),
+            "tokens_per_s": round(out_tokens / (gen_ms / 1000.0), 1) if out_tokens else 0.0,
+            "sample_tokens": out_tokens,
+        }
+
+    async def preflight(self) -> dict[str, Any]:
+        """Full BaseCapability for this endpoint: security tier + reachability + a measured canary.
+        Never raises. The gateway/eval use `measured_ok` + `tokens_per_s` to gate serving."""
+        from .endpoint_security import classify_endpoint
+
+        tier_v = classify_endpoint(self.base_url)
+        h = await self.health(force=True)
+        cap: dict[str, Any] = {
+            "backend": self.backend,
+            "base_url": self.base_url,
+            "model": self.model,
+            "context_window": self.context_window,
+            "trust_tier": tier_v.tier,
+            "endpoint_ok": tier_v.ok,
+            "reachable": bool(h.get("ok")),
+            "models_loaded": h.get("models_loaded", []),
+        }
+        if cap["reachable"] and tier_v.ok:
+            c = await self.canary()
+            cap["measured_ok"] = bool(c.get("ok"))
+            cap["ttft_ms"] = c.get("ttft_ms")
+            cap["tokens_per_s"] = c.get("tokens_per_s")
+            if not c.get("ok"):
+                cap["measure_error"] = c.get("error")
+        else:
+            cap["measured_ok"] = False
+            cap["measure_error"] = "endpoint_blocked" if not tier_v.ok else "unreachable"
+        return cap
 
     # ── Generation ────────────────────────────────────────────────────────────
 

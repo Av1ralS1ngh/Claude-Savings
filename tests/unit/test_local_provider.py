@@ -384,3 +384,54 @@ def test_queue_timeout_fails_fast_when_busy():
             sem.release()
 
     asyncio.run(go())
+
+
+# ── Preflight / canary (V1a BaseCapability) ─────────────────────────────────────
+
+def _sse_chat(chunks: list[str]) -> httpx.Response:
+    """An OpenAI-style streaming chat-completions response built from text chunks."""
+    body = ""
+    for c in chunks:
+        body += 'data: {"choices":[{"delta":{"content":%s}}]}\n\n' % json.dumps(c)
+    body += "data: [DONE]\n\n"
+    return httpx.Response(200, text=body, headers={"content-type": "text/event-stream"})
+
+
+def test_preflight_reports_tier_reachable_and_measured():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "local-student-coder"}]})
+        if request.url.path.endswith("/chat/completions"):
+            return _sse_chat(["o", "k"])
+        return httpx.Response(404)
+
+    prov = _provider(handler, backend="llama_cpp")
+    cap = asyncio.run(prov.preflight())
+    assert cap["trust_tier"] == "loopback"      # 127.0.0.1 endpoint
+    assert cap["endpoint_ok"] is True
+    assert cap["reachable"] is True
+    assert cap["measured_ok"] is True
+    assert cap["ttft_ms"] is not None
+    assert cap["tokens_per_s"] >= 0
+
+
+def test_preflight_unreachable_is_not_measured():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused")
+
+    cap = asyncio.run(_provider(handler).preflight())
+    assert cap["reachable"] is False
+    assert cap["measured_ok"] is False
+    assert cap["measure_error"] == "unreachable"
+
+
+def test_preflight_blocked_endpoint_is_not_measured():
+    # A metadata-IP endpoint must be flagged blocked by the security tier and never measured.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": []})
+
+    prov = _provider(handler, base_url="http://169.254.169.254/v1")
+    cap = asyncio.run(prov.preflight())
+    assert cap["endpoint_ok"] is False
+    assert cap["trust_tier"] == "blocked"
+    assert cap["measured_ok"] is False
