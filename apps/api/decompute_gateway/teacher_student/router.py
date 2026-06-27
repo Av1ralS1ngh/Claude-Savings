@@ -143,7 +143,9 @@ def include_teacher_student_router(
     async def teacher_student_health(request: Request):
         auth_func(request, "routes:read")
         service = _build_service(request)
-        return JSONResponse(await service.health())
+        # ?measure=true runs the full preflight (a tiny canary → TTFT + tokens/s). On-demand only.
+        measure = request.query_params.get("measure", "").lower() in ("1", "true", "yes")
+        return JSONResponse(await service.health(measure=measure))
 
     @router.post("/run")
     async def teacher_student_run(payload: TeacherStudentRunRequest, request: Request):

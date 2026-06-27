@@ -246,10 +246,12 @@ def ts_export(
 
 
 @app.command("ts-health")
-def ts_health():
-    """Show local student / teacher readiness."""
+def ts_health(
+    measure: bool = typer.Option(False, "--measure", help="Run a live readiness canary (TTFT + tokens/s)."),
+):
+    """Show local student / teacher readiness (and the endpoint's trust tier)."""
     try:
-        h = _client().teacher_student.health()
+        h = _client().teacher_student.health(measure=measure)
     except DecomputeError as exc:
         _explain_ts_error(exc)
         raise typer.Exit(1)
@@ -259,7 +261,18 @@ def ts_health():
     color = "green" if (enabled and ok) else ("yellow" if enabled else "red")
     print(f"[{color}]teacher-student: enabled={enabled} student_ok={ok}[/{color}]")
     student = h.get("student") or {}
-    print(f"  backend: {student.get('backend')}  model: {student.get('model')}  url: {student.get('base_url')}")
+    tier = student.get("trust_tier")
+    tier_str = ""
+    if tier:
+        tcolor = {"loopback": "green", "private": "cyan", "public": "yellow", "blocked": "red"}.get(tier, "dim")
+        tier_str = f"  endpoint: [{tcolor}]{tier}[/{tcolor}]"
+    print(f"  backend: {student.get('backend')}  model: {student.get('model')}  url: {student.get('base_url')}{tier_str}")
+    # Measured readiness (when --measure ran the canary).
+    if sh.get("measured_ok") is not None:
+        if sh.get("measured_ok"):
+            print(f"  [dim]measured:[/dim] TTFT {sh.get('ttft_ms')}ms · {sh.get('tokens_per_s')} tok/s")
+        else:
+            print(f"  [yellow]measure failed:[/yellow] {sh.get('measure_error')}")
     print(f"  verifier threshold: {(h.get('verifier') or {}).get('threshold')}  judge: {(h.get('verifier') or {}).get('judge_enabled')}")
     print(f"  sandbox: {(h.get('sandbox') or {}).get('backend')}  governance: {(h.get('governance') or {}).get('mode')}")
     # Actionable next step when something isn't ready — don't make the user infer it.

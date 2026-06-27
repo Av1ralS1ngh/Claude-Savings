@@ -122,8 +122,12 @@ class TeacherStudentService:
 
     # ── Health ──────────────────────────────────────────────────────────────
 
-    async def health(self) -> dict[str, Any]:
+    async def health(self, *, measure: bool = False) -> dict[str, Any]:
         s = self.settings
+        # Trust tier of the configured endpoint (cheap, no I/O) — surfaced so ts-health shows whether
+        # the student is loopback (trusted) / private (LAN) / public (third-party) / blocked.
+        from ..endpoint_security import classify_endpoint
+        tier = classify_endpoint(s.local_student_base_url).tier
         out: dict[str, Any] = {
             "enabled": s.local_student_enabled,
             "mock": s.local_student_mock,
@@ -132,6 +136,7 @@ class TeacherStudentService:
                 "base_url": s.local_student_base_url,
                 "model": s.local_student_model,
                 "context_window": s.local_student_context_window,
+                "trust_tier": tier,
             },
             "verifier": {
                 "threshold": s.teacher_student_confidence_threshold,
@@ -148,6 +153,9 @@ class TeacherStudentService:
         }
         if s.local_student_mock:
             out["student_health"] = {"ok": True, "mock": True}
+        elif measure:
+            # Full measured preflight (runs a tiny canary → TTFT + tokens/s). On-demand only.
+            out["student_health"] = await self.provider.preflight()
         else:
             out["student_health"] = await self.provider.health()
         return out

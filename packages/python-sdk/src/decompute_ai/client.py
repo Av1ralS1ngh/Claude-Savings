@@ -96,8 +96,11 @@ class Licenses(_Resource):
 class TeacherStudent(_Resource):
     """Command-gated local coding student. Backs `decompute ts-run` / `ts-health` / `local-chat`."""
 
-    def health(self) -> dict[str, Any]:
-        return self._client.get("/v1/teacher_student/health")
+    def health(self, *, measure: bool = False) -> dict[str, Any]:
+        path = "/v1/teacher_student/health"
+        if measure:
+            path += "?measure=true"
+        return self._client.get(path)
 
     def run(
         self,
