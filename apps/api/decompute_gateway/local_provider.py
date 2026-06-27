@@ -419,10 +419,58 @@ class LocalStudentProvider:
             cap["tokens_per_s"] = c.get("tokens_per_s")
             if not c.get("ok"):
                 cap["measure_error"] = c.get("error")
+            cap["conformance"] = await self.conformance()
         else:
             cap["measured_ok"] = False
             cap["measure_error"] = "endpoint_blocked" if not tier_v.ok else "unreachable"
         return cap
+
+    async def conformance(self) -> dict[str, Any]:
+        """Probe whether the endpoint returns a WELL-FORMED OpenAI response — "OpenAI-compatible" is a
+        leaky abstraction (servers differ on response shape, usage fields, stop handling). A
+        non-conformant endpoint would silently break the verify path, so we check before trusting it.
+
+        Checks (one tiny non-streaming completion): a non-empty assistant message, a usage block with a
+        token count (needed for cost accounting), and the reported model id (flagged if it differs from
+        the configured one). Never raises."""
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": "Reply with exactly: ok"}],
+            "max_tokens": 16,
+            "temperature": 0.0,
+        }
+        result = {"chat_ok": False, "returns_content": False, "returns_usage": False,
+                  "reported_model": None, "model_matches": None, "warnings": []}
+        try:
+            resp = await asyncio.wait_for(self._post_chat(payload), timeout=min(self.overall_timeout_s, 30.0))
+        except Exception as exc:
+            result["warnings"].append(f"request_failed:{type(exc).__name__}")
+            return result
+        if resp.status_code >= 400:
+            result["warnings"].append(f"http_{resp.status_code}")
+            return result
+        body = _safe_json(resp)
+        if not body:
+            result["warnings"].append("unparseable_body")
+            return result
+        result["chat_ok"] = True
+        text = extract_openai_text(body)
+        result["returns_content"] = bool(text.strip())
+        if not result["returns_content"]:
+            result["warnings"].append("empty_content")
+        usage = body.get("usage") or {}
+        # Either completion_tokens (OpenAI) or output-token variants count as usable for accounting.
+        result["returns_usage"] = any(usage.get(k) for k in ("completion_tokens", "total_tokens", "output_tokens"))
+        if not result["returns_usage"]:
+            result["warnings"].append("no_usage_tokens")  # cost accounting will fall back to estimates
+        reported = body.get("model")
+        result["reported_model"] = reported
+        if reported and self.model and reported != self.model:
+            result["model_matches"] = False
+            result["warnings"].append(f"model_mismatch:served={reported}")
+        elif reported:
+            result["model_matches"] = True
+        return result
 
     # ── Generation ────────────────────────────────────────────────────────────
 

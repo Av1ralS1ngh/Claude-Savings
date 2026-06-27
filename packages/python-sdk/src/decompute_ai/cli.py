@@ -359,6 +359,15 @@ def ts_health(
             print(f"  [dim]measured:[/dim] TTFT {sh.get('ttft_ms')}ms · {sh.get('tokens_per_s')} tok/s")
         else:
             print(f"  [yellow]measure failed:[/yellow] {sh.get('measure_error')}")
+    # Conformance: warn if the endpoint isn't returning well-formed OpenAI responses.
+    conf = sh.get("conformance")
+    if conf is not None:
+        warns = conf.get("warnings") or []
+        if conf.get("chat_ok") and not warns:
+            print("  [dim]conformance:[/dim] [green]ok[/green] (well-formed responses + usage)")
+        else:
+            from rich.markup import escape as _esc
+            print(f"  [yellow]conformance issues:[/yellow] {', '.join(_esc(w) for w in warns) or 'chat failed'}")
     print(f"  verifier threshold: {(h.get('verifier') or {}).get('threshold')}  judge: {(h.get('verifier') or {}).get('judge_enabled')}")
     print(f"  sandbox: {(h.get('sandbox') or {}).get('backend')}  governance: {(h.get('governance') or {}).get('mode')}")
     # Actionable next step when something isn't ready — don't make the user infer it.

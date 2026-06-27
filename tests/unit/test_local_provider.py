@@ -435,3 +435,52 @@ def test_preflight_blocked_endpoint_is_not_measured():
     assert cap["endpoint_ok"] is False
     assert cap["trust_tier"] == "blocked"
     assert cap["measured_ok"] is False
+
+
+# ── Conformance probe (V1a: "OpenAI-compatible" is leaky) ───────────────────────
+
+def test_conformance_wellformed_endpoint_passes():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "model": "local-student-coder",
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            "usage": {"completion_tokens": 1, "total_tokens": 12},
+        })
+    c = asyncio.run(_provider(handler).conformance())
+    assert c["chat_ok"] and c["returns_content"] and c["returns_usage"]
+    assert c["model_matches"] is True
+    assert c["warnings"] == []
+
+
+def test_conformance_flags_empty_content_and_missing_usage():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "model": "local-student-coder",
+            "choices": [{"message": {"role": "assistant", "content": ""}}],
+            "usage": {},
+        })
+    c = asyncio.run(_provider(handler).conformance())
+    assert c["chat_ok"] is True
+    assert c["returns_content"] is False
+    assert c["returns_usage"] is False
+    assert "empty_content" in c["warnings"] and "no_usage_tokens" in c["warnings"]
+
+
+def test_conformance_flags_model_mismatch():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "model": "some-other-model-the-endpoint-actually-serves",
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {"completion_tokens": 1},
+        })
+    c = asyncio.run(_provider(handler, model="qwen-i-expected").conformance())
+    assert c["model_matches"] is False
+    assert any("model_mismatch" in w for w in c["warnings"])
+
+
+def test_conformance_http_error_is_reported_not_raised():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="boom")
+    c = asyncio.run(_provider(handler).conformance())
+    assert c["chat_ok"] is False
+    assert any("http_500" in w for w in c["warnings"])
