@@ -235,10 +235,20 @@ class Decompute:
         if resp.status_code >= 400:
             try:
                 body = resp.json()
-                message = (body.get("error", {}) or {}).get("message") if isinstance(body, dict) else None
-                message = message or (body.get("detail") if isinstance(body, dict) else None) or resp.text
             except Exception:
                 body, message = None, resp.text
+            else:
+                # `error` may be a nested object ({"error":{"message":...}}) or a bare code string
+                # ({"error":"student_unavailable"}); handle both without losing `body`.
+                message = None
+                if isinstance(body, dict):
+                    err = body.get("error")
+                    if isinstance(err, dict):
+                        message = err.get("message")
+                    elif isinstance(err, str):
+                        message = err
+                    message = message or body.get("detail")
+                message = message or resp.text
             raise error_for_status(resp.status_code, f"HTTP {resp.status_code}: {message}", body)
         if raw:
             return resp.text

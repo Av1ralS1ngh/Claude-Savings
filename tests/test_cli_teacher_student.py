@@ -350,3 +350,42 @@ def test_ts_run_empty_task_errors_clearly():
     r = runner.invoke(app, ["ts-run"])
     assert r.exit_code == 2
     assert "no task" in r.output.lower()
+
+
+# ── Error-explainer regression: status_code must reach _explain_ts_error on EVERY status ──
+# Previously error_for_status only attached status_code to APIError (404 path); 503/401 dropped it, so
+# the actionable fresh-install messages never fired. These lock the fix.
+
+import io
+import contextlib
+from decompute_ai.errors import error_for_status, ProviderError, AuthError
+import decompute_ai.cli as _cli
+
+
+def test_error_for_status_carries_status_code_on_all_classes():
+    assert error_for_status(503, "m").status_code == 503        # ProviderError
+    assert error_for_status(401, "m").status_code == 401        # AuthError
+    assert error_for_status(429, "m").status_code == 429        # RateLimitError
+    assert error_for_status(404, "m", {"x": 1}).status_code == 404  # APIError
+    assert isinstance(error_for_status(503, "m"), ProviderError)
+    assert isinstance(error_for_status(401, "m"), AuthError)
+
+
+def _explain(status, body):
+    exc = error_for_status(status, f'HTTP {status}: {body.get("error","")}', body)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        _cli._explain_ts_error(exc)
+    return buf.getvalue().lower()
+
+
+def test_explain_distinguishes_disabled_from_unavailable():
+    assert "isn't set up" in _explain(503, {"error": "teacher_student_disabled"})
+    assert "student models" in _explain(503, {"error": "teacher_student_disabled"})
+    assert "isn't ready" in _explain(503, {"error": "student_unavailable"})
+    assert "student start" in _explain(503, {"error": "student_unavailable"})
+
+
+def test_explain_handles_404_and_auth():
+    assert "isn't available" in _explain(404, {"error": "not_found"})
+    assert "authentication failed" in _explain(401, {"error": "unauth"})

@@ -188,6 +188,10 @@ def _explain_ts_error(exc: Exception) -> None:
         print(f"  The gateway at [cyan]{gw}[/cyan] doesn't expose /v1/teacher_student — it may be an older")
         print("  build or have the feature disabled. Enable the local student with [bold]decompute student models[/bold],")
         print("  then restart the gateway, or point [bold]decompute[/bold] at the gateway that has it.")
+    elif status == 503 and "disabled" in msg.lower():
+        # Feature never set up on this gateway — they need to pick a model first (which enables it).
+        print("[red]✗ The local student isn't set up on this gateway yet.[/red]")
+        print("  Set it up with [bold]decompute student models[/bold] (pick a model for your RAM), then retry.")
     elif status == 503:
         print("[red]✗ The local student isn't ready.[/red]")
         print("  Start it with [bold]decompute student start[/bold], then [bold]decompute ts-health[/bold] to confirm.")
