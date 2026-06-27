@@ -288,3 +288,34 @@ def test_student_endpoint_key_stored_owner_only(tmp_path, monkeypatch):
     assert mode == 0o600, oct(mode)
     assert cfg.load_student_endpoint_key() == "sk-secret-xyz"
     importlib.reload(cfg)
+
+
+def test_ts_eval_summarizes_accept_rate(monkeypatch, tmp_path):
+    """ts-eval runs the task set through the client and reports local accept-rate + latency, and
+    appends a comparable JSON result line."""
+    import decompute_ai.cli as cli
+
+    calls = {"n": 0}
+
+    class _FakeTS:
+        def run(self, task, **k):
+            calls["n"] += 1
+            # First two served locally, rest escalate — exercises both branches.
+            route = "student_only" if calls["n"] <= 2 else "teacher_corrected"
+            return {"final_answer": "x", "route": route, "verdict": {"confidence": 0.85}, "usage": {}}
+
+    class _FakeClient:
+        teacher_student = _FakeTS()
+
+    monkeypatch.setattr(cli, "_client", lambda: _FakeClient())
+    tasks = tmp_path / "tasks.txt"
+    tasks.write_text("a[i] bug fix\nreverse a string\nmerge lists\n")  # includes brackets (markup-escape test)
+    out = tmp_path / "res.jsonl"
+    from typer.testing import CliRunner
+    r = CliRunner().invoke(cli.app, ["ts-eval", "--tasks-file", str(tasks), "--label", "t", "--out", str(out)])
+    assert r.exit_code == 0, r.output
+    assert "local accept-rate" in r.output
+    import json
+    line = json.loads(out.read_text().strip().splitlines()[-1])
+    assert line["n"] == 3 and line["accepted_local"] == 2 and line["escalated_to_claude"] == 1
+    assert line["label"] == "t"

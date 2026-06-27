@@ -87,10 +87,12 @@ _COMMAND_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
     ]),
     ("Local coding model (teacher-student)", [
         ("student models", "Pick + download a local coding model (RAM-aware)"),
+        ("student endpoint <url>", "Point the student at a bigger box / hosted endpoint"),
         ("student start", "Start the local model (loads it into memory)"),
         ("student stop / status", "Stop the model / check if it's running"),
         ("ts-run \"<task>\"", "Answer a coding task with the local model (verified)"),
-        ("ts-health", "Check the local model + verifier readiness"),
+        ("ts-health [--measure]", "Check the model + verifier readiness (trust tier, TTFT)"),
+        ("ts-eval", "Measure local accept-rate + latency (compare two students)"),
         ("local-chat \"<prompt>\"", "Talk to the local model directly (unverified, debug)"),
     ]),
     ("See your usage & savings", [
@@ -221,6 +223,90 @@ def ts_run(
     else:
         print("[red](no answer — the student was unavailable and no teacher was configured)[/red]")
     _print_route_summary(resp)
+
+
+# A small stratified set of coding tasks for the eval (by intent). Enough to compare two students
+# side by side out of the box; pass --tasks-file for a real, larger, representative set.
+_EVAL_TASKS = [
+    "Write a Python function to check if a number is prime.",
+    "Write a Python function to reverse a string in place.",
+    "Write a Python function to merge two sorted lists.",
+    "Write a Python function to compute the nth Fibonacci number iteratively.",
+    "Write a Python function to flatten a nested list one level deep.",
+    "Fix the off-by-one error: for i in range(len(a)+1): print(a[i])",
+    "Add type hints to: def add(a, b): return a + b",
+    "Write a docstring for a function that parses an ISO-8601 date string.",
+    "Write a regex to validate an email address.",
+    "Write a Python function to count word frequencies in a string.",
+]
+
+
+@app.command("ts-eval")
+def ts_eval(
+    tasks_file: Optional[Path] = typer.Option(None, "--tasks-file", help="One coding task per line (default: a built-in stratified set)."),
+    label: str = typer.Option("student", "--label", help="A label for this run (e.g. the model name), for comparing runs."),
+    out: Optional[Path] = typer.Option(None, "--out", help="Append the JSON result line here (to compare runs later)."),
+    require_teacher: bool = typer.Option(False, "--require-teacher", help="Force the teacher path (baseline cost reference)."),
+):
+    """§0 eval: run a task set through the verify pipeline and report accept-rate + latency.
+
+    The gate for whether a BIGGER student is worth it: point the student at model A (e.g. 7B), run
+    `ts-eval --label 7b`, then point at model B (e.g. 32B), run `ts-eval --label 32b`, and compare. A
+    bigger student is worth deploying only if it raises the local accept-rate enough, at acceptable
+    latency, to net-save after the judge cost (see docs/heterogeneous_inference_plan.md §0)."""
+    import time as _t
+    from rich.markup import escape as _esc  # task/answer text may contain [..] — escape before printing
+    tasks = [ln.strip() for ln in tasks_file.read_text().splitlines() if ln.strip()] if tasks_file else list(_EVAL_TASKS)
+    if not tasks:
+        print("[red]no tasks to evaluate.[/red]")
+        raise typer.Exit(2)
+    print(f"[bold]ts-eval[/bold] · label=[cyan]{label}[/cyan] · {len(tasks)} tasks\n")
+    rows = []
+    accepted = escalated = errors = 0
+    lat_ms: list[float] = []
+    for i, task in enumerate(tasks, 1):
+        t0 = _t.perf_counter()
+        try:
+            resp = _client().teacher_student.run(task, require_teacher=require_teacher, max_tokens=512)
+            dt = (_t.perf_counter() - t0) * 1000
+            route = resp.get("route")
+            conf = (resp.get("verdict") or {}).get("confidence")
+            served = route == "student_only"
+            accepted += int(served)
+            escalated += int(not served)
+            lat_ms.append(dt)
+            rows.append({"task": task[:40], "route": route, "confidence": conf, "ms": int(dt)})
+            mark = "[green]✓ local[/green]" if served else "[yellow]→ claude[/yellow]"
+            print(f"  {i:>2}. {mark}  {int(dt):>5}ms  conf={conf}  [dim]{_esc(task[:48])}[/dim]")
+        except DecomputeError as exc:
+            errors += 1
+            print(f"  {i:>2}. [red]error[/red]  {_esc(str(exc))}")
+    n = len(tasks)
+    done = n - errors
+    accept_rate = round(accepted / done, 3) if done else 0.0
+
+    def _pct(p):
+        if not lat_ms:
+            return 0
+        s = sorted(lat_ms)
+        return int(s[min(len(s) - 1, int(len(s) * p))])
+
+    summary = {
+        "label": label, "n": n, "errors": errors,
+        "accepted_local": accepted, "escalated_to_claude": escalated,
+        "local_accept_rate": accept_rate,
+        "p50_ms": _pct(0.5), "p95_ms": _pct(0.95),
+    }
+    print(f"\n[bold]Result ({label}):[/bold]")
+    print(f"  local accept-rate: [bold]{accept_rate:.0%}[/bold]  ({accepted}/{done} served locally, {escalated} escalated to Claude)")
+    print(f"  latency: p50 {summary['p50_ms']}ms · p95 {summary['p95_ms']}ms" + (f"  · {errors} errors" if errors else ""))
+    print("  [dim]Compare two runs (e.g. 7b vs 32b): a bigger student is worth it only if accept-rate[/dim]")
+    print("  [dim]rises enough to net-save after the judge cost, at acceptable latency. (plan §0)[/dim]")
+    if out:
+        import json as _json
+        with open(out, "a") as f:
+            f.write(_json.dumps(summary) + "\n")
+        print(f"  [green]appended result to {out}[/green]")
 
 
 @app.command("ts-export")
