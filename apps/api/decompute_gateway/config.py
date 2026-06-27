@@ -41,6 +41,17 @@ def _float(name: str, default: float) -> float:
         return default
 
 
+def _read_student_endpoint_key_file() -> str | None:
+    """Read the custom-student-endpoint API key from the owner-only file the CLI writes, so the secret
+    lives in a chmod-600 file rather than plaintext in the gateway .env. Honors DECOMPUTE_CONFIG_DIR.
+    Returns None if absent/unreadable (a keyless local endpoint is the common case)."""
+    cfg_dir = os.getenv("DECOMPUTE_CONFIG_DIR") or str(Path.home() / ".decompute")
+    try:
+        return (Path(cfg_dir) / "student_endpoint.key").read_text(encoding="utf-8").strip() or None
+    except Exception:
+        return None
+
+
 def _default_data_dir() -> Path:
     """The gateway's data directory — ALWAYS absolute.
 
@@ -273,7 +284,10 @@ class Settings:
     local_student_backend: str = os.getenv("DECOMPUTE_LOCAL_STUDENT_BACKEND", "llama_cpp")
     local_student_base_url: str = os.getenv("DECOMPUTE_LOCAL_STUDENT_BASE_URL", "http://127.0.0.1:18080/v1")
     local_student_model: str = os.getenv("DECOMPUTE_LOCAL_STUDENT_MODEL", "local-student-coder")
-    local_student_api_key: str | None = os.getenv("DECOMPUTE_LOCAL_STUDENT_API_KEY")
+    # API key for a custom student endpoint. Env first; else the owner-only key file the CLI writes
+    # (~/.decompute/student_endpoint.key) — read directly so the secret stays in a chmod-600 file
+    # instead of plaintext in the gateway .env. None for keyless local/LAN endpoints.
+    local_student_api_key: str | None = os.getenv("DECOMPUTE_LOCAL_STUDENT_API_KEY") or _read_student_endpoint_key_file()
     local_student_context_window: int = _int("DECOMPUTE_LOCAL_STUDENT_CONTEXT_WINDOW", 32_000)
     local_student_max_output_tokens: int = _int("DECOMPUTE_LOCAL_STUDENT_MAX_OUTPUT_TOKENS", 2048)
     local_student_connect_timeout_s: float = _float("DECOMPUTE_LOCAL_STUDENT_CONNECT_TIMEOUT_S", 3.0)

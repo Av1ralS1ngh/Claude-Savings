@@ -20,6 +20,7 @@ from typing import Any
 CONFIG_DIR = Path(os.getenv("DECOMPUTE_CONFIG_DIR", str(Path.home() / ".decompute")))
 CONFIG_TOML = CONFIG_DIR / "config.toml"
 KEY_FILE = CONFIG_DIR / "claude.key"
+STUDENT_ENDPOINT_KEY_FILE = CONFIG_DIR / "student_endpoint.key"  # API key for a custom student endpoint
 DEVICE_ID_FILE = CONFIG_DIR / "device.id"
 LICENSE_FILE = CONFIG_DIR / "license.key"
 LEGACY_JSON = CONFIG_DIR / "config.json"
@@ -204,6 +205,31 @@ def save_claude_key(key: str) -> Path:
     if not _valid_secret(key):
         raise ValueError("refusing to save a malformed Claude key")
     return _write_secret(KEY_FILE, key)  # atomic, owner-only (0600), no world-readable window
+
+
+def load_student_endpoint_key() -> str | None:
+    """API key for a custom student endpoint (V1a). Env override first, then the on-disk key file.
+    Handled like the Claude key: owner-only file, never logged, never echoed."""
+    env = os.getenv("DECOMPUTE_LOCAL_STUDENT_API_KEY")
+    if env:
+        return env
+    try:
+        return (STUDENT_ENDPOINT_KEY_FILE.read_text(encoding="utf-8").strip() or None)
+    except Exception:
+        return None
+
+
+def save_student_endpoint_key(key: str) -> Path:
+    if not key or not key.strip():
+        raise ValueError("refusing to save an empty student endpoint key")
+    return _write_secret(STUDENT_ENDPOINT_KEY_FILE, key.strip())  # atomic, owner-only (0600)
+
+
+def clear_student_endpoint_key() -> None:
+    try:
+        STUDENT_ENDPOINT_KEY_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def clear_claude_key() -> None:

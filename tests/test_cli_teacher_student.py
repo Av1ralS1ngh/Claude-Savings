@@ -236,3 +236,55 @@ def test_commands_plain_is_deduped_scriptable():
     assert "decompute init" in lines
     # 'student models' + 'student start' must collapse to a single 'decompute student'
     assert lines.count("decompute student") == 1
+
+
+def test_student_endpoint_loopback_no_consent(tmp_path, monkeypatch):
+    """A loopback endpoint is trusted — no consent prompt — and persists as openai_endpoint."""
+    monkeypatch.setenv("DECOMPUTE_CONFIG_DIR", str(tmp_path))
+    import decompute_ai.config as cfg
+    import importlib; importlib.reload(cfg)
+    import decompute_ai.cli as cli; importlib.reload(cli)
+    from typer.testing import CliRunner
+    r = CliRunner().invoke(cli.app, ["student", "endpoint", "http://127.0.0.1:18080/v1", "--model", "qwen"])
+    assert r.exit_code == 0, r.output
+    assert "endpoint set" in r.output.lower()
+    student = cfg.load_config().get("student", {})
+    assert student.get("backend") == "openai_endpoint"
+    assert student.get("base_url") == "http://127.0.0.1:18080/v1"
+    importlib.reload(cfg); importlib.reload(cli)
+
+
+def test_student_endpoint_public_requires_consent(tmp_path, monkeypatch):
+    """A public third-party endpoint warns + aborts on 'n', changing nothing."""
+    monkeypatch.setenv("DECOMPUTE_CONFIG_DIR", str(tmp_path))
+    import decompute_ai.config as cfg
+    import importlib; importlib.reload(cfg)
+    import decompute_ai.cli as cli; importlib.reload(cli)
+    from typer.testing import CliRunner
+    r = CliRunner().invoke(cli.app, ["student", "endpoint", "https://api.host.xyz/v1", "--model", "big"], input="n\n")
+    assert r.exit_code == 0
+    assert "third-party" in r.output.lower() and "aborted" in r.output.lower()
+    assert cfg.load_config().get("student") is None  # nothing saved
+    importlib.reload(cfg); importlib.reload(cli)
+
+
+def test_endpoint_host_tier_classification():
+    from decompute_ai.cli import _endpoint_host_tier
+    assert _endpoint_host_tier("http://127.0.0.1:8080/v1") == "loopback"
+    assert _endpoint_host_tier("http://localhost/v1") == "loopback"
+    assert _endpoint_host_tier("http://192.168.1.5/v1") == "private"
+    assert _endpoint_host_tier("http://100.101.1.1/v1") == "private"   # tailscale
+    assert _endpoint_host_tier("https://api.together.xyz/v1") == "public"
+    assert _endpoint_host_tier("https://1.1.1.1/v1") == "public"
+
+
+def test_student_endpoint_key_stored_owner_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("DECOMPUTE_CONFIG_DIR", str(tmp_path))
+    import decompute_ai.config as cfg
+    import importlib; importlib.reload(cfg)
+    cfg.save_student_endpoint_key("sk-secret-xyz")
+    import os, stat
+    mode = stat.S_IMODE(os.stat(cfg.STUDENT_ENDPOINT_KEY_FILE).st_mode)
+    assert mode == 0o600, oct(mode)
+    assert cfg.load_student_endpoint_key() == "sk-secret-xyz"
+    importlib.reload(cfg)

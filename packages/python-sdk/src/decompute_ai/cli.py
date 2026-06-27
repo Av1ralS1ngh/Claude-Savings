@@ -35,6 +35,7 @@ from .config import (
     load_license_key,
     save_claude_key,
     save_config,
+    save_student_endpoint_key,
     save_license_key,
     set_session_id,
 )
@@ -532,11 +533,12 @@ def _enable_student_in_gateway_env() -> bool:
     if env_path is None:
         return False
     cfg = load_config().get("student", {})
+    # Honor a custom endpoint (set by `decompute student endpoint`); else the local llama.cpp defaults.
     desired = {
         "DECOMPUTE_LOCAL_STUDENT_ENABLED": "true",
-        "DECOMPUTE_LOCAL_STUDENT_BACKEND": "llama_cpp",
-        "DECOMPUTE_LOCAL_STUDENT_BASE_URL": _student_base_url(),
-        "DECOMPUTE_LOCAL_STUDENT_MODEL": "local-student-coder",
+        "DECOMPUTE_LOCAL_STUDENT_BACKEND": cfg.get("backend", "llama_cpp"),
+        "DECOMPUTE_LOCAL_STUDENT_BASE_URL": cfg.get("base_url") or _student_base_url(),
+        "DECOMPUTE_LOCAL_STUDENT_MODEL": cfg.get("endpoint_model", "local-student-coder"),
         # The judge is the verification signal on the live proxy path (requests carry no tests).
         "DECOMPUTE_TS_JUDGE_ENABLED": "true",
     }
@@ -941,6 +943,73 @@ def student_models(
     print("\n  Use it [bold]outside[/bold] Claude Code:  [bold]decompute ts-run \"<task>\"[/bold]")
     if slash:
         print("  Use it [bold]inside[/bold] Claude Code:   type [bold]/student <task>[/bold]  (the local model answers, verified)")
+
+
+def _endpoint_host_tier(url: str) -> str:
+    """UX-only host classification for the consent prompt: 'loopback' | 'private' | 'public' | 'unknown'.
+    NOT a security boundary — the gateway's endpoint_security guard is authoritative; this only decides
+    how loud a warning to show when configuring."""
+    import ipaddress
+    from urllib.parse import urlparse
+
+    host = (urlparse(url).hostname or "").lower()
+    if not host:
+        return "unknown"
+    if host in {"localhost"}:
+        return "loopback"
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return "public"  # a hostname → treat as public for the warning (gateway resolves + enforces)
+    if ip.is_loopback:
+        return "loopback"
+    if ip.is_private or (isinstance(ip, ipaddress.IPv4Address) and ip in ipaddress.ip_network("100.64.0.0/10")):
+        return "private"
+    return "public"
+
+
+@student_app.command("endpoint")
+def student_endpoint(
+    url: str = typer.Argument(..., help="An OpenAI-compatible endpoint URL, e.g. http://192.168.1.50:8080/v1 or https://api.host/v1"),
+    model: str = typer.Option(..., "--model", help="The model id the endpoint serves (its /v1/models id)."),
+    api_key: Optional[str] = typer.Option(None, "--api-key", help="API key for the endpoint (stored owner-only; omit for keyless local/LAN servers)."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the consent prompt for a remote endpoint."),
+):
+    """Point the student at ANY OpenAI-compatible endpoint — a bigger box, a private/hosted GPU, vLLM.
+
+    The endpoint hosts a (potentially much larger) student model than this machine could run locally.
+    Local/loopback is trusted; a remote endpoint means your prompts leave this machine, so it asks for
+    consent and the gateway enforces an SSRF + trust-tier + https policy before ever routing to it."""
+    from urllib.parse import urlparse
+    if urlparse(url).scheme not in ("http", "https"):
+        print("[red]✗[/red] endpoint URL must start with http:// or https://")
+        raise typer.Exit(2)
+    tier = _endpoint_host_tier(url)
+    host = urlparse(url).hostname or url
+
+    if tier in ("private", "public", "unknown") and not yes:
+        if tier == "public":
+            print(f"[yellow]⚠ This is a THIRD-PARTY endpoint[/yellow] ([bold]{host}[/bold]).")
+            print("  Your coding prompts (which may contain proprietary code) will be sent OUTSIDE this machine,")
+            print("  to a server you don't control. The gateway also requires https + an explicit consent flag")
+            print("  ([bold]DECOMPUTE_LOCAL_STUDENT_ALLOW_PUBLIC_ENDPOINT=true[/bold]) before it will route to it.")
+        else:
+            print(f"[yellow]⚠ Remote endpoint[/yellow] ([bold]{host}[/bold]) — prompts leave this machine for your LAN/VPN host.")
+        if not typer.confirm("Continue?", default=False):
+            print("Aborted. Nothing changed.")
+            raise typer.Exit(0)
+
+    if api_key:
+        save_student_endpoint_key(api_key)
+        print("[green]✓[/green] endpoint API key stored (owner-only).")
+
+    save_config({"student": {"backend": "openai_endpoint", "base_url": url.rstrip("/"), "endpoint_model": model}})
+    wrote = _enable_student_in_gateway_env()
+    _install_student_slash_command()
+    print(f"\n[green]✓ Student endpoint set:[/green] [bold]{model}[/bold] @ [cyan]{url}[/cyan]  [dim]({tier})[/dim]")
+    print("  Verify it (the gateway runs the security + readiness preflight):  [bold]decompute ts-health[/bold]")
+    if not wrote:
+        print("  [dim](couldn't auto-wire the gateway env — set DECOMPUTE_LOCAL_STUDENT_BASE_URL/MODEL/BACKEND yourself.)[/dim]")
 
 
 @student_app.command("install")
