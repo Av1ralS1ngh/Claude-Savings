@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.18
+
+- **Local coding model, now in the editor.** New commands run a local AI model on your machine for routine coding tasks, verified, and fall back to Claude when it's not confident: **Ask Local Student** (describe a task), **Teacher-Student Solve** (right-click a selection or describe one), **Set Up Local Student Model** (pick a model for your RAM), and **Local Student Health** (check it's ready). Answers stream into a terminal. (Previously this only worked from the terminal CLI.)
+- **Robust on multi-line selections.** "Teacher-Student Solve" on a block of code now passes it safely via a temp file instead of the command line, so newlines never break the command across shells (bash/zsh/PowerShell).
+
 ## 0.1.17
 
 - **Claude-plan auth hardening (gateway + CLI).** Several fixes for the "Use my existing Claude plan" path: re-running setup no longer silently switches an existing API-key user to subscription mode; subscription mode is refused on a non-local gateway (your Claude login stays on this machine); and the gateway always reads the same config the CLI wrote. Update your local engine to get them (one-time prompt, or run “Decompute: Set Up”).
