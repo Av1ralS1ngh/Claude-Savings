@@ -48,8 +48,9 @@ OpenClaw sees normal Anthropic responses.
 ### Auth
 
 - **Local dev** (gateway with `DECOMPUTE_REQUIRE_AUTH=false`, the default): any key works; use `dc_dev_local`.
-- **Hosted / team**: issue a project key and set it as `apiKey`. The gateway accepts it via `x-api-key`
-  or `Authorization: Bearer` — both are in the CORS allowlist and the auth path.
+- **Hosted / team**: issue a project key (`dc_…`) and set it as `apiKey`. OpenClaw sends it on
+  `x-api-key`; the gateway recognizes a `dc_`-prefixed value there as a Decompute platform key (a real
+  Claude key is `sk-ant-…` and is treated as BYOK instead). `Authorization: Bearer dc_…` also works.
 - **BYOK passthrough**: if the gateway has no server-side `ANTHROPIC_API_KEY`, it forwards the caller's
   key upstream (when `DECOMPUTE_ALLOW_CLIENT_PROVIDER_KEY=true`).
 

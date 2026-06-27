@@ -46,13 +46,20 @@ def extract_bearer(authorization: str | None) -> str | None:
 
 
 def platform_api_key_from_request(request: Request) -> str | None:
-    # Decompute platform auth intentionally does NOT use Anthropic x-api-key.
+    # Decompute platform auth does NOT treat an arbitrary Anthropic x-api-key as a platform key.
     dedicated = request.headers.get("x-decompute-api-key") or request.headers.get("x-decompute-key")
     if dedicated:
         return dedicated
     bearer = extract_bearer(request.headers.get("authorization"))
     if bearer and bearer.startswith("dc_"):
         return bearer
+    # Anthropic-protocol clients (e.g. OpenClaw with api: "anthropic-messages") can only set their
+    # credential via x-api-key. A `dc_`-prefixed value there is UNAMBIGUOUSLY a Decompute platform key
+    # (real Anthropic keys are `sk-ant-…`), so accept it for platform auth. It still must verify against
+    # the DB — an unknown/revoked dc_ key is a 401, same as any other path.
+    xkey = request.headers.get("x-api-key")
+    if xkey and xkey.startswith("dc_"):
+        return xkey
     return None
 
 
@@ -138,9 +145,11 @@ def upstream_anthropic_auth(request: Request, settings: Settings) -> UpstreamAnt
             return UpstreamAnthropicAuth("api_key", byok)
     if not settings.allow_client_provider_key:
         return None
-    # x-api-key is reserved for Anthropic/Claude clients.
+    # x-api-key is the Anthropic/Claude BYOK credential — but a `dc_`-prefixed value there is a Decompute
+    # platform key (an Anthropic-protocol client like OpenClaw has no other header to send it on). Never
+    # forward a platform key upstream; it would 401 at Anthropic.
     api_key = request.headers.get("x-api-key")
-    if api_key:
+    if api_key and not api_key.startswith("dc_"):
         return UpstreamAnthropicAuth("api_key", api_key)
     # Bearer is a provider credential only when it is not a Decompute dc_* platform key. Local Claude
     # subscription users need this passthrough; hosted production gateways block it by default.

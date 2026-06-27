@@ -168,3 +168,31 @@ def test_openclaw_usage_is_tagged_openclaw(monkeypatch):
     by_client = (summ.json() or {}).get("by_client") or []
     clients = {row.get("client") for row in by_client}
     assert "openclaw" in clients, f"OpenClaw traffic not tagged; saw clients: {clients}"
+
+
+def test_openclaw_hosted_auth_via_x_api_key(monkeypatch):
+    """The documented HOSTED path: OpenClaw (api: anthropic-messages) sends its project key on x-api-key.
+    Under require_auth=true the gateway must accept a dc_ key there (it can't send x-decompute-key), and
+    a non-dc key on x-api-key must NOT authenticate as a platform key. Closes the docs/code mismatch."""
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("DECOMPUTE_MOCK_ANTHROPIC", "true")
+    monkeypatch.setenv("DECOMPUTE_REQUIRE_AUTH", "true")
+    main = _app(monkeypatch)
+    if not main.settings.mock_anthropic:
+        pytest.skip("runs only in mock mode")
+
+    # Issue a real project key (what a hosted/team user would set as OpenClaw's apiKey).
+    issued = main.store.create_api_key(project_id="proj_default", name="openclaw", scopes=["messages:write"])
+    dc_key = issued["api_key"]
+    assert dc_key.startswith("dc_")
+
+    with TestClient(main.app) as c:
+        # dc_ key on x-api-key (exactly how OpenClaw sends it) → authenticated.
+        ok = c.post("/v1/messages", json=_openclaw_body(stream=False),
+                    headers={"x-api-key": dc_key, "user-agent": OPENCLAW_UA, "content-type": "application/json"})
+        assert ok.status_code == 200, ok.text
+        # No key at all → 401 (auth is genuinely required, not silently bypassed).
+        no_key = c.post("/v1/messages", json=_openclaw_body(stream=False),
+                        headers={"user-agent": OPENCLAW_UA, "content-type": "application/json"})
+        assert no_key.status_code == 401

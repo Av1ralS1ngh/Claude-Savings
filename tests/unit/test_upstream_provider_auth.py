@@ -108,3 +108,34 @@ def test_data_dir_falls_back_to_config_dir(tmp_path: Path, monkeypatch):
     # DATA_DIR still takes precedence when both are set.
     monkeypatch.setenv("DECOMPUTE_DATA_DIR", str(tmp_path / "install"))
     assert _default_data_dir() == tmp_path / "install"
+
+
+# ── OpenClaw / Anthropic-protocol clients: dc_ platform key via x-api-key ──────────
+# OpenClaw (api: "anthropic-messages") can only send its credential on x-api-key. A dc_-prefixed value
+# there is a Decompute platform key, not a Claude key — accept it for platform auth, never forward it up.
+
+from decompute_gateway.security import platform_api_key_from_request
+
+
+def test_platform_auth_accepts_dc_key_via_x_api_key():
+    raw = platform_api_key_from_request(_request({"x-api-key": "dc_proj_abc123"}))
+    assert raw == "dc_proj_abc123"
+
+
+def test_platform_auth_ignores_real_anthropic_key_via_x_api_key():
+    # A real Claude key (sk-ant-…) on x-api-key must NOT be treated as a platform key (it's BYOK).
+    raw = platform_api_key_from_request(_request({"x-api-key": "sk-ant-real-byok-key"}))
+    assert raw is None
+
+
+def test_dc_key_via_x_api_key_is_never_forwarded_upstream(tmp_path: Path):
+    settings = Settings(data_dir=tmp_path, anthropic_api_key=None)
+    auth = upstream_anthropic_auth(_request({"x-api-key": "dc_proj_abc123"}), settings)
+    assert auth is None  # a platform key must never go to Anthropic
+
+
+def test_real_anthropic_key_via_x_api_key_still_forwards_upstream(tmp_path: Path):
+    # No regression: a genuine sk-ant key on x-api-key is still the BYOK upstream credential.
+    settings = Settings(data_dir=tmp_path, anthropic_api_key=None)
+    auth = upstream_anthropic_auth(_request({"x-api-key": "sk-ant-byok"}), settings)
+    assert auth is not None and auth.kind == "api_key" and auth.value == "sk-ant-byok"
