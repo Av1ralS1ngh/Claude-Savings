@@ -290,9 +290,15 @@ class Settings:
     # raises a typed error or escalates to the teacher (plan invariant #3, "no silent mock fallback").
     # Rejected in production by validate_for_startup.
     local_student_mock: bool = _bool("DECOMPUTE_LOCAL_STUDENT_MOCK", False)
-    # The student is local by default. To point it at a REMOTE endpoint in production you must opt in
-    # explicitly (and use https) — see the SSRF guard in validate_for_startup.
+    # The student is local by default. Trust tiers for the endpoint (V1a):
+    #  - loopback: always allowed (the local student).
+    #  - private (LAN / Tailscale): allowed only with allow_remote — a bigger box on your network.
+    #  - public (a third-party / hosted endpoint): a trust-boundary change (proprietary code leaves your
+    #    machine), so it needs the SEPARATE allow_public consent AND https. Off by default.
+    # The SSRF block (cloud-metadata / link-local) is unconditional — see endpoint_security + the guard
+    # in validate_for_startup.
     local_student_allow_remote: bool = _bool("DECOMPUTE_LOCAL_STUDENT_ALLOW_REMOTE", False)
+    local_student_allow_public_endpoint: bool = _bool("DECOMPUTE_LOCAL_STUDENT_ALLOW_PUBLIC_ENDPOINT", False)
 
     # Teacher-student verifier / governance (consumed in later phases; declared here so production
     # validation can reject unsafe combinations from the first ship).
@@ -404,21 +410,29 @@ class Settings:
             # The force-pass judge is a dev/demo aid; in production it would accept unverified answers.
             if self.teacher_student_judge_mock_pass:
                 errors.append("DECOMPUTE_TS_JUDGE_MOCK_PASS must be false in production (no fake verification)")
-            # SSRF / exfiltration guard (H3): the "local" student must be LOOPBACK in production unless
-            # an operator explicitly opts into a remote endpoint. Without the opt-in, ANY non-loopback
-            # host (even https) is rejected — otherwise a misconfigured base_url could ship every prompt
-            # to an arbitrary internal/external host. With the opt-in, the remote endpoint must be https.
-            if self.local_student_enabled and not self.local_student_base_url_is_loopback:
-                if not self.local_student_allow_remote:
-                    errors.append(
-                        "DECOMPUTE_LOCAL_STUDENT_BASE_URL must be loopback in production. To use a remote "
-                        "student set DECOMPUTE_LOCAL_STUDENT_ALLOW_REMOTE=true (and use https)."
-                    )
-                elif not self.local_student_base_url.startswith("https://"):
-                    errors.append(
-                        "A remote DECOMPUTE_LOCAL_STUDENT_BASE_URL must use https in production "
-                        "(plaintext prompts would cross the network)."
-                    )
+            # SSRF / exfiltration / trust-boundary guard (H3, V1a): classify the student endpoint and
+            # enforce the tier policy. The block list (cloud-metadata / link-local) is unconditional;
+            # private (LAN/Tailscale) needs allow_remote; public (third-party) needs allow_public +
+            # https. This replaces the old loopback-only check, which let allow_remote bypass straight to
+            # a metadata IP.
+            if self.local_student_enabled:
+                from .endpoint_security import validate_student_endpoint
+                v = validate_student_endpoint(
+                    self.local_student_base_url,
+                    allow_private=self.local_student_allow_remote,
+                    allow_public=self.local_student_allow_public_endpoint,
+                    require_tls_public=True,
+                )
+                if not v.ok:
+                    _hint = {
+                        "resolves_to_blocked_range": "endpoint resolves to a blocked (cloud-metadata/link-local) range — never allowed",
+                        "private_endpoint_not_allowed": "a LAN/private endpoint requires DECOMPUTE_LOCAL_STUDENT_ALLOW_REMOTE=true",
+                        "public_endpoint_requires_consent": "a third-party endpoint requires DECOMPUTE_LOCAL_STUDENT_ALLOW_PUBLIC_ENDPOINT=true (your prompts would leave your machine)",
+                        "public_endpoint_requires_https": "a third-party endpoint must use https",
+                        "scheme_not_http": "endpoint URL must be http(s)",
+                        "host_unresolvable": "endpoint host could not be resolved",
+                    }.get(v.reason, v.reason)
+                    errors.append(f"DECOMPUTE_LOCAL_STUDENT_BASE_URL rejected ({v.tier}): {_hint}")
             # Test execution must run in a real sandbox, never bare subprocess on the request path.
             if self.teacher_student_test_execution_enabled and self.teacher_student_sandbox_backend == "disabled":
                 errors.append(

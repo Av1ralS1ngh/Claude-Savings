@@ -63,10 +63,23 @@ def test_prod_rejects_local_student_mock():
 
 
 def test_prod_rejects_remote_plain_http_student():
-    with pytest.raises(RuntimeError, match="loopback"):
+    # A private LAN endpoint without the opt-in is rejected (now via the tiered endpoint guard, which
+    # gives a clearer "requires ALLOW_REMOTE" message than the old loopback-only check).
+    with pytest.raises(RuntimeError, match="ALLOW_REMOTE"):
         _prod_settings(
             local_student_enabled=True,
             local_student_base_url="http://10.0.0.9:18080/v1",
+        ).validate_for_startup()
+
+
+def test_prod_blocks_metadata_ip_even_with_allow_remote():
+    """Closed SSRF hole: the old guard let allow_remote bypass to ANY non-loopback host, including the
+    cloud-metadata IP. The tiered guard blocks metadata/link-local ranges unconditionally."""
+    with pytest.raises(RuntimeError, match="blocked|metadata"):
+        _prod_settings(
+            local_student_enabled=True,
+            local_student_allow_remote=True,
+            local_student_base_url="http://169.254.169.254/v1",
         ).validate_for_startup()
 
 
