@@ -520,15 +520,19 @@ def _fits_ram(model: dict, total_gb: int) -> bool:
     return total_gb == 0 or total_gb >= model["min_ram_gb"]
 
 
-def _ts_run_command() -> str:
-    """The shell command the /student slash command runs — `decompute ts-run`, with absolute paths so
-    it works from any directory Claude Code is launched in.
+def _local_chat_command() -> str:
+    """The shell command the /student slash command runs to get the LOCAL model's draft — `decompute
+    local-chat`, with absolute paths so it works from any directory Claude Code is launched in.
 
-    Gateway resolution is robust by construction: we `env -u DECOMPUTE_BASE_URL` to strip any inherited
-    (possibly stale) value from the Claude Code session, so `ts-run` falls through to config.toml — the
-    always-current source of truth. No URL is baked into the command file, so it never goes stale when
-    the configured gateway changes (the bug that broke /student when config moved after install)."""
-    # Prefer the installed `decompute` on PATH; fall back to this source checkout's module form.
+    Why local-chat (the pure local model) and NOT ts-run (the gateway-judged path): when invoked as a
+    Claude Code slash command, the bash subprocess can't carry the session's Claude subscription token,
+    so a gateway-side judge can't authenticate. Instead the local model just drafts here (no Claude
+    needed), and Claude Code's OWN session — which runs on the user's subscription — acts as the
+    teacher/judge in the command body: it keeps the local answer or escalates (solves it itself). That
+    delivers verified-with-escalation on the subscription, no API key.
+
+    Gateway resolution is robust: `env -u DECOMPUTE_BASE_URL` strips any inherited (stale) value so
+    local-chat reads config.toml at runtime — no URL baked in, never goes stale."""
     bin_path = shutil.which("decompute")
     if bin_path:
         runner = f'"{bin_path}"'
@@ -538,38 +542,42 @@ def _ts_run_command() -> str:
         venv_py = here.parents[4] / ".venv" / "bin" / "python"  # .../Claude-Coder/.venv/bin/python
         py = str(venv_py) if venv_py.exists() else sys.executable
         runner = f'PYTHONPATH="{repo_src}" "{py}" -m decompute_ai.cli'
-    # `env -u DECOMPUTE_BASE_URL`: drop any inherited override so ts-run reads config.toml at runtime.
-    return f'env -u DECOMPUTE_BASE_URL {runner} ts-run "$ARGUMENTS"'
+    return f'env -u DECOMPUTE_BASE_URL {runner} local-chat "$ARGUMENTS"'
 
 
 def _install_student_slash_command(*, global_scope: bool = True) -> Optional[Path]:
-    """Install a Claude Code `/student` slash command so a user can invoke the local model from INSIDE
-    a Claude Code session: `/student <task>` runs it through `decompute ts-run` (verified; escalates to
-    Claude if the verifier isn't confident) and shows the answer in the session. Global by default
-    (~/.claude/commands) so it works in every project. Returns the written path, or None on failure."""
+    """Install a Claude Code `/student` slash command: the local model drafts a coding task, then THIS
+    Claude Code session (running on the user's Claude subscription) acts as the teacher — keeping the
+    local answer if it's good, or escalating (solving it itself) if the task is too hard. So the student
+    is used only when the user types /student, and escalation rides the subscription (no API key).
+    Global by default (~/.claude/commands). Returns the written path, or None on failure."""
     base = CLAUDE_CONFIG_DIR if global_scope else (Path.cwd() / ".claude")
     cmd_dir = base / "commands"
     cmd_file = cmd_dir / "student.md"
     body = f"""---
-description: Answer this coding task with the LOCAL student model (verified; escalates to Claude only if not confident)
+description: Draft a coding task with the LOCAL student model; you (Claude) verify it and escalate only if it's too hard
 argument-hint: [coding task]
 disable-model-invocation: true
-allowed-tools: Bash(* ts-run *)
+allowed-tools: Bash(* local-chat *)
 ---
 
-The user invoked the local student model for this coding task. The answer below was produced by the
-local model on this machine (the gateway verified it; it falls back to Claude only if the verifier
-isn't confident). Present the answer as the response to the user's request.
+The user invoked the local student model for this coding task. The small local model on this machine
+produced the DRAFT below. You are the teacher in a teacher-student flow — and you run on the user's
+Claude subscription, so any escalation costs them nothing extra.
 
-## Local student answer
+## Task
+$ARGUMENTS
 
-!`{_ts_run_command()}`
+## The local student's draft
+!`{_local_chat_command()}`
 
-## Your job
-Show the user the local student's answer above (the code and the route line). Do NOT re-answer the
-task yourself — the point is that the local model answered it. If the route is `teacher_corrected` or
-`teacher_only`, note that the verifier wasn't confident so it escalated to Claude, and the shown
-answer is the corrected one.
+## Your job — verify, and escalate only if needed
+Judge the draft above against the task:
+- If it is correct and complete → present it as the final answer and note: **"✓ handled locally by the student model."** Do not rewrite a correct answer.
+- If it has bugs, misses edge cases, or the task is genuinely too hard for a small local model → solve it properly yourself and present your answer, noting: **"↑ escalated to Claude — the local draft wasn't sufficient."**
+
+Judge honestly: a wrong local answer is worse than escalating. Keep your reply concise — the student
+did the first pass; you are the verification + safety net.
 """
     try:
         cmd_dir.mkdir(parents=True, exist_ok=True)
