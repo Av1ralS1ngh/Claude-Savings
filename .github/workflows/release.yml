@@ -1,14 +1,19 @@
 name: release-cli
 
-# Builds the PyArmor-obfuscated `decompute-ai` wheel for every supported platform/Python
-# and publishes them to PyPI on a version tag. The obfuscated wheel bundles a native
-# pyarmor runtime .so, so it is platform+python specific — hence the matrix.
+# Build the decompute-ai (CLI/SDK) + decompute-gateway wheels and publish them to the Cloudflare R2
+# dist bucket that install.sh pulls from. The wheels are pure-Python (py3-none-any), so a single build
+# serves every platform — the license boundary is the Ed25519 signature (see docs/offline_licensing.md),
+# not obfuscation. (Optional Nuitka hardening of signed_license.py — scripts/build_engine_nuitka.sh — is
+# a documented follow-up; it would make the gateway wheel platform-specific and need a build matrix.)
 #
-# Required repository secrets:
-#   PYARMOR_REGFILE_B64  base64 of your PyArmor license regfile (pyarmor-regfile.zip)
-#   PYPI_API_TOKEN       PyPI API token (publish job only)
+# Supersedes the old PyArmor->PyPI pipeline: distribution is R2 (install.sh), not PyPI, and the
+# obfuscator is Nuitka, not PyArmor — so neither a PyArmor license nor a PyPI token is needed.
 #
-# Trigger: push a tag like v0.1.0, or run manually (workflow_dispatch, build-only).
+# Required repo secrets for the R2 publish job:
+#   CLOUDFLARE_API_TOKEN   API token with R2 write on the `decompute-dist` bucket
+#   CLOUDFLARE_ACCOUNT_ID  the Cloudflare account id
+#
+# Trigger: push a tag like v0.2.0 (build + publish), or run manually (build-only).
 
 on:
   push:
@@ -17,65 +22,87 @@ on:
 
 jobs:
   build:
-    name: build ${{ matrix.os }} py${{ matrix.python }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-14, macos-13, windows-latest]
-        python: ["3.10", "3.11", "3.12", "3.13"]
+    name: build + verify wheels
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python }}
-
-      - name: Install build tooling
-        run: python -m pip install --upgrade pip pyarmor setuptools wheel
-
-      - name: Register PyArmor license
-        shell: bash
-        env:
-          PYARMOR_REGFILE_B64: ${{ secrets.PYARMOR_REGFILE_B64 }}
-        run: |
-          if [ -z "$PYARMOR_REGFILE_B64" ]; then
-            echo "::error::PYARMOR_REGFILE_B64 secret is not set — a PyArmor license is required for release builds." && exit 1
-          fi
-          echo "$PYARMOR_REGFILE_B64" | base64 -d > pyarmor-regfile.zip
-          pyarmor reg pyarmor-regfile.zip
-          rm -f pyarmor-regfile.zip
-
-      - name: Build + verify obfuscated wheel
-        run: python scripts/build_release.py --verify
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wheel-${{ matrix.os }}-py${{ matrix.python }}
-          path: dist/*.whl
-          if-no-files-found: error
-
-  publish:
-    name: publish to PyPI
-    needs: build
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
-    environment: pypi          # add a manual-approval gate on this environment for safety
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Publish
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+      - name: Build wheels
         run: |
-          python -m pip install --upgrade twine
-          python -m twine check dist/*.whl
-          python -m twine upload dist/*.whl
+          python -m pip install --upgrade pip wheel
+          mkdir -p dist/wheels
+          pip wheel --no-deps packages/python-sdk -w dist/wheels
+          pip wheel --no-deps apps/api          -w dist/wheels
+
+      - name: Smoke-test the CLI wheel (clean venv)
+        run: |
+          python -m venv /tmp/v
+          /tmp/v/bin/pip install dist/wheels/decompute_ai-*.whl
+          /tmp/v/bin/decompute --help >/dev/null
+          test -f /tmp/v/bin/decompute-mcp   # MCP entry point present
+          echo "✓ CLI + decompute-mcp install and run"
+
+      - name: Assert wheels match the tag version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          ls dist/wheels/decompute_ai-${ver}-py3-none-any.whl
+          ls dist/wheels/decompute_gateway-${ver}-py3-none-any.whl
+          grep -q "decompute_ai-${ver}-py3-none-any.whl" scripts/install.sh
+          grep -q "decompute_gateway-${ver}-py3-none-any.whl" scripts/install.sh
+          echo "✓ wheel versions == tag ${ver} == install.sh pins"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels
+          path: dist/wheels/decompute_*.whl
+          if-no-files-found: error
+
+  publish-r2:
+    name: publish to R2
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment: r2          # add a manual-approval rule on this environment for a human gate
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels
+          path: dist/wheels
+
+      # Skip-with-notice (not a hard fail) when the token is absent: a fresh repo won't have it yet,
+      # and the release can still be published manually via scripts/sync_r2.sh. The notice + job
+      # summary make a skipped publish loud, so it's never a silent "thought it shipped" footgun.
+      - name: Check Cloudflare credentials
+        id: cf
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          if [ -z "$CF_TOKEN" ]; then
+            echo "has_token=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::CLOUDFLARE_API_TOKEN not set — SKIPPING R2 publish. Add the secret to automate, or run scripts/sync_r2.sh manually."
+            echo "### ⚠️ R2 publish skipped — CLOUDFLARE_API_TOKEN not set (publish manually with scripts/sync_r2.sh)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "has_token=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish wheels + install.sh to R2
+        if: steps.cf.outputs.has_token == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          BUCKET: decompute-dist
+        run: |
+          npm i -g wrangler
+          # Wheels FIRST, install.sh LAST — install.sh must never point at a not-yet-uploaded wheel.
+          for w in dist/wheels/decompute_*.whl; do
+            echo "→ $(basename "$w")"
+            wrangler r2 object put "$BUCKET/$(basename "$w")" --file "$w" --remote
+          done
+          echo "→ install.sh"
+          wrangler r2 object put "$BUCKET/install.sh" --file scripts/install.sh --remote
+          echo "✓ published $(ls dist/wheels/decompute_*.whl | wc -l) wheels + install.sh to r2://$BUCKET" >> "$GITHUB_STEP_SUMMARY"

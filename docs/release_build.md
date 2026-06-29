@@ -1,5 +1,14 @@
 # Release build — obfuscation & packaging
 
+> ⚠️ **SUPERSEDED in part.** The live distribution is **Cloudflare R2** (what `install.sh` pulls),
+> **not PyPI**, and the obfuscator chosen for the Python layer is **Nuitka**
+> (`scripts/build_engine_nuitka.sh`), **not PyArmor** — Nuitka is free with no license server, and the
+> real license boundary is the Ed25519 signature (see `docs/offline_licensing.md`), so obfuscation is
+> defense-in-depth only. The current shipped wheels are plain `py3-none-any` (Nuitka not yet wired into
+> the shipped artifact). **The working release pipeline is `.github/workflows/release.yml`** (build
+> wheels → verify → publish to R2 on a `v*` tag) and the manual fallback `scripts/sync_r2.sh`. The
+> PyArmor/PyPI sections below are retained for historical context only.
+
 ## Product shape
 
 The valuable IP — the **YSCompress engine** — is a compiled **Rust** core and runs
