@@ -71,8 +71,8 @@ fi
 if [ -z "$gw_spec" ] && [ -n "$here" ] && [ -f "$here/../apps/api/pyproject.toml" ]; then
   gw_spec="$(cd "$here/../apps/api" && pwd)"
 fi
-sdk_spec="${sdk_spec:-$DIST_URL/decompute_ai-0.2.0-py3-none-any.whl}"
-gw_spec="${gw_spec:-$DIST_URL/decompute_gateway-0.2.0-py3-none-any.whl}"
+sdk_spec="${sdk_spec:-$DIST_URL/decompute_ai-0.2.1-py3-none-any.whl}"
+gw_spec="${gw_spec:-$DIST_URL/decompute_gateway-0.2.1-py3-none-any.whl}"
 # The engine wheel is Python-version + platform specific, so pick the one matching this venv's
 # Python (Apple-Silicon macOS for now; other OS/arch get their own wheels via a pip index later).
 PYTAG="$("$PY" -c 'import sys; print(f"cp{sys.version_info.major}{sys.version_info.minor}")' 2>/dev/null || echo unknown)"
