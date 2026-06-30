@@ -309,8 +309,13 @@ class LocalStudentProvider:
 
         started = time.perf_counter()
         try:
+            # read_timeout only bounds inter-byte gaps; wait_for adds a hard wall-clock cap so a
+            # server that trickles bytes can't hold the health probe open indefinitely.
             async with self._client(read_timeout_s=min(self.read_timeout_s, 8.0)) as client:
-                resp = await client.get("/models", headers=self._headers())
+                resp = await asyncio.wait_for(
+                    client.get("/models", headers=self._headers()),
+                    timeout=min(self.overall_timeout_s, 8.0),
+                )
             ok = resp.status_code < 400
             models = []
             if ok:
@@ -326,7 +331,7 @@ class LocalStudentProvider:
                 "models_loaded": models,
                 "context_window": self.context_window,
             }
-        except httpx.TimeoutException as exc:
+        except (httpx.TimeoutException, asyncio.TimeoutError) as exc:
             value = self._health_error("timeout", exc, started)
         except httpx.HTTPError as exc:
             value = self._health_error("unreachable", exc, started)
@@ -363,7 +368,11 @@ class LocalStudentProvider:
         started = time.perf_counter()
         ttft_ms: float | None = None
         out_tokens = 0
-        try:
+
+        # The streaming read is wrapped in wait_for below: read_timeout only bounds inter-byte gaps,
+        # so a server that drips bytes could keep this loop alive indefinitely without an outer cap.
+        async def _stream() -> dict | None:
+            nonlocal ttft_ms, out_tokens
             async with self._client(read_timeout_s=min(self.overall_timeout_s, 30.0)) as client:
                 async with client.stream("POST", "/chat/completions", json=payload, headers=self._headers()) as resp:
                     if resp.status_code >= 400:
@@ -382,7 +391,12 @@ class LocalStudentProvider:
                             if ttft_ms is None:
                                 ttft_ms = (time.perf_counter() - started) * 1000
                             out_tokens += 1  # ~1 chunk ≈ 1 token; a rough but consistent measure
-        except httpx.HTTPError as exc:
+            return None
+        try:
+            early = await asyncio.wait_for(_stream(), timeout=min(self.overall_timeout_s, 30.0))
+            if early is not None:
+                return early  # http_4xx short-circuit
+        except (httpx.HTTPError, asyncio.TimeoutError) as exc:
             return {"ok": False, "error": "unreachable", "error_detail": type(exc).__name__}
         total_ms = (time.perf_counter() - started) * 1000
         if ttft_ms is None:

@@ -97,12 +97,15 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           BUCKET: decompute-dist
         run: |
+          set -euo pipefail   # any failed upload aborts the job (never report a partial publish as success)
           npm i -g wrangler
           # Wheels FIRST, install.sh LAST — install.sh must never point at a not-yet-uploaded wheel.
           for w in dist/wheels/decompute_*.whl; do
             echo "→ $(basename "$w")"
-            wrangler r2 object put "$BUCKET/$(basename "$w")" --file "$w" --remote
+            wrangler r2 object put "$BUCKET/$(basename "$w")" --file "$w" --remote \
+              || { echo "::error::failed to upload $(basename "$w") to R2"; exit 1; }
           done
           echo "→ install.sh"
-          wrangler r2 object put "$BUCKET/install.sh" --file scripts/install.sh --remote
+          wrangler r2 object put "$BUCKET/install.sh" --file scripts/install.sh --remote \
+            || { echo "::error::failed to upload install.sh to R2"; exit 1; }
           echo "✓ published $(ls dist/wheels/decompute_*.whl | wc -l) wheels + install.sh to r2://$BUCKET" >> "$GITHUB_STEP_SUMMARY"

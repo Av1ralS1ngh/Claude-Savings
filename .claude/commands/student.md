@@ -13,7 +13,7 @@ Claude subscription, so any escalation costs them nothing extra.
 $ARGUMENTS
 
 ## The local student's draft
-!`env -u DECOMPUTE_BASE_URL "/Users/avii/.local/bin/decompute" local-chat "$ARGUMENTS"`
+!`env -u DECOMPUTE_BASE_URL PYTHONPATH="/Users/avii/Documents/Claude-Coder/packages/python-sdk/src" "/Users/avii/Documents/Claude-Coder/.venv/bin/python" -m decompute_ai.cli local-chat '$ARGUMENTS'`
 
 ## Your job — verify, and escalate only if needed
 Judge the draft above against the task:

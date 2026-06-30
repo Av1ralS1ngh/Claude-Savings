@@ -542,7 +542,11 @@ def _local_chat_command() -> str:
         venv_py = here.parents[4] / ".venv" / "bin" / "python"  # .../Claude-Coder/.venv/bin/python
         py = str(venv_py) if venv_py.exists() else sys.executable
         runner = f'PYTHONPATH="{repo_src}" "{py}" -m decompute_ai.cli'
-    return f'env -u DECOMPUTE_BASE_URL {runner} local-chat "$ARGUMENTS"'
+    # SINGLE-quote $ARGUMENTS: inside '...' bash does no command substitution or variable expansion,
+    # so a task containing $(...), backticks, $, or " is passed to local-chat as literal text rather
+    # than executed. (Claude Code substitutes the user's text for $ARGUMENTS before bash runs; a literal
+    # ' in the task is the only residual edge case, and harmless — it's the user's own input.)
+    return f"env -u DECOMPUTE_BASE_URL {runner} local-chat '$ARGUMENTS'"
 
 
 def _install_student_slash_command(*, global_scope: bool = True) -> Optional[Path]:
@@ -691,7 +695,24 @@ def _enable_student_in_gateway_env() -> bool:
             out.append("# Teacher-student local model (set by `decompute student models`)")
             out.extend(f"{k}={desired[k]}" for k in missing)
         env_path.parent.mkdir(parents=True, exist_ok=True)
-        env_path.write_text("\n".join(out).rstrip() + "\n")
+        # Atomic write: the always-on gateway can load_dotenv() this file at any moment, so a partial
+        # write would feed it a truncated config. Write to a temp file in the same dir, fsync, then
+        # os.replace (atomic rename) so a reader sees either the old or the complete new contents.
+        import tempfile
+        data = ("\n".join(out).rstrip() + "\n").encode("utf-8")
+        fd, tmp = tempfile.mkstemp(dir=str(env_path.parent), prefix=env_path.name + ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, env_path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
         return True
     except Exception:
         return False
@@ -757,7 +778,9 @@ def student_start(
     # Fall back to the model/size chosen via the wizard (config) when not given explicitly.
     cfg_student = load_config().get("student", {}) if not model else {}
     model = model or cfg_student.get("model")
-    model_path = None if model and not cfg_student else cfg_student.get("model_path")
+    # cfg_student is {} when --model was passed (so this is None — an explicit model loads via -hf,
+    # not the configured model's cached path); otherwise reuse the wizard's cached on-disk path.
+    model_path = cfg_student.get("model_path")
     if weight_gb == 0.0:
         weight_gb = float(cfg_student.get("weight_gb", 0.0) or 0.0)
     if not model and not model_path:

@@ -130,9 +130,11 @@ def load_config() -> dict:
 
 def _render_toml(cfg: dict) -> str:
     lines: list[str] = []
-    for section in ("gateway", "privacy", "ccr", "claude", "license", "telemetry", "student"):
-        sec = cfg.get(section) or {}
-        if not sec:
+    # Persist every real config section (not a hardcoded whitelist — that silently dropped any new
+    # section on the next save). Skip: `_`-prefixed keys (runtime-derived/transient, e.g. `_meta`),
+    # non-dict values (malformed — would crash on .items()), and empty sections.
+    for section, sec in cfg.items():
+        if section.startswith("_") or not isinstance(sec, dict) or not sec:
             continue
         lines.append(f"[{section}]")
         for k, v in sec.items():

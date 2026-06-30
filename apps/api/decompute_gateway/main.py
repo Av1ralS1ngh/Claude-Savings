@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import asyncio
 import csv
+import hashlib
 import html
 import io
 import json

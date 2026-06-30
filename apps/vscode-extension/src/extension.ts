@@ -747,11 +747,13 @@ async function runTeacherStudent(task: string, opts: { requireTeacher?: boolean 
   // execute mid-command across shells (bash/zsh/pwsh). Write it to a temp file and pass --task-file,
   // so the terminal command is always a single clean line. Single-line tasks stay inline for clarity.
   let taskArg: string;
+  let tmpFile: string | null = null;
   if (task.includes("\n")) {
     const tmp = path.join(os.tmpdir(), `decompute-task-${randomUUID()}.txt`);
     try {
       fs.writeFileSync(tmp, task, { encoding: "utf8", mode: 0o600 });
       taskArg = `--task-file ${q(tmp)}`;
+      tmpFile = tmp;
     } catch {
       // Fall back to inline if the temp write fails (best-effort).
       taskArg = q(task);
@@ -763,6 +765,12 @@ async function runTeacherStudent(task: string, opts: { requireTeacher?: boolean 
   if (opts.requireTeacher) line += " --require-teacher";
   // addNewLine=true: run it (the answer streams into the terminal). The user sees route + verifier line.
   terminal.sendText(line, true);
+  // Clean up the temp task file once ts-run has read it (seconds after launch) so they don't pile up
+  // in the tmp dir across invocations. Best-effort; ignore if already gone.
+  if (tmpFile) {
+    const toRemove = tmpFile;
+    setTimeout(() => { try { fs.rmSync(toRemove, { force: true }); } catch { /* ignore */ } }, 30_000);
+  }
 }
 
 /** "Ask Local Student": prompt for a coding task, run it verified through the local student. */
