@@ -126,6 +126,40 @@ def test_student_only_is_served_on_proxy_when_serve_enabled(monkeypatch):
     assert body["type"] == "message" and body["role"] == "assistant"
 
 
+def test_exo_serve_is_gated_until_eval_passes(monkeypatch):
+    """V1c: exo can be measured/evaluated, but auto-serving Claude Code is closed until the §0 eval
+    gate is explicitly marked passed."""
+    from fastapi.testclient import TestClient
+
+    main = _reload_app_with(
+        monkeypatch,
+        DECOMPUTE_MOCK_ANTHROPIC="true",
+        DECOMPUTE_LOCAL_STUDENT_ENABLED="true",
+        DECOMPUTE_LOCAL_STUDENT_SERVE="true",
+        DECOMPUTE_LOCAL_STUDENT_BACKEND="exo",
+        DECOMPUTE_LOCAL_STUDENT_BASE_URL="http://127.0.0.1:52415/v1",
+        DECOMPUTE_LOCAL_STUDENT_MODEL="mlx-community/qwen-coder",
+        DECOMPUTE_LOCAL_STUDENT_EXO_EVAL_PASSED="false",
+        DECOMPUTE_EXO_EVAL_PASSED="false",
+    )
+    assert main.settings.local_student_backend == "exo"
+    assert main.settings.local_student_exo_eval_gate_passed is False
+
+    import decompute_gateway.teacher_student.router as router_mod
+    monkeypatch.setattr(router_mod, "build_teacher_student_service",
+                        _make_service_factory(route="student_only", answer=_STUDENT_ANSWER))
+
+    with TestClient(main.app) as c:
+        r = c.post("/v1/messages", json={
+            "model": "claude-opus-4-8", "max_tokens": 64,
+            "messages": [{"role": "user", "content": _CODING_PROMPT}],
+        })
+    assert r.status_code == 200
+    assert r.headers.get("x-decompute-served-by") is None
+    assert r.headers.get("x-decompute-student-fallback") == "exo_eval_gate_not_passed"
+    assert "Mock Claude response from Decompute Gateway" in r.json()["content"][0]["text"]
+
+
 def test_student_only_is_served_as_sse_for_streaming_request(monkeypatch):
     """The production case: Claude Code STREAMS. An accepted student answer on a streaming request must
     come back as Anthropic-shaped SSE (message_start ... content_block_delta ... message_stop), carrying

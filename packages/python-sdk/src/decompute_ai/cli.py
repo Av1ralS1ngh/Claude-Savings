@@ -59,6 +59,7 @@ configure_app = typer.Typer(help="Configure editor and agent integrations.")
 app.add_typer(configure_app, name="configure")
 
 HOSTED_GATEWAY_URL = "https://gateway.decompute.run"
+DEFAULT_EXO_BASE_URL = "http://127.0.0.1:52415/v1"
 CLAUDE_CONFIG_DIR = Path(os.getenv("DECOMPUTE_CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
 CLAUDE_SETTINGS = CLAUDE_CONFIG_DIR / "settings.json"
 AUTH_API_KEY = "anthropic_api"
@@ -88,6 +89,7 @@ _COMMAND_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
     ("Local coding model (teacher-student)", [
         ("student models", "Pick + download a local coding model (RAM-aware)"),
         ("student endpoint <url>", "Point the student at a bigger box / hosted endpoint"),
+        ("student exo", "Detect a user-run exo cluster on :52415 and use it as the student"),
         ("student start", "Start the local model (loads it into memory)"),
         ("student stop / status", "Stop the model / check if it's running"),
         ("ts-run \"<task>\"", "Answer a coding task with the local model (verified)"),
@@ -384,6 +386,32 @@ def ts_health(
         else:
             from rich.markup import escape as _esc
             print(f"  [yellow]conformance issues:[/yellow] {', '.join(_esc(w) for w in warns) or 'chat failed'}")
+    gate = sh.get("serve_gate")
+    if gate is not None:
+        if gate.get("ok"):
+            print("  [dim]auto-serve gate:[/dim] [green]open[/green]")
+        else:
+            print(f"  [dim]auto-serve gate:[/dim] [yellow]closed[/yellow] ({gate.get('reason')})")
+    cluster = sh.get("cluster")
+    if isinstance(cluster, dict):
+        readiness = cluster.get("readiness") or {}
+        interconnect = (readiness.get("interconnect") or {}).get("label") or "unknown"
+        ram = cluster.get("pooled_ram_gb")
+        ram_text = f", {ram} GiB pooled RAM" if ram is not None else ""
+        print(f"  [dim]exo cluster:[/dim] {cluster.get('node_count', 0)} node(s){ram_text}, {interconnect}")
+        model_info = readiness.get("model") or {}
+        if model_info:
+            downloaded = "yes" if model_info.get("downloaded") else "no"
+            active = "yes" if model_info.get("active") else "no"
+            print(f"  [dim]exo model:[/dim] downloaded={downloaded} active={active}")
+        warnings = readiness.get("warnings") or []
+        blockers = readiness.get("blockers") or []
+        if blockers or warnings:
+            from rich.markup import escape as _esc
+            issues = blockers + warnings
+            print("  [yellow]exo readiness:[/yellow] " + ", ".join(_esc(str(x)) for x in issues[:6]))
+            if readiness.get("recommended_next"):
+                print(f"  [dim]next:[/dim] {_esc(str(readiness['recommended_next']))}")
     print(f"  verifier threshold: {(h.get('verifier') or {}).get('threshold')}  judge: {(h.get('verifier') or {}).get('judge_enabled')}")
     print(f"  sandbox: {(h.get('sandbox') or {}).get('backend')}  governance: {(h.get('governance') or {}).get('mode')}")
     # Actionable next step when something isn't ready — don't make the user infer it.
@@ -678,6 +706,10 @@ def _enable_student_in_gateway_env() -> bool:
         # The judge is the verification signal on the live proxy path (requests carry no tests).
         "DECOMPUTE_TS_JUDGE_ENABLED": "true",
     }
+    if cfg.get("backend") == "exo":
+        desired["DECOMPUTE_LOCAL_STUDENT_EXO_EVAL_PASSED"] = (
+            "true" if cfg.get("exo_eval_passed") else "false"
+        )
     try:
         lines = env_path.read_text().splitlines() if env_path.is_file() else []
         seen: set[str] = set()
@@ -1121,6 +1153,182 @@ def _endpoint_host_tier(url: str) -> str:
     if ip.is_private or (isinstance(ip, ipaddress.IPv4Address) and ip in ipaddress.ip_network("100.64.0.0/10")):
         return "private"
     return "public"
+
+
+def _exo_root_url(url: str) -> str:
+    from urllib.parse import urlparse, urlunparse
+
+    parsed = urlparse((url or DEFAULT_EXO_BASE_URL).rstrip("/"))
+    path = parsed.path.rstrip("/")
+    if path == "/v1":
+        path = ""
+    elif path.endswith("/v1"):
+        path = path[:-3].rstrip("/")
+    return urlunparse((parsed.scheme, parsed.netloc, path, "", "", "")).rstrip("/")
+
+
+def _model_ids_from_models_payload(payload: Any) -> list[str]:
+    """Normalize exo `/models` and OpenAI `/v1/models` responses into model ids."""
+    if isinstance(payload, dict):
+        items = payload.get("data") or payload.get("models") or payload.get("items") or []
+    elif isinstance(payload, list):
+        items = payload
+    else:
+        items = []
+    ids: list[str] = []
+    for item in items:
+        if isinstance(item, str):
+            mid = item
+        elif isinstance(item, dict):
+            mid = item.get("id") or item.get("model_id") or item.get("modelId") or item.get("name")
+        else:
+            mid = None
+        if mid and str(mid) not in ids:
+            ids.append(str(mid))
+    return ids
+
+
+def _exo_state_summary(state: Any) -> dict[str, Any]:
+    if not isinstance(state, dict):
+        return {"node_count": 0, "instance_count": 0, "active_models": []}
+    node_maps = [
+        state.get("nodeIdentities") or state.get("node_identities") or {},
+        state.get("nodeMemory") or state.get("node_memory") or {},
+        state.get("nodeBackends") or state.get("node_backends") or {},
+        state.get("lastSeen") or state.get("last_seen") or {},
+    ]
+    node_ids: set[str] = set()
+    for m in node_maps:
+        if isinstance(m, dict):
+            node_ids.update(str(k) for k in m.keys())
+    topology = state.get("topology") or {}
+    if isinstance(topology, dict):
+        node_ids.update(str(n) for n in topology.get("nodes") or [])
+    instances = state.get("instances") or {}
+    active_models: set[str] = set()
+    if isinstance(instances, dict):
+        for inst in instances.values():
+            if not isinstance(inst, dict):
+                continue
+            shards = inst.get("shardAssignments") or inst.get("shard_assignments") or {}
+            if isinstance(shards, dict):
+                mid = shards.get("modelId") or shards.get("model_id")
+                if mid:
+                    active_models.add(str(mid))
+    return {
+        "node_count": len(node_ids),
+        "instance_count": len(instances) if isinstance(instances, dict) else 0,
+        "active_models": sorted(active_models),
+    }
+
+
+def _discover_exo_cluster(url: str) -> dict[str, Any]:
+    """Probe a user-run exo API directly from the CLI. Raises with an actionable message on failure."""
+    import httpx
+
+    root = _exo_root_url(url)
+    try:
+        models_resp = httpx.get(f"{url.rstrip('/')}/models?status=downloaded", timeout=8.0)
+        if models_resp.status_code == 404:
+            models_resp = httpx.get(f"{url.rstrip('/')}/models", timeout=8.0)
+        models_resp.raise_for_status()
+        state_resp = httpx.get(f"{root}/state", timeout=8.0)
+        state_resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"could not reach exo at {url}: {exc}") from exc
+    models = _model_ids_from_models_payload(models_resp.json())
+    state = state_resp.json()
+    return {"base_url": url.rstrip("/"), "root_url": root, "models": models, "state": state}
+
+
+@student_app.command("exo")
+def student_exo(
+    url: str = typer.Option(DEFAULT_EXO_BASE_URL, "--url", help="exo OpenAI-compatible base URL."),
+    model: Optional[str] = typer.Option(
+        None, "--model", help="Model id to use. Defaults to the first downloaded model exo reports."
+    ),
+    eval_passed: bool = typer.Option(
+        False,
+        "--eval-passed",
+        help="Record that the §0 eval passed; opens exo auto-serve when serve is otherwise enabled.",
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the remote-endpoint consent prompt."),
+):
+    """Detect a BYO exo cluster and point the student at it.
+
+    exo stays user-run: Decompute only reads `/models` + `/state` and then uses exo's
+    OpenAI-compatible `/v1/chat/completions` for student drafts. exo also exposes a Claude Messages
+    API; Decompute's Claude Code compressor path keeps returning Anthropic-shaped `/v1/messages`
+    responses when a verified student answer is accepted.
+    """
+    from urllib.parse import urlparse
+
+    if urlparse(url).scheme not in ("http", "https"):
+        print("[red]✗[/red] exo URL must start with http:// or https://")
+        raise typer.Exit(2)
+
+    tier = _endpoint_host_tier(url)
+    host = urlparse(url).hostname or url
+    if tier in ("private", "public", "unknown") and not yes:
+        print(f"[yellow]⚠ Remote exo endpoint[/yellow] ([bold]{host}[/bold]).")
+        print("  Student prompts will be sent to that cluster. Keep exo on a network you control.")
+        if tier == "public":
+            print("  Public exo endpoints require https + DECOMPUTE_LOCAL_STUDENT_ALLOW_PUBLIC_ENDPOINT=true.")
+        if not typer.confirm("Continue?", default=False):
+            print("Aborted. Nothing changed.")
+            raise typer.Exit(0)
+
+    try:
+        detected = _discover_exo_cluster(url)
+    except RuntimeError as exc:
+        print(f"[red]✗[/red] {exc}")
+        print("  Start exo, open its dashboard, then retry.")
+        print("  Default expected URL: [bold]http://127.0.0.1:52415/v1[/bold]")
+        raise typer.Exit(1)
+
+    models = detected["models"]
+    chosen_model = model or (models[0] if models else None)
+    if not chosen_model:
+        print("[red]✗[/red] exo is reachable but reported no downloaded models.")
+        print("  Download or add a model in exo first, or pass [bold]--model <id>[/bold].")
+        raise typer.Exit(2)
+    if model and models and model not in models:
+        print(f"[yellow]⚠ model not listed by exo:[/yellow] [bold]{model}[/bold]")
+        if not (yes or typer.confirm("Use it anyway?", default=False)):
+            print("Aborted. Nothing changed.")
+            raise typer.Exit(0)
+
+    summary = _exo_state_summary(detected["state"])
+    save_config({
+        "student": {
+            "backend": "exo",
+            "base_url": detected["base_url"],
+            "endpoint_model": chosen_model,
+            "exo_eval_passed": bool(eval_passed),
+        }
+    })
+    wrote = _enable_student_in_gateway_env()
+    _install_student_slash_command()
+
+    print(
+        f"\n[green]✓ exo cluster detected:[/green] {summary['node_count']} node(s), "
+        f"{summary['instance_count']} active instance(s)"
+    )
+    print(f"  student: [bold]{chosen_model}[/bold] @ [cyan]{detected['base_url']}[/cyan]  [dim]({tier})[/dim]")
+    if summary["active_models"]:
+        print(f"  active models: [dim]{', '.join(summary['active_models'])}[/dim]")
+    print("  api: [dim]OpenAI chat + Claude Messages compatible (exo);[/dim]")
+    print("       [dim]Decompute returns Claude-shaped messages to Claude Code.[/dim]")
+    if eval_passed:
+        print("  [green]auto-serve gate:[/green] open (you marked the §0 eval as passed)")
+    else:
+        print("  [yellow]auto-serve gate:[/yellow] closed until §0 eval passes.")
+        print("  Run [bold]decompute ts-eval --label exo[/bold], compare against 7B, then set")
+        print("  [bold]DECOMPUTE_LOCAL_STUDENT_EXO_EVAL_PASSED=true[/bold] when the predeclared thresholds pass.")
+    print("  Verify topology + readiness: [bold]decompute ts-health --measure[/bold]")
+    if not wrote:
+        print("  [dim](couldn't auto-wire the gateway env — set[/dim]")
+        print("  [dim]DECOMPUTE_LOCAL_STUDENT_BASE_URL/MODEL/BACKEND yourself.)[/dim]")
 
 
 @student_app.command("endpoint")

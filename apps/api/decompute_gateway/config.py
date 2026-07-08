@@ -313,6 +313,12 @@ class Settings:
     # in validate_for_startup.
     local_student_allow_remote: bool = _bool("DECOMPUTE_LOCAL_STUDENT_ALLOW_REMOTE", False)
     local_student_allow_public_endpoint: bool = _bool("DECOMPUTE_LOCAL_STUDENT_ALLOW_PUBLIC_ENDPOINT", False)
+    # V1c exo is experimental BYO clustering. Health/eval may probe it, but automatic inline serving
+    # on the Claude Code compressor path stays closed until the §0 eval has been run and accepted.
+    local_student_exo_eval_gate_passed: bool = _bool(
+        "DECOMPUTE_LOCAL_STUDENT_EXO_EVAL_PASSED",
+        _bool("DECOMPUTE_EXO_EVAL_PASSED", False),
+    )
 
     # Teacher-student verifier / governance (consumed in later phases; declared here so production
     # validation can reject unsafe combinations from the first ship).

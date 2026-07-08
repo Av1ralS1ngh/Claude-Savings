@@ -30,6 +30,46 @@ decompute ts-health --measure
 tokens/s**, and a **conformance** check (does it return well-formed OpenAI responses with usage). Use it
 to confirm the endpoint is genuinely usable, not just reachable.
 
+## exo BYO cluster (V1c, experimental)
+
+If you run an exo cluster yourself, Decompute can use it as the student backend without owning any exo
+orchestration:
+
+```bash
+# Detect exo at the default API URL, read /models + /state, and configure backend=exo:
+decompute student exo
+
+# See topology, the eval gate, TTFT, tokens/s, and conformance:
+decompute ts-health --measure
+
+# Gather the §0 evidence before enabling automatic Claude Code serving:
+decompute ts-eval --label exo --out compare.jsonl
+```
+
+exo exposes OpenAI chat completions at `/v1/chat/completions` and Claude Messages at `/v1/messages`.
+Decompute uses the OpenAI-compatible student contract for drafts, then returns normal Claude-shaped
+`/v1/messages` responses to Claude Code when a verified student answer is accepted.
+
+Because exo is a distributed, experimental BYO backend, automatic inline serving on the Claude Code
+compressor path stays **closed** until the §0 eval has passed your predeclared thresholds. Leave it
+closed while measuring. After the eval passes, set:
+
+```bash
+DECOMPUTE_LOCAL_STUDENT_EXO_EVAL_PASSED=true
+```
+
+Explicit commands (`decompute ts-run`, `decompute local-chat`, `/student`, and `decompute ts-eval`) can
+still run against exo so you can gather that evidence.
+
+`ts-health --measure` now performs the pre-integration checks we want before touching real office
+hardware:
+
+- node count and pooled RAM from exo `/state`;
+- requested-model status: listed/downloaded vs already active in the cluster;
+- interconnect classification: Thunderbolt/RDMA, Ethernet/socket, WiFi, or unknown;
+- obvious blockers/warnings such as WiFi-only, no topology edges, single-node mode, or model not active;
+- measured TTFT/tokens/s from the same canary used by the generic endpoint preflight.
+
 ## Security model (what the gateway enforces)
 
 Pointing the student off-box means your prompts (which may contain proprietary code) leave this machine.

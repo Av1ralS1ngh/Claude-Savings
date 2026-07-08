@@ -14,7 +14,7 @@ runner = CliRunner()
 def test_student_subcommands_registered():
     result = runner.invoke(app, ["student", "--help"])
     assert result.exit_code == 0
-    for cmd in ("status", "start", "stop", "smoke", "install", "pull", "models"):
+    for cmd in ("status", "start", "stop", "smoke", "install", "pull", "models", "exo"):
         assert cmd in result.output
 
 
@@ -219,6 +219,64 @@ def test_explain_ts_error_actionable_messages(capsys):
     assert "student isn't ready" in out or "student start" in out
 
 
+def test_ts_health_prints_exo_cluster_readiness(monkeypatch):
+    import decompute_ai.cli as cli
+
+    class _FakeTS:
+        def health(self, *, measure=False):
+            assert measure is True
+            return {
+                "enabled": True,
+                "student": {
+                    "backend": "exo",
+                    "base_url": "http://127.0.0.1:52415/v1",
+                    "model": "mlx-community/qwen-coder",
+                    "trust_tier": "loopback",
+                },
+                "student_health": {
+                    "ok": True,
+                    "measured_ok": True,
+                    "ttft_ms": 123,
+                    "tokens_per_s": 18.5,
+                    "serve_gate": {"ok": False, "reason": "exo_eval_gate_not_passed"},
+                    "conformance": {"chat_ok": True, "warnings": []},
+                    "cluster": {
+                        "node_count": 2,
+                        "pooled_ram_gb": 96,
+                        "readiness": {
+                            "interconnect": {"label": "ethernet_or_socket"},
+                            "model": {
+                                "requested": "mlx-community/qwen-coder",
+                                "downloaded": True,
+                                "active": False,
+                            },
+                            "warnings": ["requested_model_not_active"],
+                            "blockers": [],
+                            "recommended_next": "warnings present; run ts-eval before any auto-serve gate",
+                        },
+                    },
+                },
+                "verifier": {"threshold": 0.82, "judge_enabled": True},
+                "sandbox": {"backend": "disabled"},
+                "governance": {"mode": "metadata_only"},
+            }
+
+    class _FakeClient:
+        teacher_student = _FakeTS()
+
+    monkeypatch.setattr(cli, "_client", lambda: _FakeClient())
+    from typer.testing import CliRunner
+    r = CliRunner().invoke(cli.app, ["ts-health", "--measure"])
+    assert r.exit_code == 0, r.output
+    out = r.output.lower()
+    assert "backend: exo" in out
+    assert "exo cluster" in out and "2 node" in out
+    assert "96 gib pooled ram" in out
+    assert "downloaded=yes active=no" in out
+    assert "auto-serve gate" in out and "closed" in out
+    assert "requested_model_not_active" in out
+
+
 def test_commands_cheatsheet_lists_key_commands():
     """`decompute commands` shows a grouped cheat-sheet covering the key user commands."""
     result = runner.invoke(app, ["commands"])
@@ -288,6 +346,50 @@ def test_student_endpoint_key_stored_owner_only(tmp_path, monkeypatch):
     assert mode == 0o600, oct(mode)
     assert cfg.load_student_endpoint_key() == "sk-secret-xyz"
     importlib.reload(cfg)
+
+
+def test_student_exo_detects_cluster_and_persists_backend(tmp_path, monkeypatch):
+    monkeypatch.setenv("DECOMPUTE_CONFIG_DIR", str(tmp_path))
+    import decompute_ai.config as cfg
+    import importlib; importlib.reload(cfg)
+    import decompute_ai.cli as cli; importlib.reload(cli)
+
+    monkeypatch.setattr(cli, "_discover_exo_cluster", lambda url: {
+        "base_url": "http://127.0.0.1:52415/v1",
+        "root_url": "http://127.0.0.1:52415",
+        "models": ["mlx-community/qwen-coder"],
+        "state": {"nodeIdentities": {"n1": {}}, "topology": {"nodes": ["n1"]}},
+    })
+    from typer.testing import CliRunner
+    r = CliRunner().invoke(cli.app, ["student", "exo", "--yes"])
+    assert r.exit_code == 0, r.output
+    assert "exo cluster detected" in r.output.lower()
+    assert "auto-serve gate" in r.output.lower()
+    student = cfg.load_config().get("student", {})
+    assert student.get("backend") == "exo"
+    assert student.get("base_url") == "http://127.0.0.1:52415/v1"
+    assert student.get("endpoint_model") == "mlx-community/qwen-coder"
+    assert student.get("exo_eval_passed") is False
+    importlib.reload(cfg); importlib.reload(cli)
+
+
+def test_student_exo_eval_passed_persists_gate(tmp_path, monkeypatch):
+    monkeypatch.setenv("DECOMPUTE_CONFIG_DIR", str(tmp_path))
+    import decompute_ai.config as cfg
+    import importlib; importlib.reload(cfg)
+    import decompute_ai.cli as cli; importlib.reload(cli)
+
+    monkeypatch.setattr(cli, "_discover_exo_cluster", lambda url: {
+        "base_url": "http://127.0.0.1:52415/v1",
+        "root_url": "http://127.0.0.1:52415",
+        "models": ["m"],
+        "state": {},
+    })
+    from typer.testing import CliRunner
+    r = CliRunner().invoke(cli.app, ["student", "exo", "--eval-passed", "--yes"])
+    assert r.exit_code == 0, r.output
+    assert cfg.load_config()["student"]["exo_eval_passed"] is True
+    importlib.reload(cfg); importlib.reload(cli)
 
 
 def test_ts_eval_summarizes_accept_rate(monkeypatch, tmp_path):

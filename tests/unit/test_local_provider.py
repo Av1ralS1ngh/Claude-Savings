@@ -410,6 +410,7 @@ def test_preflight_reports_tier_reachable_and_measured():
     assert cap["trust_tier"] == "loopback"      # 127.0.0.1 endpoint
     assert cap["endpoint_ok"] is True
     assert cap["reachable"] is True
+    assert cap["ok"] is True
     assert cap["measured_ok"] is True
     assert cap["ttft_ms"] is not None
     assert cap["tokens_per_s"] >= 0
@@ -421,6 +422,7 @@ def test_preflight_unreachable_is_not_measured():
 
     cap = asyncio.run(_provider(handler).preflight())
     assert cap["reachable"] is False
+    assert cap["ok"] is False
     assert cap["measured_ok"] is False
     assert cap["measure_error"] == "unreachable"
 
@@ -434,7 +436,39 @@ def test_preflight_blocked_endpoint_is_not_measured():
     cap = asyncio.run(prov.preflight())
     assert cap["endpoint_ok"] is False
     assert cap["trust_tier"] == "blocked"
+    assert cap["ok"] is False
     assert cap["measured_ok"] is False
+
+
+def test_exo_preflight_includes_cluster_and_eval_gate():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "mlx-community/qwen-coder"}]})
+        if request.url.path.endswith("/state"):
+            return httpx.Response(200, json={"nodeIdentities": {"n1": {}}, "topology": {"nodes": ["n1"]}})
+        if request.url.path.endswith("/chat/completions"):
+            return _sse_chat(["o", "k"])
+        return httpx.Response(404)
+
+    prov = _provider(
+        handler,
+        backend="exo",
+        model="mlx-community/qwen-coder",
+        base_url="http://127.0.0.1:52415/v1",
+    )
+    cap = asyncio.run(prov.preflight())
+    assert cap["backend"] == "exo"
+    assert cap["experimental"] is True
+    assert cap["serve_gate"]["ok"] is False
+    assert cap["serve_gate"]["reason"] == "exo_eval_gate_not_passed"
+    assert cap["cluster"]["ok"] is True
+    assert cap["cluster"]["node_count"] == 1
+    assert cap["cluster"]["api_formats"]["claude_messages"] == "/v1/messages"
+    readiness = cap["cluster"]["readiness"]
+    assert readiness["measured_ok"] is True
+    assert readiness["model"]["downloaded"] is True
+    assert readiness["model"]["active"] is False
+    assert "requested_model_not_active" in readiness["warnings"]
 
 
 # ── Conformance probe (V1a: "OpenAI-compatible" is leaky) ───────────────────────

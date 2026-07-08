@@ -1,6 +1,8 @@
 # Heterogeneous Inference for the Local Student — Design Plan (v2, post-Codex review)
 
-Status: **PROPOSAL (revised after a tough Codex review).** Not implemented.
+Status: **IN PROGRESS.** V1a (`openai_endpoint`) is shipped. V1c initial BYO exo adapter work has
+started: detect a user-run exo API at `:52415/v1`, read `/models` + `/state`, surface topology in
+preflight, and keep automatic Claude Code serving gated behind the §0 eval.
 This v2 reframes the v1 around the review's central correction: the product is a **pluggable,
 OpenAI-compatible student backend with measured health/preflight + an explicit fallback policy** — not
 "Decompute-managed llama.cpp clustering." llama.cpp RPC becomes the *first experimental* backend,

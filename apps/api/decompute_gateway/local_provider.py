@@ -183,7 +183,7 @@ _semaphores: dict[tuple[str, int], asyncio.Semaphore] = {}
 # Process-wide provider singletons keyed by (base_url, model), so the per-provider health TTL cache
 # survives across requests (M5). The router builds a fresh service per request; without this the
 # health probe would hit the backend every time despite health_ttl_s.
-_provider_singletons: dict[tuple[str, str], "LocalStudentProvider"] = {}
+_provider_singletons: dict[tuple[str, str, str, bool], "LocalStudentProvider"] = {}
 
 
 def _semaphore_for(base_url: str, concurrency: int) -> asyncio.Semaphore:
@@ -223,6 +223,7 @@ class LocalStudentProvider:
         max_concurrency: int = 1,
         queue_timeout_s: float = 45.0,
         backend: str = "llama_cpp",
+        exo_eval_gate_passed: bool = False,
         transport: httpx.AsyncBaseTransport | None = None,
     ):
         self.base_url = base_url.rstrip("/")
@@ -237,6 +238,7 @@ class LocalStudentProvider:
         self.max_concurrency = max_concurrency
         self.queue_timeout_s = queue_timeout_s
         self.backend = backend
+        self.exo_eval_gate_passed = exo_eval_gate_passed
         self._transport = transport
         self._health_cache: _HealthCacheEntry | None = None
 
@@ -255,6 +257,7 @@ class LocalStudentProvider:
             max_concurrency=settings.local_student_max_concurrency,
             queue_timeout_s=settings.local_student_queue_timeout_s,
             backend=settings.local_student_backend,
+            exo_eval_gate_passed=settings.local_student_exo_eval_gate_passed,
             transport=transport,
         )
 
@@ -263,7 +266,12 @@ class LocalStudentProvider:
         """Return a process-wide singleton keyed by (base_url, model). The router builds a fresh
         SERVICE per request, but the provider — and its health TTL cache — must persist so /health
         doesn't probe the backend on every call (M5). Test transports never use this path."""
-        key = (settings.local_student_base_url, settings.local_student_model)
+        key = (
+            settings.local_student_backend,
+            settings.local_student_base_url,
+            settings.local_student_model,
+            settings.local_student_exo_eval_gate_passed,
+        )
         inst = _provider_singletons.get(key)
         if inst is None:
             inst = cls.from_settings(settings)
@@ -426,16 +434,44 @@ class LocalStudentProvider:
             "reachable": bool(h.get("ok")),
             "models_loaded": h.get("models_loaded", []),
         }
+        if self.backend == "exo":
+            from .exo_adapter import assess_exo_cluster, exo_cluster_capability
+
+            cap["experimental"] = True
+            cap["serve_gate"] = {
+                "ok": bool(self.exo_eval_gate_passed),
+                "reason": None if self.exo_eval_gate_passed else "exo_eval_gate_not_passed",
+                "required": "heterogeneous_inference_plan §0 eval",
+            }
+            cap["cluster"] = await exo_cluster_capability(
+                base_url=self.base_url,
+                api_key=self.api_key,
+                timeout_s=min(self.overall_timeout_s, 8.0),
+                requested_model=self.model,
+                models_loaded=list(h.get("models_loaded") or []),
+                transport=self._transport,
+            )
         if cap["reachable"] and tier_v.ok:
             c = await self.canary()
             cap["measured_ok"] = bool(c.get("ok"))
+            cap["ok"] = cap["measured_ok"]
             cap["ttft_ms"] = c.get("ttft_ms")
             cap["tokens_per_s"] = c.get("tokens_per_s")
             if not c.get("ok"):
                 cap["measure_error"] = c.get("error")
             cap["conformance"] = await self.conformance()
+            if self.backend == "exo" and isinstance(cap.get("cluster"), dict):
+                cap["cluster"]["readiness"] = assess_exo_cluster(
+                    cap["cluster"],
+                    requested_model=self.model,
+                    models_loaded=list(h.get("models_loaded") or []),
+                    measured_ok=cap["measured_ok"],
+                    tokens_per_s=cap.get("tokens_per_s"),
+                    ttft_ms=cap.get("ttft_ms"),
+                )
         else:
             cap["measured_ok"] = False
+            cap["ok"] = False
             cap["measure_error"] = "endpoint_blocked" if not tier_v.ok else "unreachable"
         return cap
 

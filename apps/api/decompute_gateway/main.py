@@ -298,6 +298,17 @@ async def _try_serve_with_student(
     from .teacher_student.router import build_teacher_student_service
     from .teacher_student.schemas import TeacherStudentRunRequest
 
+    if (
+        getattr(settings, "local_student_backend", "") == "exo"
+        and not getattr(settings, "local_student_exo_eval_gate_passed", False)
+    ):
+        headers["x-decompute-student-fallback"] = "exo_eval_gate_not_passed"
+        log.info(
+            "student-serve skipped; exo eval gate not passed",
+            extra={"extra": {"request_id": request_id, "backend": "exo"}},
+        )
+        return None
+
     try:
         service = build_teacher_student_service(
             request,
