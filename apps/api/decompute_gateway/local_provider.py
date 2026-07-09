@@ -423,7 +423,6 @@ class LocalStudentProvider:
         from .endpoint_security import classify_endpoint
 
         tier_v = classify_endpoint(self.base_url)
-        h = await self.health(force=True)
         cap: dict[str, Any] = {
             "backend": self.backend,
             "base_url": self.base_url,
@@ -431,48 +430,70 @@ class LocalStudentProvider:
             "context_window": self.context_window,
             "trust_tier": tier_v.tier,
             "endpoint_ok": tier_v.ok,
-            "reachable": bool(h.get("ok")),
-            "models_loaded": h.get("models_loaded", []),
         }
         if self.backend == "exo":
-            from .exo_adapter import assess_exo_cluster, exo_cluster_capability
-
             cap["experimental"] = True
             cap["serve_gate"] = {
                 "ok": bool(self.exo_eval_gate_passed),
                 "reason": None if self.exo_eval_gate_passed else "exo_eval_gate_not_passed",
                 "required": "heterogeneous_inference_plan §0 eval",
             }
+
+        # Classify BEFORE probing. An endpoint the classifier rejected (bad scheme, unresolvable, or
+        # resolving into an SSRF range such as the cloud-metadata IP) must never receive a request
+        # from us — not a health probe, not exo's /state, not a canary.
+        if not tier_v.ok:
+            cap.update(
+                {
+                    "reachable": False,
+                    "models_loaded": [],
+                    "measured_ok": False,
+                    "ok": False,
+                    "measure_error": "endpoint_blocked",
+                }
+            )
+            return cap
+
+        h = await self.health(force=True)
+        cap["reachable"] = bool(h.get("ok"))
+        cap["models_loaded"] = h.get("models_loaded", [])
+        models_loaded = list(h.get("models_loaded") or [])
+
+        if self.backend == "exo":
+            from .exo_adapter import assess_exo_cluster, exo_cluster_capability
+
             cap["cluster"] = await exo_cluster_capability(
                 base_url=self.base_url,
                 api_key=self.api_key,
                 timeout_s=min(self.overall_timeout_s, 8.0),
                 requested_model=self.model,
-                models_loaded=list(h.get("models_loaded") or []),
+                models_loaded=models_loaded,
                 transport=self._transport,
             )
-        if cap["reachable"] and tier_v.ok:
-            c = await self.canary()
-            cap["measured_ok"] = bool(c.get("ok"))
-            cap["ok"] = cap["measured_ok"]
-            cap["ttft_ms"] = c.get("ttft_ms")
-            cap["tokens_per_s"] = c.get("tokens_per_s")
-            if not c.get("ok"):
-                cap["measure_error"] = c.get("error")
-            cap["conformance"] = await self.conformance()
-            if self.backend == "exo" and isinstance(cap.get("cluster"), dict):
-                cap["cluster"]["readiness"] = assess_exo_cluster(
-                    cap["cluster"],
-                    requested_model=self.model,
-                    models_loaded=list(h.get("models_loaded") or []),
-                    measured_ok=cap["measured_ok"],
-                    tokens_per_s=cap.get("tokens_per_s"),
-                    ttft_ms=cap.get("ttft_ms"),
-                )
-        else:
+
+        if not cap["reachable"]:
             cap["measured_ok"] = False
             cap["ok"] = False
-            cap["measure_error"] = "endpoint_blocked" if not tier_v.ok else "unreachable"
+            cap["measure_error"] = "unreachable"
+            return cap
+
+        c = await self.canary()
+        cap["measured_ok"] = bool(c.get("ok"))
+        cap["ok"] = cap["measured_ok"]
+        cap["ttft_ms"] = c.get("ttft_ms")
+        cap["tokens_per_s"] = c.get("tokens_per_s")
+        if not c.get("ok"):
+            cap["measure_error"] = c.get("error")
+        cap["conformance"] = await self.conformance()
+        if self.backend == "exo" and isinstance(cap.get("cluster"), dict):
+            cap["cluster"]["readiness"] = assess_exo_cluster(
+                cap["cluster"],
+                requested_model=self.model,
+                models_loaded=models_loaded,
+                measured_ok=cap["measured_ok"],
+                tokens_per_s=cap.get("tokens_per_s"),
+                ttft_ms=cap.get("ttft_ms"),
+            )
         return cap
 
     async def conformance(self) -> dict[str, Any]:

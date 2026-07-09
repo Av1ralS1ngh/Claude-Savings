@@ -440,6 +440,25 @@ def test_preflight_blocked_endpoint_is_not_measured():
     assert cap["measured_ok"] is False
 
 
+def test_preflight_never_sends_a_request_to_a_blocked_endpoint():
+    """SSRF guard: classification happens before any I/O, so a blocked endpoint (here the cloud
+    metadata IP) receives no health probe, no exo /state read, and no canary."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(200, json={"data": []})
+
+    for backend in ("llama_cpp", "exo"):
+        seen.clear()
+        prov = _provider(handler, backend=backend, base_url="http://169.254.169.254/v1")
+        cap = asyncio.run(prov.preflight())
+        assert cap["endpoint_ok"] is False
+        assert cap["measure_error"] == "endpoint_blocked"
+        assert cap["reachable"] is False
+        assert seen == [], f"{backend}: sent requests to a blocked endpoint: {seen}"
+
+
 def test_exo_preflight_includes_cluster_and_eval_gate():
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/models"):
