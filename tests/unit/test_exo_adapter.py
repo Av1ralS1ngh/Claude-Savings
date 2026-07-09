@@ -100,6 +100,21 @@ def test_assess_exo_cluster_does_not_gate_interconnect_on_a_single_node():
     assert "wifi_interconnect_unsupported" in exo.assess_exo_cluster(multi)["blockers"]
 
 
+def test_exo_cluster_capability_never_raises_on_empty_base_url():
+    """`base_url=None` must fall back to the default, not blow up on the success path."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"nodeIdentities": {"n1": {}}})
+
+    for supplied in (None, ""):
+        cap = asyncio.run(
+            exo.exo_cluster_capability(base_url=supplied, transport=httpx.MockTransport(handler))
+        )
+        assert cap["ok"] is True
+        # base_url must agree with root_url instead of echoing the empty input back.
+        assert cap["base_url"] == exo.DEFAULT_EXO_BASE_URL
+        assert cap["root_url"] == "http://127.0.0.1:52415"
+
+
 def test_exo_cluster_capability_fetches_state_and_reports_api_formats():
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/state"

@@ -235,6 +235,10 @@ async def exo_cluster_capability(
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> dict[str, Any]:
     """Fetch and normalize exo `/state`. Never raises."""
+    # Normalize once: a None/empty base_url must fall back to the default here too, or the summary
+    # below would report a base_url that disagrees with root_url (and `None.rstrip` would raise,
+    # breaking the "never raises" contract on the success path).
+    base_url = (base_url or DEFAULT_EXO_BASE_URL).rstrip("/")
     root = exo_root_url(base_url)
     headers: dict[str, str] = {}
     if api_key and api_key.lower() != "none":
@@ -250,7 +254,7 @@ async def exo_cluster_capability(
             {
                 "backend": EXO_BACKEND,
                 "root_url": root,
-                "base_url": base_url.rstrip("/"),
+                "base_url": base_url,
                 "experimental": True,
                 "owned_by_decompute": False,
                 "api_formats": {
