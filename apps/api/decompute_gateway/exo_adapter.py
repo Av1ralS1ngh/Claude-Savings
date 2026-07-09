@@ -181,12 +181,17 @@ def assess_exo_cluster(
         blockers.append("no_nodes")
     elif node_count == 1:
         warnings.append("single_node_exo_cluster")
-    if node_count > 1 and edge_count == 0:
-        warnings.append("no_topology_edges")
-    if interconnect["tier"] == "unsupported":
-        blockers.append("wifi_interconnect_unsupported")
-    elif interconnect["tier"] == "unknown":
-        warnings.append("unknown_interconnect")
+
+    # Interconnect only matters when shards actually cross nodes. A single-node cluster runs the whole
+    # model in one process, so a WiFi-only NIC is irrelevant there — gating on it would wrongly block
+    # the most common first setup (one Mac on WiFi). The tier is still reported for visibility.
+    if node_count > 1:
+        if edge_count == 0:
+            warnings.append("no_topology_edges")
+        if interconnect["tier"] == "unsupported":
+            blockers.append("wifi_interconnect_unsupported")
+        elif interconnect["tier"] == "unknown":
+            warnings.append("unknown_interconnect")
 
     model_info: dict[str, Any] = {}
     if requested_model:

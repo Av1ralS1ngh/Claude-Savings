@@ -80,6 +80,26 @@ def test_assess_exo_cluster_flags_wifi_and_missing_model_state():
     }
 
 
+def test_assess_exo_cluster_does_not_gate_interconnect_on_a_single_node():
+    """A 1-node exo cluster runs the whole model in one process, so a WiFi-only NIC is irrelevant.
+    Gating on it would block the most common first setup (one Mac on WiFi)."""
+    summary = {
+        "ok": True,
+        "node_count": 1,
+        "network": {"types": ["wifi"]},
+        "topology": {"edge_count": 0, "connection_types": []},
+        "active_models": ["m"],
+    }
+    verdict = exo.assess_exo_cluster(summary, requested_model="m", models_loaded=["m"], measured_ok=True)
+    assert verdict["ok"] is True
+    assert "wifi_interconnect_unsupported" not in verdict["blockers"]
+    assert "no_topology_edges" not in verdict["warnings"]
+    assert verdict["interconnect"]["tier"] == "unsupported"  # still reported, just not gating
+    # ...but the same WiFi-only fabric DOES block once shards must cross nodes.
+    multi = dict(summary, node_count=2)
+    assert "wifi_interconnect_unsupported" in exo.assess_exo_cluster(multi)["blockers"]
+
+
 def test_exo_cluster_capability_fetches_state_and_reports_api_formats():
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/state"
